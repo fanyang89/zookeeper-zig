@@ -1,0 +1,6 @@
+version = "3.9.5"
+git_tag = "release-3.9.5"
+git_commit = "293c895a8d966a3ecb92872be4a1daf87d725da2"
+url = "https://archive.apache.org/dist/zookeeper/zookeeper-3.9.5/apache-zookeeper-3.9.5.tar.gz"
+sha512 = "65beaebcb6ef7f69b844c2f0a59dc4d92f42845bdc3a9ca9fd31fe5927d37bab4e99e7009effd833a833e33e4fc81ba5ca0d23ee3a9cdc1990be8b6fc8fb79b7"
+path = "apache-zookeeper-3.9.5/zookeeper-client/zookeeper-client-c"
