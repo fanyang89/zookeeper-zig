@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Run three-node ZooKeeper end-to-end tests"
+set -euo pipefail
+
+export E2E_COMPOSE_FILE=tests/e2e/compose-quorum.yaml
+export E2E_PROJECT=zookeeper-zig-e2e-quorum
+export E2E_HOSTS=127.0.0.1:22181,127.0.0.1:22182,127.0.0.1:22183
+exec .mise/tasks/e2e

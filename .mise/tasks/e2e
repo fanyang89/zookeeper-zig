@@ -2,7 +2,10 @@
 #MISE description="Run single-node ZooKeeper end-to-end tests"
 set -euo pipefail
 
-compose=(docker compose --project-name zookeeper-zig-e2e --file tests/e2e/compose.yaml)
+compose_file=${E2E_COMPOSE_FILE:-tests/e2e/compose.yaml}
+project=${E2E_PROJECT:-zookeeper-zig-e2e}
+hosts=${E2E_HOSTS:-127.0.0.1:22181}
+compose=(docker compose --project-name "$project" --file "$compose_file")
 
 cleanup() {
     status=$?
@@ -16,4 +19,4 @@ cleanup() {
 trap cleanup EXIT
 
 "${compose[@]}" up --detach --wait --wait-timeout 60
-zig build e2e -- 127.0.0.1:22181
+zig build e2e -- "$hosts"

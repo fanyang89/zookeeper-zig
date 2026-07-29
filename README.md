@@ -22,6 +22,7 @@ mise install
 mise run build
 mise run test
 mise run e2e
+mise run e2e-quorum
 ```
 
 More test and instrumentation tasks will be listed by `mise tasks`.
