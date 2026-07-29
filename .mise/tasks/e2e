@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#MISE description="Run single-node ZooKeeper end-to-end tests"
+set -euo pipefail
+
+compose=(docker compose --project-name zookeeper-zig-e2e --file tests/e2e/compose.yaml)
+
+cleanup() {
+    status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+        "${compose[@]}" logs --no-color
+    fi
+    "${compose[@]}" down --volumes --remove-orphans
+    exit "$status"
+}
+trap cleanup EXIT
+
+"${compose[@]}" up --detach --wait --wait-timeout 60
+zig build e2e -- 127.0.0.1:22181

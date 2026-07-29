@@ -13,6 +13,7 @@ The client sources are local and builds do not fetch dependencies. See
 - Zig 0.16.0 (installed by mise)
 - OpenSSL development files for TLS builds
 - Cyrus SASL development files for SASL builds
+- Docker with Compose for end-to-end tests
 
 ## Quick start
 
@@ -20,6 +21,7 @@ The client sources are local and builds do not fetch dependencies. See
 mise install
 mise run build
 mise run test
+mise run e2e
 ```
 
 More test and instrumentation tasks will be listed by `mise tasks`.

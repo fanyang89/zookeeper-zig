@@ -56,10 +56,22 @@ pub fn build(b: *std.Build) void {
     installHeaders(b);
 
     const test_step = b.step("test", "Run C client unit tests");
-    const unit_mt = addUnitTest(b, target, optimize, features, true, mt_static);
-    const unit_st = addUnitTest(b, target, optimize, features, false, st_static);
+    const unit_mt = addTestExecutable(b, "unit_mt", "tests/unit.c", target, optimize, features, true, mt_static);
+    const unit_st = addTestExecutable(b, "unit_st", "tests/unit.c", target, optimize, features, false, st_static);
     test_step.dependOn(&b.addRunArtifact(unit_mt).step);
     test_step.dependOn(&b.addRunArtifact(unit_st).step);
+
+    const e2e_step = b.step("e2e", "Run C client end-to-end tests");
+    const e2e_mt = addTestExecutable(b, "e2e_mt", "tests/e2e.c", target, optimize, features, true, mt_static);
+    const e2e_st = addTestExecutable(b, "e2e_st", "tests/e2e.c", target, optimize, features, false, st_static);
+    const run_e2e_mt = b.addRunArtifact(e2e_mt);
+    const run_e2e_st = b.addRunArtifact(e2e_st);
+    if (b.args) |args| {
+        run_e2e_mt.addArgs(args);
+        run_e2e_st.addArgs(args);
+    }
+    e2e_step.dependOn(&run_e2e_mt.step);
+    e2e_step.dependOn(&run_e2e_st.step);
 }
 
 fn addConfigHeader(b: *std.Build) *std.Build.Step.ConfigHeader {
@@ -207,8 +219,10 @@ fn addTool(
     return b.addExecutable(.{ .name = name, .root_module = module });
 }
 
-fn addUnitTest(
+fn addTestExecutable(
     b: *std.Build,
+    name: []const u8,
+    source: []const u8,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     features: Features,
@@ -226,16 +240,13 @@ fn addUnitTest(
     if (features.tls) module.addCMacro("HAVE_OPENSSL_H", "1");
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
-        .file = b.path("tests/unit.c"),
+        .file = b.path(source),
         .flags = common_flags,
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
 
-    return b.addExecutable(.{
-        .name = if (threaded) "unit_mt" else "unit_st",
-        .root_module = module,
-    });
+    return b.addExecutable(.{ .name = name, .root_module = module });
 }
 
 fn addIncludes(b: *std.Build, module: *std.Build.Module) void {
