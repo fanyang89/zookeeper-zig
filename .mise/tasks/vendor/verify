@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#MISE description="Verify vendored ZooKeeper sources"
+set -euo pipefail
+
+version="3.9.5"
+archive="apache-zookeeper-${version}.tar.gz"
+url="https://archive.apache.org/dist/zookeeper/zookeeper-${version}/${archive}"
+expected="65beaebcb6ef7f69b844c2f0a59dc4d92f42845bdc3a9ca9fd31fe5927d37bab4e99e7009effd833a833e33e4fc81ba5ca0d23ee3a9cdc1990be8b6fc8fb79b7"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+curl -fsSL "$url" -o "$tmp/$archive"
+printf '%s  %s\n' "$expected" "$tmp/$archive" | sha512sum --check --status
+mkdir -p "$tmp/client"
+tar -xzf "$tmp/$archive" -C "$tmp/client" --strip-components=3 \
+  "apache-zookeeper-${version}/zookeeper-client/zookeeper-client-c"
+diff -ru "$tmp/client" "$MISE_PROJECT_ROOT/vendor/zookeeper-client-c"
+printf 'ZooKeeper C client %s matches the official source release.\n' "$version"

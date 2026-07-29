@@ -1,0 +1,15 @@
+.{
+    .name = .zookeeper_c,
+    .version = "3.9.5",
+    .fingerprint = 0x93cdc1ec4a2052ec, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "generated",
+        "LICENSE",
+        "README.md",
+        "vendor",
+    },
+}
