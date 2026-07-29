@@ -194,7 +194,19 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof(path), "/zookeeper-zig-e2e-%ld", (long)getpid());
     snprintf(child, sizeof(child), "%s/ephemeral", path);
     zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
+#ifdef HAVE_OPENSSL_H
+    if (argc > 2) {
+        zh = zookeeper_init_ssl(host, argv[2], NULL, 5000, NULL, NULL, 0);
+    } else {
+        zh = zookeeper_init(host, NULL, 5000, NULL, NULL, 0);
+    }
+#else
+    if (argc > 2) {
+        fprintf(stderr, "TLS credentials require -Dtls=true\n");
+        return 1;
+    }
     zh = zookeeper_init(host, NULL, 5000, NULL, NULL, 0);
+#endif
     CHECK(zh != NULL);
     CHECK(wait_for_connection(zh) == 0);
 
@@ -251,13 +263,13 @@ int main(int argc, char **argv) {
     CHECK(result.rc == ZNONODE);
 
     status = 0;
-    printf("PASS: %s client CRUD against %s\n",
+    printf("PASS: %s client CRUD against %s%s\n",
 #ifdef THREADED
            "threaded",
 #else
            "single-threaded",
 #endif
-           host);
+           host, argc > 2 ? " with TLS" : "");
 
 cleanup:
     if (zh != NULL && zookeeper_close(zh) != ZOK) {

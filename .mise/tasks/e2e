@@ -19,4 +19,8 @@ cleanup() {
 trap cleanup EXIT
 
 "${compose[@]}" up --detach --wait --wait-timeout 60
-zig build e2e -- "$hosts"
+args=("$hosts")
+if [[ -n ${E2E_TLS_CERT:-} ]]; then
+    args+=("$E2E_TLS_CERT")
+fi
+zig build e2e -- "${args[@]}"

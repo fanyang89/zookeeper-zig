@@ -14,6 +14,7 @@ The client sources are local and builds do not fetch dependencies. See
 - OpenSSL development files for TLS builds
 - Cyrus SASL development files for SASL builds
 - Docker with Compose for end-to-end tests
+- OpenSSL and JDK `keytool` for TLS end-to-end tests
 
 ## Quick start
 
@@ -22,6 +23,7 @@ mise install
 mise run build
 mise run test
 mise run e2e
+mise run e2e-tls
 mise run e2e-quorum
 ```
 

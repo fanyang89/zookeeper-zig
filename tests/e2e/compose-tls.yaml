@@ -1,0 +1,26 @@
+services:
+  zookeeper:
+    image: zookeeper:3.9.5-jre-17
+    ports:
+      - "127.0.0.1:22281:2281"
+    volumes:
+      - "../.runtime/tls:/certs:ro"
+    environment:
+      ZOO_4LW_COMMANDS_WHITELIST: srvr
+      ZOO_ADMINSERVER_ENABLED: "false"
+      ZOO_CFG_EXTRA: >-
+        secureClientPort=2281
+        serverCnxnFactory=org.apache.zookeeper.server.NettyServerCnxnFactory
+        ssl.keyStore.location=/certs/server.p12
+        ssl.keyStore.password=changeit
+        ssl.keyStore.type=PKCS12
+        ssl.trustStore.location=/certs/truststore.p12
+        ssl.trustStore.password=changeit
+        ssl.trustStore.type=PKCS12
+        ssl.clientAuth=NEED
+    healthcheck:
+      test: ["CMD-SHELL", "zkServer.sh status"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
