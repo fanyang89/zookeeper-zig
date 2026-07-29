@@ -54,6 +54,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(load_gen);
 
     installHeaders(b);
+
+    const test_step = b.step("test", "Run C client unit tests");
+    const unit_mt = addUnitTest(b, target, optimize, features, true, mt_static);
+    const unit_st = addUnitTest(b, target, optimize, features, false, st_static);
+    test_step.dependOn(&b.addRunArtifact(unit_mt).step);
+    test_step.dependOn(&b.addRunArtifact(unit_st).step);
 }
 
 fn addConfigHeader(b: *std.Build) *std.Build.Step.ConfigHeader {
@@ -199,6 +205,37 @@ fn addTool(
     addSystemLibraries(module, features, threaded);
 
     return b.addExecutable(.{ .name = name, .root_module = module });
+}
+
+fn addUnitTest(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    features: Features,
+    threaded: bool,
+    library: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addIncludes(b, module);
+    module.addCMacro("USE_STATIC_LIB", "1");
+    if (threaded) module.addCMacro("THREADED", "1");
+    if (features.tls) module.addCMacro("HAVE_OPENSSL_H", "1");
+    if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
+    module.addCSourceFile(.{
+        .file = b.path("tests/unit.c"),
+        .flags = common_flags,
+    });
+    module.linkLibrary(library);
+    addSystemLibraries(module, features, threaded);
+
+    return b.addExecutable(.{
+        .name = if (threaded) "unit_mt" else "unit_st",
+        .root_module = module,
+    });
 }
 
 fn addIncludes(b: *std.Build, module: *std.Build.Module) void {
