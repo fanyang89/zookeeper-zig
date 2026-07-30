@@ -36,6 +36,7 @@ mise run e2e-tsan
 mise run e2e-sasl
 mise run e2e-tls
 mise run e2e-quorum
+mise run chaos
 ```
 
 More test and instrumentation tasks will be listed by `mise tasks`.

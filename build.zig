@@ -92,6 +92,10 @@ pub fn build(b: *std.Build) void {
     }
     e2e_step.dependOn(&run_e2e_mt.step);
     e2e_step.dependOn(&run_e2e_st.step);
+
+    const chaos_step = b.step("chaos", "Build chaos test executables");
+    const chaos_mt = addTestExecutable(b, "chaos_mt", "tests/chaos.c", target, optimize, features, true, mt_static);
+    chaos_step.dependOn(&b.addInstallArtifact(chaos_mt, .{}).step);
 }
 
 fn addFuzzStep(
