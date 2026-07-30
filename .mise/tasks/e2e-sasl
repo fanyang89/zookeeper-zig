@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Run SASL ZooKeeper end-to-end tests"
+set -euo pipefail
+
+export E2E_COMPOSE_FILE=tests/e2e/compose-sasl.yaml
+export E2E_PROJECT=zookeeper-zig-e2e-sasl
+export E2E_HOSTS=127.0.0.1:22381
+export E2E_SASL_PASSWORD=tests/e2e/sasl-password
+exec .mise/tasks/e2e

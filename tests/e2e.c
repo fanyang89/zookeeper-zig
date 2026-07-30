@@ -190,10 +190,38 @@ int main(int argc, char **argv) {
     zhandle_t *zh = NULL;
     struct result result;
     int status = 1;
+#ifdef HAVE_CYRUS_SASL_H
+    sasl_callback_t *sasl_callbacks = NULL;
+    int sasl_initialized = 0;
+#endif
+    int use_sasl = argc > 2 && strcmp(argv[2], "--sasl") == 0;
 
     snprintf(path, sizeof(path), "/zookeeper-zig-e2e-%ld", (long)getpid());
     snprintf(child, sizeof(child), "%s/ephemeral", path);
     zoo_set_debug_level(ZOO_LOG_LEVEL_WARN);
+#ifdef HAVE_CYRUS_SASL_H
+    if (use_sasl) {
+        zoo_sasl_params_t params = {
+            .service = "zookeeper",
+            .host = "zk-sasl-md5",
+            .mechlist = "DIGEST-MD5",
+        };
+
+        CHECK(argc > 3);
+        CHECK(sasl_client_init(NULL) == SASL_OK);
+        sasl_initialized = 1;
+        sasl_callbacks = zoo_sasl_make_basic_callbacks("bob", NULL, argv[3]);
+        CHECK(sasl_callbacks != NULL);
+        params.callbacks = sasl_callbacks;
+        zh = zookeeper_init_sasl(host, NULL, 5000, NULL, NULL, 0, NULL,
+                                 &params);
+    } else
+#else
+    if (use_sasl) {
+        fprintf(stderr, "SASL credentials require -Dsasl=true\n");
+        return 1;
+    }
+#endif
 #ifdef HAVE_OPENSSL_H
     if (argc > 2) {
         zh = zookeeper_init_ssl(host, argv[2], NULL, 5000, NULL, NULL, 0);
@@ -269,11 +297,17 @@ int main(int argc, char **argv) {
 #else
            "single-threaded",
 #endif
-           host, argc > 2 ? " with TLS" : "");
+           host, use_sasl ? " with SASL" : argc > 2 ? " with TLS" : "");
 
 cleanup:
     if (zh != NULL && zookeeper_close(zh) != ZOK) {
         status = 1;
     }
+#ifdef HAVE_CYRUS_SASL_H
+    free(sasl_callbacks);
+    if (sasl_initialized) {
+        sasl_done();
+    }
+#endif
     return status;
 }
