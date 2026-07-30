@@ -22,6 +22,7 @@ const Features = struct {
     sasl: bool,
     sanitizer: Sanitizer,
     fuzz: bool,
+    coverage: bool,
     clang_runtime_dir: ?[]const u8,
 };
 
@@ -40,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .sasl = b.option(bool, "sasl", "Build Cyrus SASL support") orelse true,
         .sanitizer = b.option(Sanitizer, "sanitize", "Enable address, undefined, or thread sanitizer") orelse .none,
         .fuzz = b.option(bool, "fuzz", "Build libFuzzer fuzz targets") orelse false,
+        .coverage = b.option(bool, "coverage", "Build with Clang source-based coverage instrumentation") orelse false,
         .clang_runtime_dir = b.option([]const u8, "clang-runtime-dir", "Clang compiler-rt directory (see: clang --print-runtime-dir)"),
     };
 
@@ -137,12 +139,14 @@ fn addFuzzTarget(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(source),
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, true);
 
-    return b.addExecutable(.{ .name = name, .root_module = module });
+    const exe = b.addExecutable(.{ .name = name, .root_module = module });
+    if (features.coverage) exe.forceUndefinedSymbol("__llvm_profile_runtime");
+    return exe;
 }
 
 fn addConfigHeader(b: *std.Build) *std.Build.Step.ConfigHeader {
@@ -239,23 +243,23 @@ fn configureClientModule(
     module.addCSourceFiles(.{
         .root = b.path("vendor/zookeeper-client-c"),
         .files = common_sources,
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     module.addCSourceFile(.{
         .file = b.path("generated/zookeeper.jute.c"),
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     module.addCSourceFile(.{
         .file = b.path(if (threaded)
             "vendor/zookeeper-client-c/src/mt_adaptor.c"
         else
             "vendor/zookeeper-client-c/src/st_adaptor.c"),
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     if (features.sasl) {
         module.addCSourceFile(.{
             .file = b.path("vendor/zookeeper-client-c/src/zk_sasl.c"),
-            .flags = cFlags(features.sanitizer, features.fuzz),
+            .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
         });
     }
     if (link_system_libraries) addSystemLibraries(module, features, threaded);
@@ -284,12 +288,14 @@ fn addTool(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(b.fmt("vendor/zookeeper-client-c/{s}", .{source})),
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
 
-    return b.addExecutable(.{ .name = name, .root_module = module });
+    const exe = b.addExecutable(.{ .name = name, .root_module = module });
+    if (features.coverage) exe.forceUndefinedSymbol("__llvm_profile_runtime");
+    return exe;
 }
 
 fn addTestExecutable(
@@ -315,12 +321,14 @@ fn addTestExecutable(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(source),
-        .flags = cFlags(features.sanitizer, features.fuzz),
+        .flags = cFlags(features.sanitizer, features.fuzz, features.coverage),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
 
-    return b.addExecutable(.{ .name = name, .root_module = module });
+    const exe = b.addExecutable(.{ .name = name, .root_module = module });
+    if (features.coverage) exe.forceUndefinedSymbol("__llvm_profile_runtime");
+    return exe;
 }
 
 fn addIncludes(b: *std.Build, module: *std.Build.Module) void {
@@ -342,6 +350,8 @@ fn applyInstrumentation(module: *std.Build.Module, features: Features, link_runt
     }
     if (features.fuzz and link_runtime)
         linkClangRuntime(module, features, "clang_rt.fuzzer");
+    if (features.coverage and link_runtime)
+        linkClangRuntime(module, features, "clang_rt.profile");
 }
 
 fn linkClangRuntime(module: *std.Build.Module, features: Features, name: []const u8) void {
@@ -351,7 +361,9 @@ fn linkClangRuntime(module: *std.Build.Module, features: Features, name: []const
     module.linkSystemLibrary(name, .{});
 }
 
-fn cFlags(sanitizer: Sanitizer, fuzz: bool) []const []const u8 {
+fn cFlags(sanitizer: Sanitizer, fuzz: bool, coverage: bool) []const []const u8 {
+    if (coverage)
+        return &.{ "-std=gnu11", "-fno-strict-aliasing", "-fprofile-instr-generate", "-fcoverage-mapping" };
     if (sanitizer == .address and fuzz)
         return &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=address", "-fno-omit-frame-pointer", "-fsanitize=fuzzer-no-link" };
     if (sanitizer == .address)

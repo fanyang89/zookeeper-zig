@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#MISE description="Generate source-based coverage report from e2e tests"
+set -euo pipefail
+
+runtime_dir=$(clang --print-runtime-dir)
+export ZIG_E2E_FLAGS="-Dcoverage=true -Dclang-runtime-dir=$runtime_dir"
+export LLVM_PROFILE_FILE="tests/.runtime/coverage/e2e-%m.profraw"
+mkdir -p tests/.runtime/coverage
+
+# Clean stale profile data
+rm -f tests/.runtime/coverage/*.profraw tests/.runtime/coverage/*.profdata
+
+# Run e2e tests (starts ZK docker container automatically)
+echo "Running e2e tests with coverage..."
+.mise/tasks/e2e 2>&1 | grep -E 'PASS:|FAIL:|error:|panic' || true
+
+# Merge profile data
+profraw_files=(tests/.runtime/coverage/*.profraw)
+if [[ ${#profraw_files[@]} -eq 0 ]]; then
+    echo "No .profraw files found — did the tests run?"
+    exit 1
+fi
+llvm-profdata merge -o tests/.runtime/coverage/merged.profdata "${profraw_files[@]}"
+
+# Find the e2e_mt executable
+exe=$(find .zig-cache -name e2e_mt -type f | head -1)
+if [[ -z "$exe" ]]; then
+    echo "e2e_mt executable not found"
+    exit 1
+fi
+
+# Generate HTML report
+echo "Generating HTML report..."
+llvm-cov show "$exe" \
+    -instr-profile=tests/.runtime/coverage/merged.profdata \
+    -format=html \
+    -output-dir=coverage \
+    -ignore-filename-regex='tests/' \
+    -ignore-filename-regex='\.zig-cache/'
+
+# Print summary
+echo ""
+echo "=== Coverage Summary ==="
+llvm-cov report "$exe" \
+    -instr-profile=tests/.runtime/coverage/merged.profdata \
+    -ignore-filename-regex='tests/' \
+    -ignore-filename-regex='\.zig-cache/' \
+    | grep -E 'TOTAL|zookeeper\.c|recordio\.c|mt_adaptor\.c|jute\.c|st_adaptor\.c'
+
+echo ""
+echo "HTML report: coverage/index.html"

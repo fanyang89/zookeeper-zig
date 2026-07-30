@@ -101,6 +101,28 @@ static void void_completion(int rc, const void *data) {
     atomic_store_explicit(&result->done, 1, memory_order_release);
 }
 
+static void string_stat_completion(int rc, const char *value,
+                                   const struct Stat *stat, const void *data) {
+    struct result *result = (struct result *)data;
+    result->rc = rc;
+    if (rc == ZOK) {
+        if (value != NULL)
+            snprintf(result->value, sizeof(result->value), "%s", value);
+        if (stat != NULL)
+            result->stat = *stat;
+    }
+    atomic_store_explicit(&result->done, 1, memory_order_release);
+}
+
+static void strings_completion(int rc, const struct String_vector *strings,
+                               const void *data) {
+    struct children_result *r = (struct children_result *)data;
+    r->rc = rc;
+    if (rc == ZOK)
+        r->count = strings ? strings->count : 0;
+    atomic_store_explicit(&r->done, 1, memory_order_release);
+}
+
 static void strings_stat_completion(int rc, const struct String_vector *strings,
                                     const struct Stat *stat, const void *data) {
     struct children_result *r = (struct children_result *)data;
@@ -211,9 +233,11 @@ static int wait_for_connection(zhandle_t *zh) {
 static int wait_for_result(zhandle_t *zh, atomic_int *done) {
     int64_t deadline = monotonic_ms() + TIMEOUT_MS;
     while (!atomic_load_explicit(done, memory_order_acquire)) {
+        int rc;
         if (monotonic_ms() >= deadline)
             return 1;
-        if (drive_once(zh) != ZOK && drive_once(zh) != ZNOTHING)
+        rc = drive_once(zh);
+        if (rc != ZOK && rc != ZNOTHING)
             return 1;
     }
     return 0;
@@ -460,6 +484,19 @@ static int test_children(zhandle_t *zh, const char *prefix) {
     CHECK(cr.rc == ZOK);
     CHECK(cr.count == 3);
 
+    /* also test zoo_aget_children (no Stat variant) */
+    {
+        struct children_result cr2;
+        memset(&cr2, 0, sizeof(cr2));
+        atomic_init(&cr2.done, 0);
+        cr2.rc = ZSYSTEMERROR;
+        CHECK(zoo_aget_children(zh, parent, 0, strings_completion,
+                                &cr2) == ZOK);
+        CHECK(wait_for_result(zh, &cr2.done) == 0);
+        CHECK(cr2.rc == ZOK);
+        CHECK(cr2.count == 3);
+    }
+
     init_result(&result);
     CHECK(zoo_adelete(zh, parent, -1, void_completion, &result) == ZOK);
     CHECK(wait_for_result(zh, &result.done) == 0);
@@ -542,6 +579,36 @@ static int test_multi(zhandle_t *zh, const char *prefix) {
         CHECK(result.rc == ZOK);
         CHECK(result.value_len == 5);
         CHECK(memcmp(result.value, "hello", 5) == 0);
+    }
+
+    /* success: create + check + set in one transaction */
+    {
+        char create_path[128];
+        zoo_op_t ops[3];
+        zoo_op_result_t results[3];
+        struct Stat check_stat, set_stat;
+        char created_path[160];
+
+        snprintf(create_path, sizeof(create_path), "%s/multi-created", prefix);
+        zoo_create_op_init(&ops[0], create_path, "new", 3,
+                           &ZOO_OPEN_ACL_UNSAFE, 0,
+                           created_path, sizeof(created_path));
+        zoo_check_op_init(&ops[1], create_path, 0);
+        zoo_set_op_init(&ops[2], create_path, "upd", 3, 0, &set_stat);
+
+        init_result(&result);
+        CHECK(zoo_amulti(zh, 3, ops, results, void_completion,
+                         &result) == ZOK);
+        CHECK(wait_for_result(zh, &result.done) == 0);
+        CHECK(result.rc == ZOK);
+        CHECK(results[0].err == ZOK);
+        CHECK(results[1].err == ZOK);
+        CHECK(results[2].err == ZOK);
+
+        /* cleanup created node */
+        init_result(&result);
+        zoo_adelete(zh, create_path, 1, void_completion, &result);
+        wait_for_result(zh, &result.done);
     }
 
     /* cleanup */
@@ -665,6 +732,67 @@ cleanup:
 }
 
 /* ------------------------------------------------------------------ */
+/* test: API helpers + sync + create2                                 */
+/* ------------------------------------------------------------------ */
+
+static int test_api(zhandle_t *zh, const char *prefix) {
+    char path[128];
+    struct result result;
+    struct watch_event global_watch;
+    int status = 1;
+
+    /* simple getter/setter APIs */
+    zoo_set_context(zh, (void *)0x42);
+    CHECK(zoo_get_context(zh) == (void *)0x42);
+    zoo_set_context(zh, NULL);
+
+    CHECK(zoo_recv_timeout(zh) > 0);
+    CHECK(zoo_client_id(zh) != NULL);
+
+    /* global watcher */
+    init_watch_event(&global_watch);
+    zoo_set_watcher(zh, watcher);
+
+    /* server info */
+    {
+        const char *srv = zoo_get_current_server(zh);
+        CHECK(srv != NULL);
+    }
+
+    /* zerror */
+    CHECK(zerror(ZOK) != NULL);
+    CHECK(zerror(ZNONODE) != NULL);
+    CHECK(zerror(ZBADVERSION) != NULL);
+
+    /* zoo_async (flush to leader) */
+    init_result(&result);
+    CHECK(zoo_async(zh, "/", string_completion, &result) == ZOK);
+    CHECK(wait_for_result(zh, &result.done) == 0);
+    CHECK(result.rc == ZOK);
+
+    /* zoo_acreate2 — returns path + Stat */
+    snprintf(path, sizeof(path), "%s/create2", prefix);
+    init_result(&result);
+    CHECK(zoo_acreate2(zh, path, "hello", 5, &ZOO_OPEN_ACL_UNSAFE, 0,
+                       string_stat_completion, &result) == ZOK);
+    CHECK(wait_for_result(zh, &result.done) == 0);
+    CHECK(result.rc == ZOK);
+    CHECK(strcmp(result.value, path) == 0);
+    CHECK(result.stat.version == 0);
+    CHECK(result.stat.dataLength == 5);
+
+    init_result(&result);
+    CHECK(zoo_adelete(zh, path, 0, void_completion, &result) == ZOK);
+    CHECK(wait_for_result(zh, &result.done) == 0);
+    CHECK(result.rc == ZOK);
+
+    status = 0;
+    printf("PASS: %s API\n", mode_label());
+cleanup:
+    return status;
+}
+
+/* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -741,6 +869,7 @@ int main(int argc, char **argv) {
     status |= test_multi(zh, prefix);
     status |= test_acl(zh, prefix);
     status |= test_error_paths(zh, prefix);
+    status |= test_api(zh, prefix);
 
     /* cleanup base node */
     {
