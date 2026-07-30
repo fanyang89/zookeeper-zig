@@ -30,6 +30,9 @@ mise run test-tsan
 mise run fuzz
 mise run fuzz-asan
 mise run e2e
+mise run e2e-asan
+mise run e2e-ubsan
+mise run e2e-tsan
 mise run e2e-sasl
 mise run e2e-tls
 mise run e2e-quorum

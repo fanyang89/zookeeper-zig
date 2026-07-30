@@ -25,4 +25,4 @@ if [[ -n ${E2E_SASL_PASSWORD:-} ]]; then
 elif [[ -n ${E2E_TLS_CERT:-} ]]; then
     args+=("$E2E_TLS_CERT")
 fi
-zig build e2e -- "${args[@]}"
+zig build e2e ${ZIG_E2E_FLAGS:-} -- "${args[@]}"
