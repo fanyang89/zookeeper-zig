@@ -20,6 +20,15 @@ const common_flags = &.{
 const Features = struct {
     tls: bool,
     sasl: bool,
+    sanitizer: Sanitizer,
+    asan_runtime_dir: ?[]const u8,
+};
+
+const Sanitizer = enum {
+    none,
+    address,
+    undefined,
+    thread,
 };
 
 pub fn build(b: *std.Build) void {
@@ -28,6 +37,8 @@ pub fn build(b: *std.Build) void {
     const features = Features{
         .tls = b.option(bool, "tls", "Build OpenSSL support") orelse true,
         .sasl = b.option(bool, "sasl", "Build Cyrus SASL support") orelse true,
+        .sanitizer = b.option(Sanitizer, "sanitize", "Enable address, undefined, or thread sanitizer") orelse .none,
+        .asan_runtime_dir = b.option([]const u8, "asan-runtime-dir", "Clang sanitizer runtime directory"),
     };
 
     if (target.result.os.tag != .linux) {
@@ -157,6 +168,7 @@ fn configureClientModule(
     threaded: bool,
     link_system_libraries: bool,
 ) void {
+    applySanitizer(module, features, link_system_libraries);
     module.addConfigHeader(config_header);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
@@ -167,23 +179,23 @@ fn configureClientModule(
     module.addCSourceFiles(.{
         .root = b.path("vendor/zookeeper-client-c"),
         .files = common_sources,
-        .flags = common_flags,
+        .flags = cFlags(features.sanitizer),
     });
     module.addCSourceFile(.{
         .file = b.path("generated/zookeeper.jute.c"),
-        .flags = common_flags,
+        .flags = cFlags(features.sanitizer),
     });
     module.addCSourceFile(.{
         .file = b.path(if (threaded)
             "vendor/zookeeper-client-c/src/mt_adaptor.c"
         else
             "vendor/zookeeper-client-c/src/st_adaptor.c"),
-        .flags = common_flags,
+        .flags = cFlags(features.sanitizer),
     });
     if (features.sasl) {
         module.addCSourceFile(.{
             .file = b.path("vendor/zookeeper-client-c/src/zk_sasl.c"),
-            .flags = common_flags,
+            .flags = cFlags(features.sanitizer),
         });
     }
     if (link_system_libraries) addSystemLibraries(module, features, threaded);
@@ -204,6 +216,7 @@ fn addTool(
         .optimize = optimize,
         .link_libc = true,
     });
+    applySanitizer(module, features, true);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
     if (threaded) module.addCMacro("THREADED", "1");
@@ -211,7 +224,7 @@ fn addTool(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(b.fmt("vendor/zookeeper-client-c/{s}", .{source})),
-        .flags = common_flags,
+        .flags = cFlags(features.sanitizer),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
@@ -234,6 +247,7 @@ fn addTestExecutable(
         .optimize = optimize,
         .link_libc = true,
     });
+    applySanitizer(module, features, true);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
     if (threaded) module.addCMacro("THREADED", "1");
@@ -241,7 +255,7 @@ fn addTestExecutable(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(source),
-        .flags = common_flags,
+        .flags = cFlags(features.sanitizer),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
@@ -254,6 +268,30 @@ fn addIncludes(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("vendor/zookeeper-client-c/src"));
     module.addIncludePath(b.path("vendor/zookeeper-client-c/src/hashtable"));
     module.addIncludePath(b.path("generated"));
+}
+
+fn applySanitizer(module: *std.Build.Module, features: Features, link_runtime: bool) void {
+    switch (features.sanitizer) {
+        .none => {},
+        .address => {
+            module.omit_frame_pointer = false;
+            if (link_runtime) {
+                const runtime_dir = features.asan_runtime_dir orelse
+                    @panic("-Dasan-runtime-dir is required with -Dsanitize=address");
+                module.addLibraryPath(.{ .cwd_relative = runtime_dir });
+                module.linkSystemLibrary("clang_rt.asan", .{});
+            }
+        },
+        .undefined => module.sanitize_c = .full,
+        .thread => module.sanitize_thread = true,
+    }
+}
+
+fn cFlags(sanitizer: Sanitizer) []const []const u8 {
+    return if (sanitizer == .address)
+        &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=address", "-fno-omit-frame-pointer" }
+    else
+        common_flags;
 }
 
 fn addSystemLibraries(module: *std.Build.Module, features: Features, threaded: bool) void {

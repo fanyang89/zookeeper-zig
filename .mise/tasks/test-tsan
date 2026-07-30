@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+#MISE description="Run unit tests with thread sanitizer"
+set -euo pipefail
+
+export TSAN_OPTIONS="suppressions=$PWD/tests/tsan.supp${TSAN_OPTIONS:+:$TSAN_OPTIONS}"
+exec zig build test -Dsanitize=thread "$@"

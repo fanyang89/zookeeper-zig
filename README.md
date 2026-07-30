@@ -16,6 +16,7 @@ The client sources are local and builds do not fetch dependencies. See
 - Cyrus SASL DIGEST-MD5 mechanism for SASL end-to-end tests
 - Docker with Compose for end-to-end tests
 - OpenSSL and JDK `keytool` for TLS end-to-end tests
+- Clang with compiler-rt for address sanitizer tests
 
 ## Quick start
 
@@ -23,6 +24,9 @@ The client sources are local and builds do not fetch dependencies. See
 mise install
 mise run build
 mise run test
+mise run test-asan
+mise run test-ubsan
+mise run test-tsan
 mise run e2e
 mise run e2e-sasl
 mise run e2e-tls

@@ -1,0 +1,4 @@
+# ZooKeeper uses a volatile close_requested flag across its worker threads.
+# Volatile does not provide C memory-model synchronization, so every normal
+# threaded handle shutdown reports this known upstream race.
+race:zookeeper_close
