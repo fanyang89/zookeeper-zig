@@ -4,4 +4,4 @@ set -euo pipefail
 
 export ASAN_OPTIONS="detect_leaks=1:halt_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 runtime_dir=$(clang --print-runtime-dir)
-exec zig build test -Dsanitize=address -Dasan-runtime-dir="$runtime_dir" "$@"
+exec zig build test -Dsanitize=address -Dclang-runtime-dir="$runtime_dir" "$@"

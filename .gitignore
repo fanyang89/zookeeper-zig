@@ -4,3 +4,4 @@ zig-pkg/
 .mise.local.toml
 coverage/
 tests/.runtime/
+tests/fuzz/corpus/

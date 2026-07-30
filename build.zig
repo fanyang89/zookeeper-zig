@@ -21,7 +21,8 @@ const Features = struct {
     tls: bool,
     sasl: bool,
     sanitizer: Sanitizer,
-    asan_runtime_dir: ?[]const u8,
+    fuzz: bool,
+    clang_runtime_dir: ?[]const u8,
 };
 
 const Sanitizer = enum {
@@ -38,7 +39,8 @@ pub fn build(b: *std.Build) void {
         .tls = b.option(bool, "tls", "Build OpenSSL support") orelse true,
         .sasl = b.option(bool, "sasl", "Build Cyrus SASL support") orelse true,
         .sanitizer = b.option(Sanitizer, "sanitize", "Enable address, undefined, or thread sanitizer") orelse .none,
-        .asan_runtime_dir = b.option([]const u8, "asan-runtime-dir", "Clang sanitizer runtime directory"),
+        .fuzz = b.option(bool, "fuzz", "Build libFuzzer fuzz targets") orelse false,
+        .clang_runtime_dir = b.option([]const u8, "clang-runtime-dir", "Clang compiler-rt directory (see: clang --print-runtime-dir)"),
     };
 
     if (target.result.os.tag != .linux) {
@@ -46,6 +48,11 @@ pub fn build(b: *std.Build) void {
     }
 
     const config_header = addConfigHeader(b);
+
+    if (features.fuzz) {
+        addFuzzStep(b, target, optimize, config_header, features);
+        return;
+    }
 
     const mt_static = addZooKeeperLibrary(b, target, optimize, config_header, features, true, .static);
     const mt_shared = addZooKeeperLibrary(b, target, optimize, config_header, features, true, .dynamic);
@@ -83,6 +90,59 @@ pub fn build(b: *std.Build) void {
     }
     e2e_step.dependOn(&run_e2e_mt.step);
     e2e_step.dependOn(&run_e2e_st.step);
+}
+
+fn addFuzzStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    config_header: *std.Build.Step.ConfigHeader,
+    features: Features,
+) void {
+    const fuzz_step = b.step("fuzz", "Build and run libFuzzer targets");
+    const mt_static = addZooKeeperLibrary(b, target, optimize, config_header, features, true, .static);
+
+    const targets = .{
+        .{ "fuzz_jute", "tests/fuzz/jute.c" },
+    };
+
+    inline for (targets) |t| {
+        const exe = addFuzzTarget(b, t[0], t[1], target, optimize, features, mt_static);
+        const run = b.addRunArtifact(exe);
+        run.addArg(b.fmt("tests/fuzz/corpus/{s}", .{t[0]}));
+        if (b.args) |args| run.addArgs(args);
+        fuzz_step.dependOn(&run.step);
+    }
+}
+
+fn addFuzzTarget(
+    b: *std.Build,
+    name: []const u8,
+    source: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    features: Features,
+    library: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    applyInstrumentation(module, features, true);
+    addIncludes(b, module);
+    module.addCMacro("USE_STATIC_LIB", "1");
+    module.addCMacro("THREADED", "1");
+    if (features.tls) module.addCMacro("HAVE_OPENSSL_H", "1");
+    if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
+    module.addCSourceFile(.{
+        .file = b.path(source),
+        .flags = cFlags(features.sanitizer, features.fuzz),
+    });
+    module.linkLibrary(library);
+    addSystemLibraries(module, features, true);
+
+    return b.addExecutable(.{ .name = name, .root_module = module });
 }
 
 fn addConfigHeader(b: *std.Build) *std.Build.Step.ConfigHeader {
@@ -168,7 +228,7 @@ fn configureClientModule(
     threaded: bool,
     link_system_libraries: bool,
 ) void {
-    applySanitizer(module, features, link_system_libraries);
+    applyInstrumentation(module, features, link_system_libraries);
     module.addConfigHeader(config_header);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
@@ -179,23 +239,23 @@ fn configureClientModule(
     module.addCSourceFiles(.{
         .root = b.path("vendor/zookeeper-client-c"),
         .files = common_sources,
-        .flags = cFlags(features.sanitizer),
+        .flags = cFlags(features.sanitizer, features.fuzz),
     });
     module.addCSourceFile(.{
         .file = b.path("generated/zookeeper.jute.c"),
-        .flags = cFlags(features.sanitizer),
+        .flags = cFlags(features.sanitizer, features.fuzz),
     });
     module.addCSourceFile(.{
         .file = b.path(if (threaded)
             "vendor/zookeeper-client-c/src/mt_adaptor.c"
         else
             "vendor/zookeeper-client-c/src/st_adaptor.c"),
-        .flags = cFlags(features.sanitizer),
+        .flags = cFlags(features.sanitizer, features.fuzz),
     });
     if (features.sasl) {
         module.addCSourceFile(.{
             .file = b.path("vendor/zookeeper-client-c/src/zk_sasl.c"),
-            .flags = cFlags(features.sanitizer),
+            .flags = cFlags(features.sanitizer, features.fuzz),
         });
     }
     if (link_system_libraries) addSystemLibraries(module, features, threaded);
@@ -216,7 +276,7 @@ fn addTool(
         .optimize = optimize,
         .link_libc = true,
     });
-    applySanitizer(module, features, true);
+    applyInstrumentation(module, features, true);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
     if (threaded) module.addCMacro("THREADED", "1");
@@ -224,7 +284,7 @@ fn addTool(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(b.fmt("vendor/zookeeper-client-c/{s}", .{source})),
-        .flags = cFlags(features.sanitizer),
+        .flags = cFlags(features.sanitizer, features.fuzz),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
@@ -247,7 +307,7 @@ fn addTestExecutable(
         .optimize = optimize,
         .link_libc = true,
     });
-    applySanitizer(module, features, true);
+    applyInstrumentation(module, features, true);
     addIncludes(b, module);
     module.addCMacro("USE_STATIC_LIB", "1");
     if (threaded) module.addCMacro("THREADED", "1");
@@ -255,7 +315,7 @@ fn addTestExecutable(
     if (features.sasl) module.addCMacro("HAVE_CYRUS_SASL_H", "1");
     module.addCSourceFile(.{
         .file = b.path(source),
-        .flags = cFlags(features.sanitizer),
+        .flags = cFlags(features.sanitizer, features.fuzz),
     });
     module.linkLibrary(library);
     addSystemLibraries(module, features, threaded);
@@ -270,28 +330,35 @@ fn addIncludes(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("generated"));
 }
 
-fn applySanitizer(module: *std.Build.Module, features: Features, link_runtime: bool) void {
+fn applyInstrumentation(module: *std.Build.Module, features: Features, link_runtime: bool) void {
     switch (features.sanitizer) {
         .none => {},
         .address => {
             module.omit_frame_pointer = false;
-            if (link_runtime) {
-                const runtime_dir = features.asan_runtime_dir orelse
-                    @panic("-Dasan-runtime-dir is required with -Dsanitize=address");
-                module.addLibraryPath(.{ .cwd_relative = runtime_dir });
-                module.linkSystemLibrary("clang_rt.asan", .{});
-            }
+            if (link_runtime) linkClangRuntime(module, features, "clang_rt.asan");
         },
         .undefined => module.sanitize_c = .full,
         .thread => module.sanitize_thread = true,
     }
+    if (features.fuzz and link_runtime)
+        linkClangRuntime(module, features, "clang_rt.fuzzer");
 }
 
-fn cFlags(sanitizer: Sanitizer) []const []const u8 {
-    return if (sanitizer == .address)
-        &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=address", "-fno-omit-frame-pointer" }
-    else
-        common_flags;
+fn linkClangRuntime(module: *std.Build.Module, features: Features, name: []const u8) void {
+    const dir = features.clang_runtime_dir orelse
+        @panic("-Dclang-runtime-dir is required (run: clang --print-runtime-dir)");
+    module.addLibraryPath(.{ .cwd_relative = dir });
+    module.linkSystemLibrary(name, .{});
+}
+
+fn cFlags(sanitizer: Sanitizer, fuzz: bool) []const []const u8 {
+    if (sanitizer == .address and fuzz)
+        return &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=address", "-fno-omit-frame-pointer", "-fsanitize=fuzzer-no-link" };
+    if (sanitizer == .address)
+        return &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=address", "-fno-omit-frame-pointer" };
+    if (fuzz)
+        return &.{ "-std=gnu11", "-fno-strict-aliasing", "-fsanitize=fuzzer-no-link" };
+    return common_flags;
 }
 
 fn addSystemLibraries(module: *std.Build.Module, features: Features, threaded: bool) void {
