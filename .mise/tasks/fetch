@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Fetch Zig dependencies with zigfetch"
+set -euo pipefail
+
+exec zigfetch "$@" .
