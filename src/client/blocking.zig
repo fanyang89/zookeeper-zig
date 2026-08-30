@@ -103,6 +103,17 @@ pub const BlockingClient = struct {
         };
     }
 
+    pub fn sendAuth(self: *BlockingClient, scheme: []const u8, auth: []const u8) !void {
+        if (!self.session.state.isConnected()) return error.ConnectionLoss;
+        var writer = jute.Writer.init(self.allocator);
+        defer writer.deinit();
+        try self.session.encodeAuth(&writer, scheme, auth, monotonicMs(self.io));
+        self.transport.writeFrameTimeout(self.io, writer.bytes(), self.io_timeout) catch |err| {
+            self.failConnection();
+            return err;
+        };
+    }
+
     pub fn sendSetWatches(self: *BlockingClient, body: anytype, extended: bool) !void {
         if (!self.session.state.isConnected()) return error.ConnectionLoss;
         var writer = jute.Writer.init(self.allocator);

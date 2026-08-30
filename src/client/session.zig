@@ -188,6 +188,24 @@ pub const Session = struct {
         self.last_send_ms = now_ms;
     }
 
+    pub fn encodeAuth(
+        self: *Session,
+        writer: *jute.Writer,
+        scheme: []const u8,
+        auth: []const u8,
+        now_ms: i64,
+    ) (wire.EncodeError || Error)!void {
+        if (!self.state.isConnected()) return error.InvalidState;
+        try wire.encodeRequestWithLimit(
+            writer,
+            wire.Xid.auth,
+            .auth,
+            proto.AuthPacket{ .type = 0, .scheme = scheme, .auth = auth },
+            self.limits.max_payload_size,
+        );
+        self.last_send_ms = now_ms;
+    }
+
     pub fn encodeSetWatches(
         self: *Session,
         writer: *jute.Writer,

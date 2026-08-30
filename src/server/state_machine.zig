@@ -2,6 +2,7 @@ const std = @import("std");
 const raft = @import("raftz");
 const jute = @import("../jute.zig");
 const protocol = @import("../protocol.zig");
+const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
 const rocks_store = @import("rocks_store.zig");
@@ -29,7 +30,18 @@ pub const ChildrenResult = struct {
     }
 };
 
-pub const SessionReadError = error{ SessionExpired, SessionMoved };
+pub const AclResult = struct {
+    blob: ?[]u8,
+    stat: protocol.data.Stat,
+    redact_digest: bool,
+
+    pub fn deinit(self: *AclResult, allocator: std.mem.Allocator) void {
+        if (self.blob) |value| allocator.free(value);
+        self.* = undefined;
+    }
+};
+
+pub const SessionReadError = error{ SessionExpired, SessionMoved, NoAuth };
 
 pub const ZooKeeperStateMachine = struct {
     allocator: std.mem.Allocator,
@@ -87,10 +99,25 @@ pub const ZooKeeperStateMachine = struct {
         generation: u64,
         path: []const u8,
     ) !?protocol.data.Stat {
+        return self.existsAuthorizedForSession(session_id, generation, path, null);
+    }
+
+    pub fn existsAuthorizedForSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+    ) !?protocol.data.Stat {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
-        return self.store.exists(path);
+        switch (try self.store.authorize(path, acl.read, identities)) {
+            .ok => return self.store.exists(path),
+            .no_node => return null,
+            .no_auth => return error.NoAuth,
+            else => return error.NoAuth,
+        }
     }
 
     pub fn getDataForSession(
@@ -100,9 +127,26 @@ pub const ZooKeeperStateMachine = struct {
         generation: u64,
         path: []const u8,
     ) !?DataResult {
+        return self.getDataAuthorizedForSession(allocator, session_id, generation, path, null);
+    }
+
+    pub fn getDataAuthorizedForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+    ) !?DataResult {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
+        switch (try self.store.authorize(path, acl.read, identities)) {
+            .ok => {},
+            .no_node => return null,
+            .no_auth => return error.NoAuth,
+            else => return error.NoAuth,
+        }
         const result = (try self.store.getData(allocator, path)) orelse return null;
         return .{ .data = result.data, .stat = result.stat };
     }
@@ -114,12 +158,59 @@ pub const ZooKeeperStateMachine = struct {
         generation: u64,
         path: []const u8,
     ) !?ChildrenResult {
+        return self.getChildrenAuthorizedForSession(allocator, session_id, generation, path, null);
+    }
+
+    pub fn getChildrenAuthorizedForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+    ) !?ChildrenResult {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
+        switch (try self.store.authorize(path, acl.read, identities)) {
+            .ok => {},
+            .no_node => return null,
+            .no_auth => return error.NoAuth,
+            else => return error.NoAuth,
+        }
         const stat = (try self.store.exists(path)) orelse return null;
         const names = (try self.store.getChildren(allocator, path)).?;
         return .{ .names = names, .stat = stat };
+    }
+
+    pub fn getAclForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+    ) !?AclResult {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+        switch (try self.store.authorize(path, acl.read | acl.admin, identities)) {
+            .ok => {},
+            .no_node => return null,
+            .no_auth => return error.NoAuth,
+            else => return error.NoAuth,
+        }
+        const redact_digest = switch (try self.store.authorize(path, acl.admin, identities)) {
+            .ok => false,
+            .no_auth => true,
+            else => return error.NoAuth,
+        };
+        const result = (try self.store.getAcl(allocator, path)) orelse return null;
+        return .{
+            .blob = result.blob,
+            .stat = result.stat,
+            .redact_digest = redact_digest,
+        };
     }
 
     pub fn validateSession(
@@ -199,6 +290,9 @@ pub const ZooKeeperStateMachine = struct {
                 .stat = result.stat.?,
             }) catch unreachable,
             .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => {},
+            .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
+                .stat = result.stat.?,
+            }) catch unreachable,
             .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
                 .stat = result.stat.?,
             }) catch unreachable,

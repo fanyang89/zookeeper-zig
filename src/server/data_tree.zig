@@ -7,11 +7,13 @@ pub const ErrorCode = enum(i32) {
     unimplemented = -6,
     bad_arguments = -8,
     no_node = -101,
+    no_auth = -102,
     bad_version = -103,
     no_children_for_ephemerals = -108,
     node_exists = -110,
     not_empty = -111,
     session_expired = -112,
+    invalid_acl = -114,
     auth_failed = -115,
     session_moved = -118,
 };
@@ -36,12 +38,15 @@ pub const Node = struct {
     mtime: i64,
     version: i32 = 0,
     cversion: i32 = 0,
+    aversion: i32 = 0,
     pzxid: i64,
     child_count: usize = 0,
     ephemeral_owner: i64 = 0,
+    acl: ?[]u8 = null,
 
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
+        if (self.acl) |value| allocator.free(value);
         self.* = undefined;
     }
 
@@ -53,7 +58,7 @@ pub const Node = struct {
             .mtime = self.mtime,
             .version = self.version,
             .cversion = self.cversion,
-            .aversion = 0,
+            .aversion = self.aversion,
             .ephemeralOwner = self.ephemeral_owner,
             .dataLength = @intCast(self.data.len),
             .numChildren = @intCast(self.child_count),

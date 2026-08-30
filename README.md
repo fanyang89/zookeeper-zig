@@ -68,7 +68,7 @@ and supports bounded connect, handshake, read, and write operations. It uses the
 monotonic awake clock for session activity. Disconnects drain outstanding
 requests into `failedRequests()` with a connection-loss reason, and `close()`
 performs the ordered `closeSession` exchange. The client is single-threaded and
-does not yet reconnect, authenticate, or restore watches automatically; callers
+does not yet reconnect, re-authenticate, or restore watches automatically; callers
 responsible for ping and expiration checks should configure finite I/O timeouts.
 
 The protocol modules contain all 72 records from ZooKeeper 3.9.5's
@@ -117,15 +117,16 @@ zig-out/bin/zookeeper-quorum-server \
 ```
 
 The current server supports replicated sessions, session resume and expiration,
-ephemeral and sequential nodes, Connect, ping, closeSession, create/create2,
-delete, setData, exists, getData, getChildren/getChildren2, and sync. Reads use Raft ReadIndex
+ephemeral and sequential nodes, digest authentication, ACL enforcement,
+Connect, ping, closeSession, create/create2, delete, setData, getACL/setACL,
+exists, getData, getChildren/getChildren2, and sync. Reads use Raft ReadIndex
 before accessing RocksDB. Session close and expiration atomically remove all
-session-owned ephemeral nodes. Watches, ACL enforcement, authentication, and multi operations are not
-implemented yet.
+session-owned ephemeral nodes. ACLs support `world`, `auth`, and `digest`; IP,
+SASL, watches, and multi operations are not implemented yet.
 
 ## Roadmap
 
-1. Complete authentication, reconnect, watches, and high-level client APIs.
-2. Add ACLs, watches, and multi operations.
+1. Complete reconnect, watches, and high-level client APIs.
+2. Add IP/SASL authentication, watches, and multi operations.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.

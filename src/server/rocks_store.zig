@@ -3,6 +3,7 @@ const rocksdb = @import("rocksdb");
 const rocksdb_c = @import("rocksdb_c");
 const jute = @import("../jute.zig");
 const protocol = @import("../protocol.zig");
+const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
 
@@ -24,6 +25,16 @@ pub const Applied = struct {
 pub const DataResult = struct {
     data: []u8,
     stat: protocol.data.Stat,
+};
+
+pub const AclResult = struct {
+    blob: ?[]u8,
+    stat: protocol.data.Stat,
+
+    pub fn deinit(self: *AclResult, allocator: std.mem.Allocator) void {
+        if (self.blob) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 pub const Session = struct {
@@ -136,15 +147,32 @@ pub const RocksStore = struct {
                 request.ephemeral,
                 request.session_id,
                 request.sequential,
+                request.acl,
+                request.identities,
                 index,
                 term,
             ),
-            .delete => |request| try self.delete(request.path, request.expected_version, index, term),
+            .delete => |request| try self.delete(
+                request.path,
+                request.expected_version,
+                request.identities,
+                index,
+                term,
+            ),
+            .set_acl => |request| try self.setAcl(
+                request.path,
+                request.acl,
+                request.expected_version,
+                request.identities,
+                index,
+                term,
+            ),
             .set_data => |request| try self.setData(
                 request.path,
                 request.data,
                 request.expected_version,
                 request.time_ms,
+                request.identities,
                 index,
                 term,
             ),
@@ -272,6 +300,34 @@ pub const RocksStore = struct {
             }
         }.lessThan);
         return try children.toOwnedSlice(allocator);
+    }
+
+    pub fn authorize(
+        self: *RocksStore,
+        path: []const u8,
+        permission: i32,
+        identities: ?[]const u8,
+    ) !data_tree.ErrorCode {
+        const maybe_node = try self.getNode(path);
+        if (maybe_node == null) return .no_node;
+        var node = maybe_node.?;
+        defer node.deinit(self.allocator);
+        return if (try acl.allows(node.acl, permission, identities)) .ok else .no_auth;
+    }
+
+    pub fn getAcl(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) !?AclResult {
+        const maybe_node = try self.getNode(path);
+        if (maybe_node == null) return null;
+        var node = maybe_node.?;
+        defer node.deinit(self.allocator);
+        return .{
+            .blob = if (node.acl) |value| try allocator.dupe(u8, value) else null,
+            .stat = node.stat(),
+        };
     }
 
     pub fn getSession(self: *RocksStore, session_id: i64) !?Session {
@@ -454,6 +510,7 @@ pub const RocksStore = struct {
         const identity: ?struct { id: i64, generation: u64 } = switch (operation) {
             .create => |request| .{ .id = request.session_id, .generation = request.session_generation },
             .delete => |request| .{ .id = request.session_id, .generation = request.session_generation },
+            .set_acl => |request| .{ .id = request.session_id, .generation = request.session_generation },
             .set_data => |request| .{ .id = request.session_id, .generation = request.session_generation },
             else => null,
         };
@@ -713,6 +770,8 @@ pub const RocksStore = struct {
         ephemeral: bool,
         session_id: i64,
         sequential: bool,
+        acl_blob: ?[]const u8,
+        identities: ?[]const u8,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
@@ -725,6 +784,7 @@ pub const RocksStore = struct {
         {
             return .{ .code = .bad_arguments };
         }
+        if (acl_blob) |value| acl.validate(value) catch return .{ .code = .invalid_acl };
         if (ephemeral) {
             const session = (try self.getSession(session_id)) orelse
                 return .{ .code = .session_expired };
@@ -734,6 +794,7 @@ pub const RocksStore = struct {
         if (maybe_parent == null) return .{ .code = .no_node };
         var parent = maybe_parent.?;
         defer parent.deinit(self.allocator);
+        if (!try acl.allows(parent.acl, acl.create, identities)) return .{ .code = .no_auth };
         if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
             (!sequential and parent.cversion == std.math.maxInt(i32)))
@@ -755,8 +816,14 @@ pub const RocksStore = struct {
             return .{ .code = .node_exists };
         }
 
+        const node_data = try self.allocator.dupe(u8, data);
+        var node_data_owned = true;
+        defer if (node_data_owned) self.allocator.free(node_data);
+        const node_acl = if (acl_blob) |value| try self.allocator.dupe(u8, value) else null;
+        var node_acl_owned = true;
+        defer if (node_acl_owned) if (node_acl) |value| self.allocator.free(value);
         var node = Node{
-            .data = try self.allocator.dupe(u8, data),
+            .data = node_data,
             .czxid = @intCast(index),
             .mzxid = @intCast(index),
             .ctime = time_ms,
@@ -766,7 +833,10 @@ pub const RocksStore = struct {
             .pzxid = @intCast(index),
             .child_count = 0,
             .ephemeral_owner = if (ephemeral) session_id else 0,
+            .acl = node_acl,
         };
+        node_data_owned = false;
+        node_acl_owned = false;
         defer node.deinit(self.allocator);
         parent.cversion = if (sequential) parent.cversion +% 1 else parent.cversion + 1;
         parent.pzxid = @intCast(index);
@@ -788,21 +858,23 @@ pub const RocksStore = struct {
         self: *RocksStore,
         path: []const u8,
         expected_version: i32,
+        identities: ?[]const u8,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
         if (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/")) {
             return .{ .code = .bad_arguments };
         }
+        const parent_path = data_tree.parentPath(path).?;
+        var parent = (try self.getNode(parent_path)) orelse return .{ .code = .no_node };
+        defer parent.deinit(self.allocator);
+        if (!try acl.allows(parent.acl, acl.delete, identities)) return .{ .code = .no_auth };
         const maybe_node = try self.getNode(path);
         if (maybe_node == null) return .{ .code = .no_node };
         var node = maybe_node.?;
         defer node.deinit(self.allocator);
-        if (node.child_count != 0) return .{ .code = .not_empty };
         if (expected_version != -1 and expected_version != node.version) return .{ .code = .bad_version };
-        const parent_path = data_tree.parentPath(path).?;
-        var parent = (try self.getNode(parent_path)).?;
-        defer parent.deinit(self.allocator);
+        if (node.child_count != 0) return .{ .code = .not_empty };
         if (parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
         parent.cversion += 1;
         parent.pzxid = @intCast(index);
@@ -815,12 +887,42 @@ pub const RocksStore = struct {
         return .{ .code = .ok };
     }
 
+    fn setAcl(
+        self: *RocksStore,
+        path: []const u8,
+        acl_blob: []const u8,
+        expected_version: i32,
+        identities: ?[]const u8,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        acl.validate(acl_blob) catch return .{ .code = .invalid_acl };
+        const maybe_node = try self.getNode(path);
+        if (maybe_node == null) return .{ .code = .no_node };
+        var node = maybe_node.?;
+        defer node.deinit(self.allocator);
+        if (!try acl.allows(node.acl, acl.admin, identities)) return .{ .code = .no_auth };
+        if (expected_version != -1 and expected_version != node.aversion) return .{ .code = .bad_version };
+        if (node.aversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
+        const replacement = try self.allocator.dupe(u8, acl_blob);
+        if (node.acl) |value| self.allocator.free(value);
+        node.acl = replacement;
+        node.aversion += 1;
+        try self.commitNodes(
+            &.{.{ .path = path, .node = node }},
+            null,
+            .{ .index = index, .term = term },
+        );
+        return .{ .code = .ok, .stat = node.stat() };
+    }
+
     fn setData(
         self: *RocksStore,
         path: []const u8,
         data: []const u8,
         expected_version: i32,
         time_ms: i64,
+        identities: ?[]const u8,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
@@ -828,6 +930,7 @@ pub const RocksStore = struct {
         if (maybe_node == null) return .{ .code = .no_node };
         var node = maybe_node.?;
         defer node.deinit(self.allocator);
+        if (!try acl.allows(node.acl, acl.write, identities)) return .{ .code = .no_auth };
         if (expected_version != -1 and expected_version != node.version) return .{ .code = .bad_version };
         if (data.len > std.math.maxInt(i32) or node.version == std.math.maxInt(i32)) {
             return .{ .code = .bad_arguments };
@@ -1064,6 +1167,8 @@ fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     try writer.writeLong(node.pzxid);
     try writer.writeLong(@bitCast(node.child_count));
     try writer.writeLong(node.ephemeral_owner);
+    try writer.writeInt(node.aversion);
+    try writer.writeBuffer(node.acl);
     return writer.toOwnedSliceAssert();
 }
 
@@ -1080,12 +1185,17 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
     const pzxid = try reader.readLong();
     const child_count = std.math.cast(usize, @as(u64, @bitCast(try reader.readLong()))) orelse
         return error.InvalidNode;
-    const ephemeral_owner = switch (reader.remaining()) {
-        0 => 0,
-        8 => try reader.readLong(),
-        else => return error.InvalidNode,
-    };
+    const ephemeral_owner = if (reader.remaining() == 0) 0 else try reader.readLong();
+    const aversion = if (reader.remaining() == 0) 0 else try reader.readInt();
+    const acl_blob = if (reader.remaining() == 0)
+        null
+    else if (try reader.readBuffer()) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (acl_blob) |value| allocator.free(value);
     if (reader.remaining() != 0) return error.InvalidNode;
+    if (acl_blob) |value| acl.validate(value) catch return error.InvalidNode;
     return .{
         .data = data,
         .czxid = czxid,
@@ -1094,9 +1204,11 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
         .mtime = mtime,
         .version = version,
         .cversion = cversion,
+        .aversion = aversion,
         .pzxid = pzxid,
         .child_count = child_count,
         .ephemeral_owner = ephemeral_owner,
+        .acl = acl_blob,
     };
 }
 
@@ -1187,4 +1299,66 @@ test "sequential creates use persistent parent cversion suffixes" {
         defer third.deinit(testing.allocator);
         try testing.expectEqualStrings("/member-0000000003", third.created_path.?);
     }
+}
+
+test "ACL authorization and snapshot restore preserve digest ownership" {
+    const testing = std.testing;
+    var source_directory = std.testing.tmpDir(.{});
+    defer source_directory.cleanup();
+    var target_directory = std.testing.tmpDir(.{});
+    defer target_directory.cleanup();
+    const source_path = try source_directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(source_path);
+    const target_path = try target_directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(target_path);
+
+    const digest_id = try acl.digestIdentity(testing.allocator, "owner:secret");
+    defer testing.allocator.free(digest_id);
+    const identities = [_]acl.Identity{.{ .scheme = "digest", .id = digest_id }};
+    const identities_blob = try acl.encodeIdentities(testing.allocator, &identities);
+    defer testing.allocator.free(identities_blob);
+    const secure_acl = [_]acl.Entry{.{
+        .perms = acl.all,
+        .scheme = "digest",
+        .id = digest_id,
+    }};
+    const acl_blob = try acl.encode(testing.allocator, &secure_acl);
+    defer testing.allocator.free(acl_blob);
+
+    var source = try RocksStore.open(testing.allocator, source_path);
+    defer source.deinit();
+    var created = try source.apply(.{ .create = .{
+        .path = "/secure",
+        .data = "private",
+        .time_ms = 1,
+        .acl = acl_blob,
+        .identities = identities_blob,
+    } }, 1, 1);
+    defer created.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.no_auth, try source.authorize("/secure", acl.read, null));
+    try testing.expectEqual(ErrorCode.ok, try source.authorize("/secure", acl.read, identities_blob));
+
+    const read_admin_acl = [_]acl.Entry{.{
+        .perms = acl.read | acl.admin,
+        .scheme = "digest",
+        .id = digest_id,
+    }};
+    const replacement = try acl.encode(testing.allocator, &read_admin_acl);
+    defer testing.allocator.free(replacement);
+    var updated = try source.apply(.{ .set_acl = .{
+        .path = "/secure",
+        .acl = replacement,
+        .expected_version = 0,
+        .identities = identities_blob,
+    } }, 2, 1);
+    defer updated.deinit(testing.allocator);
+    try testing.expectEqual(@as(i32, 1), updated.stat.?.aversion);
+
+    const snapshot = try source.snapshot(testing.allocator);
+    defer testing.allocator.free(snapshot);
+    var target = try RocksStore.open(testing.allocator, target_path);
+    defer target.deinit();
+    try target.restore(snapshot, 2, 1);
+    try testing.expectEqual(ErrorCode.no_auth, try target.authorize("/secure", acl.read, null));
+    try testing.expectEqual(ErrorCode.ok, try target.authorize("/secure", acl.admin, identities_blob));
 }

@@ -2,12 +2,13 @@ const std = @import("std");
 const jute = @import("../jute.zig");
 const data_tree = @import("data_tree.zig");
 
-pub const version: i32 = 3;
+pub const version: i32 = 4;
 pub const legacy_version: i32 = 1;
 
 pub const Kind = enum(i32) {
     create = 1,
     delete = 2,
+    set_acl = 4,
     set_data = 5,
     open_session = 100,
     touch_session = 101,
@@ -26,12 +27,23 @@ pub const Mutation = union(Kind) {
         session_id: i64 = 0,
         session_generation: u64 = 0,
         sequential: bool = false,
+        acl: ?[]const u8 = null,
+        identities: ?[]const u8 = null,
     },
     delete: struct {
         path: []const u8,
         expected_version: i32,
         session_id: i64 = 0,
         session_generation: u64 = 0,
+        identities: ?[]const u8 = null,
+    },
+    set_acl: struct {
+        path: []const u8,
+        acl: []const u8,
+        expected_version: i32,
+        session_id: i64 = 0,
+        session_generation: u64 = 0,
+        identities: ?[]const u8 = null,
     },
     set_data: struct {
         path: []const u8,
@@ -40,6 +52,7 @@ pub const Mutation = union(Kind) {
         time_ms: i64,
         session_id: i64 = 0,
         session_generation: u64 = 0,
+        identities: ?[]const u8 = null,
     },
     open_session: struct {
         session_id: i64,
@@ -84,7 +97,7 @@ pub fn resultCapacity(mutation: Mutation) error{SizeOverflow}!usize {
     return switch (mutation) {
         .create => |value| std.math.add(usize, 94, value.path.len) catch error.SizeOverflow,
         .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => 12,
-        .set_data => 80,
+        .set_acl, .set_data => 80,
     };
 }
 
@@ -102,12 +115,23 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeLong(value.session_id);
             try writer.writeLong(@bitCast(value.session_generation));
             try writer.writeBool(value.sequential);
+            try writer.writeBuffer(value.acl);
+            try writer.writeBuffer(value.identities);
         },
         .delete => |value| {
             try writer.writeString(value.path);
             try writer.writeInt(value.expected_version);
             try writer.writeLong(value.session_id);
             try writer.writeLong(@bitCast(value.session_generation));
+            try writer.writeBuffer(value.identities);
+        },
+        .set_acl => |value| {
+            try writer.writeString(value.path);
+            try writer.writeBuffer(value.acl);
+            try writer.writeInt(value.expected_version);
+            try writer.writeLong(value.session_id);
+            try writer.writeLong(@bitCast(value.session_generation));
+            try writer.writeBuffer(value.identities);
         },
         .set_data => |value| {
             try writer.writeString(value.path);
@@ -116,6 +140,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeLong(value.time_ms);
             try writer.writeLong(value.session_id);
             try writer.writeLong(@bitCast(value.session_generation));
+            try writer.writeBuffer(value.identities);
         },
         .open_session => |value| {
             try writer.writeLong(value.session_id);
@@ -159,7 +184,9 @@ pub fn decode(bytes: []const u8) !Mutation {
         return error.UnsupportedCommandVersion;
     }
     const kind = checkedEnum(Kind, try reader.readInt()) orelse return error.UnknownCommand;
-    if (encoded_version == legacy_version and @intFromEnum(kind) >= 100) {
+    if ((encoded_version == legacy_version and @intFromEnum(kind) >= 100) or
+        (kind == .set_acl and encoded_version < 4))
+    {
         return error.UnsupportedCommandVersion;
     }
     const mutation: Mutation = switch (kind) {
@@ -171,12 +198,23 @@ pub fn decode(bytes: []const u8) !Mutation {
             .session_id = if (encoded_version >= 2) try reader.readLong() else 0,
             .session_generation = if (encoded_version >= 2) @bitCast(try reader.readLong()) else 0,
             .sequential = if (encoded_version >= 3) try reader.readBool() else false,
+            .acl = if (encoded_version >= 4) try reader.readBuffer() else null,
+            .identities = if (encoded_version >= 4) try reader.readBuffer() else null,
         } },
         .delete => .{ .delete = .{
             .path = (try reader.readString()) orelse return error.InvalidCommand,
             .expected_version = try reader.readInt(),
             .session_id = if (encoded_version >= 2) try reader.readLong() else 0,
             .session_generation = if (encoded_version >= 2) @bitCast(try reader.readLong()) else 0,
+            .identities = if (encoded_version >= 4) try reader.readBuffer() else null,
+        } },
+        .set_acl => .{ .set_acl = .{
+            .path = (try reader.readString()) orelse return error.InvalidCommand,
+            .acl = (try reader.readBuffer()) orelse return error.InvalidCommand,
+            .expected_version = try reader.readInt(),
+            .session_id = try reader.readLong(),
+            .session_generation = @bitCast(try reader.readLong()),
+            .identities = try reader.readBuffer(),
         } },
         .set_data => .{ .set_data = .{
             .path = (try reader.readString()) orelse return error.InvalidCommand,
@@ -185,6 +223,7 @@ pub fn decode(bytes: []const u8) !Mutation {
             .time_ms = try reader.readLong(),
             .session_id = if (encoded_version >= 2) try reader.readLong() else 0,
             .session_generation = if (encoded_version >= 2) @bitCast(try reader.readLong()) else 0,
+            .identities = if (encoded_version >= 4) try reader.readBuffer() else null,
         } },
         .open_session => .{ .open_session = .{
             .session_id = try reader.readLong(),
@@ -307,6 +346,22 @@ test "mutation commands and results round trip" {
     try testing.expect(version_two_create.create.ephemeral);
     try testing.expect(!version_two_create.create.sequential);
     try testing.expectEqual(@as(u64, 7), version_two_create.create.session_generation);
+
+    var version_three_writer = jute.Writer.init(testing.allocator);
+    defer version_three_writer.deinit();
+    try version_three_writer.writeInt(3);
+    try version_three_writer.writeInt(@intFromEnum(Kind.create));
+    try version_three_writer.writeString("/v3-");
+    try version_three_writer.writeBuffer("payload");
+    try version_three_writer.writeLong(789);
+    try version_three_writer.writeBool(false);
+    try version_three_writer.writeLong(42);
+    try version_three_writer.writeLong(8);
+    try version_three_writer.writeBool(true);
+    const version_three_create = try decode(version_three_writer.bytes());
+    try testing.expect(version_three_create.create.sequential);
+    try testing.expect(version_three_create.create.acl == null);
+    try testing.expect(version_three_create.create.identities == null);
 
     const response = try encodeResult(testing.allocator, .ok, 7, {});
     defer testing.allocator.free(response);

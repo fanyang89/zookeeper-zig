@@ -5,6 +5,7 @@ const protocol = @import("../protocol.zig");
 const wire = @import("../wire.zig");
 const blocking_client = @import("../client/blocking.zig");
 const TcpTransport = @import("../client/tcp_transport.zig").TcpTransport;
+const acl = @import("acl.zig");
 const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
@@ -15,6 +16,17 @@ const ConnectionSession = struct {
     password: [16]u8,
     timeout_ms: i32,
     generation: u64,
+};
+
+const ConnectionContext = struct {
+    session: ConnectionSession,
+    identities: std.ArrayList(acl.Identity) = .empty,
+
+    fn deinit(self: *ConnectionContext, allocator: std.mem.Allocator) void {
+        for (self.identities.items) |identity| allocator.free(identity.id);
+        self.identities.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 const SessionMutationResult = struct {
@@ -74,6 +86,8 @@ pub const TcpServer = struct {
         defer self.allocator.free(connect_payload);
         const connect = try wire.decodeConnectRequest(connect_payload);
         const session = (try self.establishSession(&transport, connect)) orelse return;
+        var context = ConnectionContext{ .session = session };
+        defer context.deinit(self.allocator);
 
         while (true) {
             const payload = try transport.readFrameAlloc(
@@ -89,7 +103,7 @@ pub const TcpServer = struct {
             };
             const keep_open = try self.dispatch(
                 &transport,
-                session,
+                &context,
                 request.header.xid,
                 opcode,
                 request.body,
@@ -195,11 +209,12 @@ pub const TcpServer = struct {
     fn dispatch(
         self: *TcpServer,
         transport: *TcpTransport,
-        session: ConnectionSession,
+        context: *ConnectionContext,
         xid: i32,
         opcode: wire.OpCode,
         body: []const u8,
     ) !bool {
+        const session = context.session;
         if (opcode != .close_session) {
             const touched = self.proposeSession(.{ .touch_session = .{
                 .session_id = session.id,
@@ -243,22 +258,63 @@ pub const TcpServer = struct {
                 }, {});
                 return false;
             },
-            .create, .create2 => try self.create(transport, session, xid, opcode, body),
-            .delete => try self.delete(transport, session, xid, body),
-            .set_data => try self.setData(transport, session, xid, body),
-            .exists => try self.exists(transport, session, xid, body),
-            .get_data => try self.getData(transport, session, xid, body),
-            .get_children, .get_children2 => try self.getChildren(transport, session, xid, opcode, body),
+            .auth => try self.authenticate(transport, context, body),
+            .create, .create2 => try self.create(transport, session, context.identities.items, xid, opcode, body),
+            .delete => try self.delete(transport, session, context.identities.items, xid, body),
+            .set_acl => try self.setAcl(transport, session, context.identities.items, xid, body),
+            .set_data => try self.setData(transport, session, context.identities.items, xid, body),
+            .exists => try self.exists(transport, session, context.identities.items, xid, body),
+            .get_acl => try self.getAcl(transport, session, context.identities.items, xid, body),
+            .get_data => try self.getData(transport, session, context.identities.items, xid, body),
+            .get_children, .get_children2 => try self.getChildren(transport, session, context.identities.items, xid, opcode, body),
             .sync => try self.sync(transport, session, xid, body),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
         return true;
     }
 
+    fn authenticate(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        context: *ConnectionContext,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.AuthPacket, bytes, self.allocator);
+        const scheme = request.scheme orelse
+            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
+        const credentials = request.auth orelse
+            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
+        if (!std.mem.eql(u8, scheme, "digest")) {
+            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
+        }
+        const identity = acl.digestIdentity(self.allocator, credentials) catch
+            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
+        for (context.identities.items) |existing| {
+            if (std.mem.eql(u8, existing.scheme, "digest") and std.mem.eql(u8, existing.id, identity)) {
+                self.allocator.free(identity);
+                return sendReply(transport, self.allocator, self.io, .{
+                    .xid = wire.Xid.auth,
+                    .zxid = -1,
+                    .err = 0,
+                }, {});
+            }
+        }
+        context.identities.append(self.allocator, .{ .scheme = "digest", .id = identity }) catch |err| {
+            self.allocator.free(identity);
+            return err;
+        };
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = wire.Xid.auth,
+            .zxid = -1,
+            .err = 0,
+        }, {});
+    }
+
     fn create(
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         opcode: wire.OpCode,
         bytes: []const u8,
@@ -281,6 +337,11 @@ pub const TcpServer = struct {
             -1,
             .unimplemented,
         );
+        const acl_blob = acl.normalize(self.allocator, request.acl, identities) catch
+            return sendError(transport, self.allocator, self.io, xid, -1, .invalid_acl);
+        defer self.allocator.free(acl_blob);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         var proposal = self.quorum.propose(.{ .create = .{
             .path = path,
             .data = request.data orelse &.{},
@@ -289,6 +350,8 @@ pub const TcpServer = struct {
             .session_id = session.id,
             .session_generation = session.generation,
             .sequential = (request.flags & 2) != 0,
+            .acl = acl_blob,
+            .identities = identities_blob,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -329,10 +392,13 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
     ) !void {
         const request = try decodeBody(protocol.proto.DeleteRequest, bytes, self.allocator);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         var proposal = self.quorum.propose(.{ .delete = .{
             .path = request.path orelse return sendError(
                 transport,
@@ -345,6 +411,7 @@ pub const TcpServer = struct {
             .expected_version = request.version,
             .session_id = session.id,
             .session_generation = session.generation,
+            .identities = identities_blob,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -370,14 +437,64 @@ pub const TcpServer = struct {
         }, {});
     }
 
+    fn setAcl(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.SetACLRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const path = request.path orelse
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        const acl_blob = acl.normalize(self.allocator, request.acl, identities) catch
+            return sendError(transport, self.allocator, self.io, xid, -1, .invalid_acl);
+        defer self.allocator.free(acl_blob);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        var proposal = self.quorum.propose(.{ .set_acl = .{
+            .path = path,
+            .acl = acl_blob,
+            .expected_version = request.version,
+            .session_id = session.id,
+            .session_generation = session.generation,
+            .identities = identities_blob,
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, result.zxid, result.code);
+        }
+        var reader = jute.Reader.init(result.body);
+        const response = try jute.deserialize(protocol.proto.SetACLResponse, &reader, self.allocator);
+        if (reader.remaining() != 0) return error.InvalidProposalResponse;
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, response);
+    }
+
     fn setData(
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
     ) !void {
         const request = try decodeBody(protocol.proto.SetDataRequest, bytes, self.allocator);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         var proposal = self.quorum.propose(.{ .set_data = .{
             .path = request.path orelse return sendError(
                 transport,
@@ -392,6 +509,7 @@ pub const TcpServer = struct {
             .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
             .session_id = session.id,
             .session_generation = session.generation,
+            .identities = identities_blob,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -424,10 +542,13 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
     ) !void {
         const request = try decodeBody(protocol.proto.ExistsRequest, bytes, self.allocator);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
         const path = request.path orelse return sendError(
@@ -438,10 +559,11 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        const maybe_stat = self.quorum.machine.existsForSession(
+        const maybe_stat = self.quorum.machine.existsAuthorizedForSession(
             session.id,
             session.generation,
             path,
+            identities_blob,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -455,14 +577,77 @@ pub const TcpServer = struct {
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.ExistsResponse{ .stat = stat });
     }
 
+    fn getAcl(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.GetACLRequest, bytes, self.allocator);
+        const path = request.path orelse
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        var result = (self.quorum.machine.getAclForSession(
+            self.allocator,
+            session.id,
+            session.generation,
+            path,
+            identities_blob,
+        ) catch |err| return sendMappedSessionError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            zxid,
+            err,
+        )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        defer result.deinit(self.allocator);
+        const entries = try acl.decodeViews(self.allocator, result.blob);
+        defer self.allocator.free(entries);
+        var redacted_ids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (redacted_ids.items) |id| self.allocator.free(id);
+            redacted_ids.deinit(self.allocator);
+        }
+        if (result.redact_digest) {
+            for (entries) |*entry| {
+                const scheme = entry.id.scheme orelse continue;
+                const id = entry.id.id orelse continue;
+                if (!std.mem.eql(u8, scheme, "digest")) continue;
+                const colon = std.mem.indexOfScalar(u8, id, ':') orelse continue;
+                const redacted = try self.allocator.alloc(u8, colon + 2);
+                @memcpy(redacted[0 .. colon + 1], id[0 .. colon + 1]);
+                redacted[colon + 1] = 'x';
+                redacted_ids.append(self.allocator, redacted) catch |err| {
+                    self.allocator.free(redacted);
+                    return err;
+                };
+                entry.id.id = redacted;
+            }
+        }
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, protocol.proto.GetACLResponse{ .acl = entries, .stat = result.stat });
+    }
+
     fn getData(
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
     ) !void {
         const request = try decodeBody(protocol.proto.GetDataRequest, bytes, self.allocator);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
         const path = request.path orelse return sendError(
@@ -473,11 +658,12 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        var result = (self.quorum.machine.getDataForSession(
+        var result = (self.quorum.machine.getDataAuthorizedForSession(
             self.allocator,
             session.id,
             session.generation,
             path,
+            identities_blob,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -494,6 +680,7 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *TcpTransport,
         session: ConnectionSession,
+        identities: []const acl.Identity,
         xid: i32,
         opcode: wire.OpCode,
         bytes: []const u8,
@@ -505,6 +692,8 @@ pub const TcpServer = struct {
             const request = try decodeBody(protocol.proto.GetChildren2Request, bytes, self.allocator);
             break :blk request.path;
         };
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
         const resolved_path = path orelse return sendError(
@@ -515,11 +704,12 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        var result = (self.quorum.machine.getChildrenForSession(
+        var result = (self.quorum.machine.getChildrenAuthorizedForSession(
             self.allocator,
             session.id,
             session.generation,
             resolved_path,
+            identities_blob,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -615,6 +805,7 @@ fn sendMappedSessionError(
     const code: data_tree.ErrorCode = switch (err) {
         error.SessionExpired => .session_expired,
         error.SessionMoved => .session_moved,
+        error.NoAuth => .no_auth,
         else => return err,
     };
     return sendError(transport, allocator, io, xid, zxid, code);
@@ -739,7 +930,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     const create_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
         .path = "/app",
         .data = "one",
-        .acl = null,
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
         .flags = 0,
     });
     var create_reply = try expectResponse(&client, create_xid);
@@ -754,7 +945,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     const create2_xid = try client.sendRequest(.create2, protocol.proto.CreateRequest{
         .path = "/temporary",
         .data = "created-with-stat",
-        .acl = null,
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
         .flags = 0,
     });
     var create2_reply = try expectResponse(&client, create2_xid);
@@ -819,7 +1010,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     const sequential_xid = try client.sendRequest(.create2, protocol.proto.CreateRequest{
         .path = "/member-",
         .data = "ordered",
-        .acl = null,
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
         .flags = 2,
     });
     var sequential_reply = try expectResponse(&client, sequential_xid);
@@ -842,7 +1033,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     const ephemeral_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
         .path = "/ephemeral-",
         .data = "session-owned",
-        .acl = null,
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
         .flags = 3,
     });
     var ephemeral_reply = try expectResponse(&client, ephemeral_xid);
@@ -854,6 +1045,61 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     );
     const ephemeral_path = ephemeral_response.path.?;
     try testing.expect(std.mem.startsWith(u8, ephemeral_path, "/ephemeral-"));
+
+    try client.sendAuth("digest", "user:password");
+    var auth_reply = try client.receive();
+    defer auth_reply.deinit();
+    try testing.expectEqual(wire.Xid.auth, auth_reply.header.xid);
+    try testing.expectEqual(@as(i32, 0), auth_reply.header.err);
+
+    const secure_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
+        .path = "/secure",
+        .data = "private",
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "auth", .id = "" } }},
+        .flags = 0,
+    });
+    var secure_reply = try expectResponse(&client, secure_xid);
+    defer secure_reply.deinit();
+
+    const get_acl_xid = try client.sendRequest(.get_acl, protocol.proto.GetACLRequest{ .path = "/secure" });
+    var get_acl_reply = try expectResponse(&client, get_acl_xid);
+    defer get_acl_reply.deinit();
+    const get_acl_response = try wire.decodeFrameRecord(
+        protocol.proto.GetACLResponse,
+        get_acl_reply.body(),
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(get_acl_response, testing.allocator);
+    try testing.expectEqualStrings("digest", get_acl_response.acl.?[0].id.scheme.?);
+    try testing.expectEqualStrings("user:tpUq/4Pn5A64fVZyQ0gOJ8ZWqkY=", get_acl_response.acl.?[0].id.id.?);
+
+    const set_acl_xid = try client.sendRequest(.set_acl, protocol.proto.SetACLRequest{
+        .path = "/secure",
+        .acl = &.{.{ .perms = acl.read, .id = .{
+            .scheme = "digest",
+            .id = "user:tpUq/4Pn5A64fVZyQ0gOJ8ZWqkY=",
+        } }},
+        .version = 0,
+    });
+    var set_acl_reply = try expectResponse(&client, set_acl_xid);
+    defer set_acl_reply.deinit();
+    const set_acl_response = try wire.decodeFrameRecord(
+        protocol.proto.SetACLResponse,
+        set_acl_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), set_acl_response.stat.aversion);
+
+    const redacted_acl_xid = try client.sendRequest(.get_acl, protocol.proto.GetACLRequest{ .path = "/secure" });
+    var redacted_acl_reply = try expectResponse(&client, redacted_acl_xid);
+    defer redacted_acl_reply.deinit();
+    const redacted_acl_response = try wire.decodeFrameRecord(
+        protocol.proto.GetACLResponse,
+        redacted_acl_reply.body(),
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(redacted_acl_response, testing.allocator);
+    try testing.expectEqualStrings("user:x", redacted_acl_response.acl.?[0].id.id.?);
 
     const session_id = client.session.session_id;
     var session_password: [16]u8 = undefined;
@@ -873,6 +1119,27 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     );
     defer resumed.deinit();
     try testing.expectEqual(session_id, resumed.session.session_id);
+    const unauthorized_xid = try resumed.sendRequest(.get_data, protocol.proto.GetDataRequest{
+        .path = "/secure",
+        .watch = false,
+    });
+    var unauthorized_reply = try resumed.receive();
+    defer unauthorized_reply.deinit();
+    try testing.expectEqual(unauthorized_xid, unauthorized_reply.header.xid);
+    try testing.expectEqual(@as(i32, @intFromEnum(data_tree.ErrorCode.no_auth)), unauthorized_reply.header.err);
+
+    try resumed.sendAuth("digest", "user:password");
+    var resumed_auth_reply = try resumed.receive();
+    defer resumed_auth_reply.deinit();
+    try testing.expectEqual(wire.Xid.auth, resumed_auth_reply.header.xid);
+    try testing.expectEqual(@as(i32, 0), resumed_auth_reply.header.err);
+    const authorized_xid = try resumed.sendRequest(.get_data, protocol.proto.GetDataRequest{
+        .path = "/secure",
+        .watch = false,
+    });
+    var authorized_reply = try expectResponse(&resumed, authorized_xid);
+    defer authorized_reply.deinit();
+
     try client.sendPing();
     var fenced_reply = try client.receive();
     defer fenced_reply.deinit();
