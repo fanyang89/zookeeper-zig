@@ -176,6 +176,30 @@ pub const Session = struct {
         return xid;
     }
 
+    pub fn encodeRequestPayload(
+        self: *Session,
+        writer: *jute.Writer,
+        opcode: wire.OpCode,
+        body_payload: []const u8,
+        now_ms: i64,
+    ) (wire.EncodeError || std.mem.Allocator.Error || Error)!i32 {
+        if (!self.state.isConnected()) return error.InvalidState;
+        if (isControlOpcode(opcode)) return error.InvalidControlOpcode;
+        const xid = self.next_xid;
+        try self.reservePendingFailureCapacity(1);
+        try wire.encodeRequestPayloadWithLimit(
+            writer,
+            xid,
+            opcode,
+            body_payload,
+            self.limits.max_payload_size,
+        );
+        self.next_xid = nextXid(xid);
+        self.pending.appendAssumeCapacity(.{ .xid = xid, .opcode = opcode });
+        self.last_send_ms = now_ms;
+        return xid;
+    }
+
     pub fn encodePing(self: *Session, writer: *jute.Writer, now_ms: i64) (wire.EncodeError || Error)!void {
         if (!self.state.isConnected()) return error.InvalidState;
         try wire.encodeRequestWithLimit(

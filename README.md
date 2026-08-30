@@ -23,8 +23,8 @@ mise run test
 
 The build exports portable `zookeeper` and `jute` modules. The native client API
 includes the Jute archive, protocol records, ZooKeeper opcodes, length-prefixed
-TCP framing, typed request/reply codecs, a blocking TCP transport, and the
-client session state machine.
+TCP framing, typed request/reply codecs, blocking and asynchronous clients, and
+the client session state machine.
 
 ```zig
 const jute = @import("jute");
@@ -70,6 +70,47 @@ requests into `failedRequests()` with a connection-loss reason, and `close()`
 performs the ordered `closeSession` exchange. The client is single-threaded and
 does not yet reconnect, re-authenticate, or restore watches automatically; callers
 responsible for ping and expiration checks should configure finite I/O timeouts.
+
+`zookeeper.client.AsyncClient` adds a concurrent read pump, serialized writes,
+request futures, watch notification delivery, automatic pings, timeout checks,
+and an ordered `closeSession` exchange. It requires an `std.Io` implementation
+that supports `concurrent`. The client is heap allocated so its address remains
+stable while background tasks run.
+
+```zig
+const zookeeper = @import("zookeeper");
+
+const client = try zookeeper.client.AsyncClient.connectAddress(
+    allocator,
+    io,
+    address,
+    .{ .connection = .{
+        .handshake_timeout = one_second,
+        .io_timeout = one_second,
+    } },
+    .{},
+);
+defer client.deinit();
+
+var future = try client.requestAsync(
+    .get_data,
+    zookeeper.protocol.proto.GetDataRequest{
+        .path = "/zookeeper",
+        .watch = true,
+    },
+);
+var inbound = try future.await(io);
+defer inbound.deinit();
+
+try client.close(one_second);
+```
+
+Request replies are delivered directly to their futures. Watch events are read
+with `receiveNotification()`. Canceling a request future cancels only the local
+wait; the client still consumes the server reply to preserve ZooKeeper's ordered
+request stream. A full notification queue disconnects with
+`NotificationQueueFull` rather than blocking request dispatch or session timers.
+Reconnection, re-authentication, and watch restoration remain future work.
 
 The protocol modules contain all 72 records from ZooKeeper 3.9.5's
 `zookeeper.jute`: `data`, `proto`, `quorum`, `persistence`, and `txn`.
@@ -124,6 +165,29 @@ before accessing RocksDB. Session close and expiration atomically remove all
 session-owned ephemeral nodes. ACLs support `world`, `auth`, `digest`, and IPv4
 `ip` identities, including CIDR masks. IPv6 ACL identities, SASL, watches, and
 multi operations are not implemented yet.
+
+## Java client interoperability
+
+Run the strict compatibility suite against the official Apache ZooKeeper Java
+client with:
+
+```sh
+mise run test-interop-java
+```
+
+The runner checks out the official `release-3.9.5` source at the verified
+upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
+adapter into `ClientBase`, and runs selected upstream `AsyncOpsTest` and
+`ClientTest` methods unchanged. Each upstream test that normally starts a Java
+server starts an isolated Zig server instead. The current selection covers 46
+synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
+large-data, sync, and error-code tests; watch and multi tests remain excluded
+until those operations are implemented.
+
+The source checkout is cached under `~/.cache/zookeeper-zig`. Set
+`ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit
+`293c895a8d966a3ecb92872be4a1daf87d725da2`. Git, Maven, Python 3, and a JDK are
+required.
 
 ## Roadmap
 

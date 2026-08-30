@@ -92,6 +92,27 @@ pub const BlockingClient = struct {
         return xid;
     }
 
+    pub fn sendEncodedRequest(
+        self: *BlockingClient,
+        opcode: wire.OpCode,
+        body_payload: []const u8,
+    ) !i32 {
+        if (!self.session.state.isConnected()) return error.ConnectionLoss;
+        var writer = jute.Writer.init(self.allocator);
+        defer writer.deinit();
+        const xid = try self.session.encodeRequestPayload(
+            &writer,
+            opcode,
+            body_payload,
+            monotonicMs(self.io),
+        );
+        self.transport.writeFrameTimeout(self.io, writer.bytes(), self.io_timeout) catch |err| {
+            self.failConnection();
+            return err;
+        };
+        return xid;
+    }
+
     pub fn sendPing(self: *BlockingClient) !void {
         if (!self.session.state.isConnected()) return error.ConnectionLoss;
         var writer = jute.Writer.init(self.allocator);
@@ -164,8 +185,13 @@ pub const BlockingClient = struct {
             if (err != error.Timeout) self.failConnection();
             return err;
         };
-        errdefer self.allocator.free(payload);
+        return self.acceptPayload(payload);
+    }
 
+    /// Takes ownership of one payload allocated by this client's allocator and
+    /// applies it to the session state machine.
+    pub fn acceptPayload(self: *BlockingClient, payload: []u8) !Inbound {
+        errdefer self.allocator.free(payload);
         const view = wire.replyViewWithLimits(payload, self.session.limits) catch |err| {
             self.failConnection();
             return err;
@@ -183,6 +209,21 @@ pub const BlockingClient = struct {
         };
     }
 
+    /// Encodes and writes closeSession without receiving its reply.
+    pub fn beginClose(self: *BlockingClient, timeout: std.Io.Timeout) !i32 {
+        if (!self.session.state.isConnected()) return error.ConnectionLoss;
+        if (self.session.pendingCount() != 0) return error.PendingRequests;
+
+        var writer = jute.Writer.init(self.allocator);
+        defer writer.deinit();
+        const xid = try self.session.encodeClose(&writer, monotonicMs(self.io));
+        self.transport.writeFrameTimeout(self.io, writer.bytes(), timeout) catch |err| {
+            self.failConnection();
+            return err;
+        };
+        return xid;
+    }
+
     /// Sends closeSession and waits for its ordered reply. The transport is
     /// closed and state becomes `closed` whether the exchange succeeds or not.
     pub fn close(self: *BlockingClient, timeout: std.Io.Timeout) !void {
@@ -198,10 +239,7 @@ pub const BlockingClient = struct {
         }
 
         const deadline = timeout.toDeadline(self.io);
-        var writer = jute.Writer.init(self.allocator);
-        defer writer.deinit();
-        const xid = try self.session.encodeClose(&writer, monotonicMs(self.io));
-        try self.transport.writeFrameTimeout(self.io, writer.bytes(), deadline);
+        const xid = try self.beginClose(deadline);
 
         while (true) {
             var inbound = try self.receiveTimeout(deadline);

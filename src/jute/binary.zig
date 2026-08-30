@@ -81,6 +81,10 @@ pub const Writer = struct {
         try self.buffer.appendSlice(self.allocator, &bytes_);
     }
 
+    pub fn writeBytes(self: *Writer, bytes_: []const u8) std.mem.Allocator.Error!void {
+        try self.buffer.appendSlice(self.allocator, bytes_);
+    }
+
     pub fn writeLong(self: *Writer, value: i64) std.mem.Allocator.Error!void {
         var bytes_: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes_, value, .big);

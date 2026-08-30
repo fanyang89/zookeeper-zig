@@ -10,6 +10,7 @@ else
 pub const wire = @import("wire.zig");
 
 test {
+    _ = client.AsyncClient;
     _ = client.BlockingClient;
     _ = jute.Reader;
     _ = jute.Writer;

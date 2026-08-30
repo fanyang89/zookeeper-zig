@@ -227,6 +227,25 @@ pub fn encodeRequestWithLimit(
     try finishFrame(writer, frame_start, max_payload);
 }
 
+pub fn encodeRequestPayloadWithLimit(
+    writer: *jute.Writer,
+    xid: i32,
+    opcode: OpCode,
+    body_payload: []const u8,
+    max_payload: usize,
+) EncodeError!void {
+    const frame_start = writer.dataSize();
+    errdefer writer.truncate(frame_start);
+
+    try writer.writeInt(0);
+    try jute.serialize(writer, proto.RequestHeader{
+        .xid = xid,
+        .type = @intFromEnum(opcode),
+    });
+    try writer.writeBytes(body_payload);
+    try finishFrame(writer, frame_start, max_payload);
+}
+
 pub fn encodeReply(
     writer: *jute.Writer,
     header: proto.ReplyHeader,
