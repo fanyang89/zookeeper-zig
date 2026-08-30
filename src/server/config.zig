@@ -10,12 +10,16 @@ pub const ServerConfig = struct {
     raft_listen: []u8,
     raft_advertise: []u8,
     data_dir: []u8,
+    import_zookeeper_data_dir: ?[]u8,
+    import_zookeeper_log_dir: ?[]u8,
     peers: []raft.Peer,
     join: bool,
 
     pub fn deinit(self: *ServerConfig) void {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
         self.allocator.free(self.peers);
+        if (self.import_zookeeper_log_dir) |value| self.allocator.free(value);
+        if (self.import_zookeeper_data_dir) |value| self.allocator.free(value);
         self.allocator.free(self.data_dir);
         self.allocator.free(self.raft_advertise);
         self.allocator.free(self.raft_listen);
@@ -31,6 +35,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var raft_listen: ?[]const u8 = null;
     var raft_advertise: ?[]const u8 = null;
     var data_dir: ?[]const u8 = null;
+    var import_zookeeper_data_dir: ?[]const u8 = null;
+    var import_zookeeper_log_dir: ?[]const u8 = null;
     var join = false;
     var peer_values: std.ArrayList([]const u8) = .empty;
     defer peer_values.deinit(allocator);
@@ -57,6 +63,10 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             raft_advertise = value;
         } else if (std.mem.eql(u8, argument, "--data-dir")) {
             data_dir = value;
+        } else if (std.mem.eql(u8, argument, "--import-zookeeper-data-dir")) {
+            import_zookeeper_data_dir = value;
+        } else if (std.mem.eql(u8, argument, "--import-zookeeper-log-dir")) {
+            import_zookeeper_log_dir = value;
         } else if (std.mem.eql(u8, argument, "--peer")) {
             try peer_values.append(allocator, value);
         } else {
@@ -82,6 +92,20 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     errdefer allocator.free(owned_advertise);
     const owned_data_dir = try allocator.dupe(u8, resolved_data_dir);
     errdefer allocator.free(owned_data_dir);
+    const owned_import_data_dir = if (import_zookeeper_data_dir) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (owned_import_data_dir) |value| allocator.free(value);
+    const owned_import_log_dir = if (import_zookeeper_log_dir) |value|
+        try allocator.dupe(u8, value)
+    else
+        null;
+    errdefer if (owned_import_log_dir) |value| allocator.free(value);
+    if (owned_import_log_dir != null and owned_import_data_dir == null) {
+        return error.ImportDataDirRequired;
+    }
+    if (join and owned_import_data_dir != null) return error.ImportNotAllowedForJoin;
     const peers = try allocator.alloc(raft.Peer, peer_values.items.len);
     errdefer allocator.free(peers);
     var initialized: usize = 0;
@@ -117,6 +141,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .raft_listen = owned_raft_listen,
         .raft_advertise = owned_advertise,
         .data_dir = owned_data_dir,
+        .import_zookeeper_data_dir = owned_import_data_dir,
+        .import_zookeeper_log_dir = owned_import_log_dir,
         .peers = peers,
         .join = join,
     };
@@ -176,14 +202,16 @@ fn parseClusterId(value: []const u8) !raft.ClusterId {
 
 test "parse a durable three-node quorum configuration" {
     const arguments = [_][]const u8{
-        "--node-id",       "2",
-        "--cluster-id",    "0198f54d-5c2a-7000-8000-000000000001",
-        "--client-listen", "127.0.0.1:2182",
-        "--raft-listen",   "127.0.0.1:2882",
-        "--data-dir",      "/tmp/zookeeper-zig-2",
-        "--peer",          "1=127.0.0.1:2881",
-        "--peer",          "2=127.0.0.1:2882",
-        "--peer",          "3=127.0.0.1:2883",
+        "--node-id",                   "2",
+        "--cluster-id",                "0198f54d-5c2a-7000-8000-000000000001",
+        "--client-listen",             "127.0.0.1:2182",
+        "--raft-listen",               "127.0.0.1:2882",
+        "--data-dir",                  "/tmp/zookeeper-zig-2",
+        "--import-zookeeper-data-dir", "/srv/zookeeper/data",
+        "--import-zookeeper-log-dir",  "/srv/zookeeper/log",
+        "--peer",                      "1=127.0.0.1:2881",
+        "--peer",                      "2=127.0.0.1:2882",
+        "--peer",                      "3=127.0.0.1:2883",
     };
     var parsed = try parse(std.testing.allocator, &arguments);
     defer parsed.deinit();
@@ -191,4 +219,6 @@ test "parse a durable three-node quorum configuration" {
     try std.testing.expectEqual(@as(usize, 3), parsed.peers.len);
     try std.testing.expectEqualStrings("127.0.0.1", parsed.client_host);
     try std.testing.expectEqual(@as(u16, 2182), parsed.client_port);
+    try std.testing.expectEqualStrings("/srv/zookeeper/data", parsed.import_zookeeper_data_dir.?);
+    try std.testing.expectEqualStrings("/srv/zookeeper/log", parsed.import_zookeeper_log_dir.?);
 }

@@ -11,8 +11,10 @@ const Node = data_tree.Node;
 const ErrorCode = data_tree.ErrorCode;
 
 const applied_key = "\x00applied";
+const import_zxid_key = "\x00import-zxid";
 const state_prefix = "\x01";
 const session_clock_key = "\x01clock";
+const zxid_base_key = "\x01zxid-base";
 const session_prefix = "\x01session/";
 const snapshot_version: u32 = 1;
 pub const max_snapshot_bytes: usize = 256 * 1024 * 1024;
@@ -23,7 +25,7 @@ pub const Applied = struct {
 };
 
 pub const DataResult = struct {
-    data: []u8,
+    data: ?[]u8,
     stat: protocol.data.Stat,
 };
 
@@ -50,6 +52,29 @@ pub const ExpiredSession = struct {
     expires_at_ms: i64,
 };
 
+pub const ImportNode = struct {
+    path: []const u8,
+    data: ?[]const u8,
+    acl: ?[]const u8,
+    czxid: i64,
+    mzxid: i64,
+    ctime: i64,
+    mtime: i64,
+    version: i32,
+    cversion: i32,
+    sequence_counter: i32,
+    aversion: i32,
+    ephemeral_owner: i64,
+    pzxid: i64,
+    child_count: usize,
+};
+
+pub const ImportSession = struct {
+    session_id: i64,
+    password: [16]u8,
+    timeout_ms: i32,
+};
+
 pub const RocksStore = struct {
     allocator: std.mem.Allocator,
     db: rocksdb.DB,
@@ -57,6 +82,7 @@ pub const RocksStore = struct {
     default_family: rocksdb.ColumnFamilyHandle,
     applied: Applied,
     session_clock_ms: i64,
+    zxid_base: i64,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !RocksStore {
         const path_z = try allocator.dupeZ(u8, path);
@@ -84,6 +110,7 @@ pub const RocksStore = struct {
             .default_family = default_family,
             .applied = .{},
             .session_clock_ms = 0,
+            .zxid_base = 0,
         };
         if (try store.getNode("/")) |root| {
             var owned_root = root;
@@ -96,6 +123,7 @@ pub const RocksStore = struct {
                 try store.writeSync(batch);
                 break :blk 0;
             };
+            store.zxid_base = (try store.loadZxidBase()) orelse 0;
         } else {
             var root = Node{
                 .data = try allocator.alloc(u8, 0),
@@ -116,6 +144,7 @@ pub const RocksStore = struct {
             batch.put(default_family, "/", encoded_root);
             putApplied(&batch, default_family, .{});
             putSessionClock(&batch, default_family, 0);
+            putZxidBase(&batch, default_family, 0);
             try store.writeSync(batch);
         }
         return store;
@@ -129,6 +158,76 @@ pub const RocksStore = struct {
 
     pub fn durableApplied(self: *const RocksStore) Applied {
         return self.applied;
+    }
+
+    pub fn installImported(
+        self: *RocksStore,
+        nodes: []const ImportNode,
+        sessions: []const ImportSession,
+        tick_grace_ms: i32,
+        source_zxid: i64,
+    ) !void {
+        if (tick_grace_ms <= 0) return error.InvalidTickGrace;
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        batch.deleteRange(self.default_family, "\x00", "\xff");
+        var encoded_nodes: std.ArrayList([]u8) = .empty;
+        defer {
+            for (encoded_nodes.items) |bytes| self.allocator.free(bytes);
+            encoded_nodes.deinit(self.allocator);
+        }
+        var found_root = false;
+        for (nodes) |imported| {
+            if (!data_tree.isValidPath(imported.path)) return error.InvalidImport;
+            found_root = found_root or std.mem.eql(u8, imported.path, "/");
+            const node = Node{
+                .data = @constCast(imported.data orelse &.{}),
+                .data_is_null = imported.data == null,
+                .czxid = imported.czxid,
+                .mzxid = imported.mzxid,
+                .ctime = imported.ctime,
+                .mtime = imported.mtime,
+                .version = imported.version,
+                .cversion = imported.cversion,
+                .sequence_counter = imported.sequence_counter,
+                .aversion = imported.aversion,
+                .pzxid = imported.pzxid,
+                .child_count = imported.child_count,
+                .ephemeral_owner = imported.ephemeral_owner,
+                .acl = if (imported.acl) |value| @constCast(value) else null,
+            };
+            const encoded = try encodeNode(self.allocator, node);
+            encoded_nodes.append(self.allocator, encoded) catch |err| {
+                self.allocator.free(encoded);
+                return err;
+            };
+            batch.put(self.default_family, imported.path, encoded);
+        }
+        if (!found_root) return error.InvalidImport;
+        for (sessions) |imported| {
+            if (imported.session_id == 0 or imported.timeout_ms <= 0) return error.InvalidImport;
+            var key_buffer: [session_prefix.len + 8]u8 = undefined;
+            const key = sessionKey(imported.session_id, &key_buffer);
+            var encoded: [40]u8 = undefined;
+            encodeSession(.{
+                .password = imported.password,
+                .timeout_ms = imported.timeout_ms,
+                .tick_grace_ms = tick_grace_ms,
+                .expires_at_ms = try renewedExpiry(0, imported.timeout_ms, tick_grace_ms),
+                .generation = 1,
+            }, &encoded);
+            batch.put(self.default_family, key, &encoded);
+        }
+        putSessionClock(&batch, self.default_family, 0);
+        putZxidBase(&batch, self.default_family, source_zxid);
+        putApplied(&batch, self.default_family, .{});
+        var source_zxid_bytes: [8]u8 = undefined;
+        std.mem.writeInt(i64, &source_zxid_bytes, source_zxid, .big);
+        batch.put(self.default_family, import_zxid_key, &source_zxid_bytes);
+        try self.writeSync(batch);
+        self.applied = .{};
+        self.session_clock_ms = 0;
+        self.zxid_base = source_zxid;
     }
 
     pub fn apply(
@@ -230,6 +329,23 @@ pub const RocksStore = struct {
         return result;
     }
 
+    pub fn importedSourceZxid(self: *RocksStore) !?i64 {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, import_zxid_key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            if (data.data.len != 8) return error.InvalidImportMarker;
+            return std.mem.readInt(i64, data.data[0..8], .big);
+        }
+        return null;
+    }
+
+    pub fn clientZxid(self: *const RocksStore, raft_index: u64) !i64 {
+        const index = std.math.cast(i64, raft_index) orelse return error.ZxidOverflow;
+        return std.math.add(i64, self.zxid_base, index) catch error.ZxidOverflow;
+    }
+
     pub fn advanceApplied(self: *RocksStore, index: u64, term: u64) !void {
         var batch = rocksdb.WriteBatch.init();
         defer batch.deinit();
@@ -258,7 +374,7 @@ pub const RocksStore = struct {
             var node = value;
             defer node.deinit(self.allocator);
             return .{
-                .data = try allocator.dupe(u8, node.data),
+                .data = if (node.data_is_null) null else try allocator.dupe(u8, node.data),
                 .stat = node.stat(),
             };
         }
@@ -380,13 +496,20 @@ pub const RocksStore = struct {
 
     pub fn snapshot(self: *RocksStore, allocator: std.mem.Allocator) ![]u8 {
         var writer = jute.Writer.init(allocator);
-        errdefer writer.deinit();
+        defer writer.deinit();
         try writer.writeInt(@intCast(snapshot_version));
         try writer.writeLong(@bitCast(self.applied.index));
         try writer.writeLong(@bitCast(self.applied.term));
         const count_offset = writer.bytes().len;
         try writer.writeInt(0);
         var count: u32 = 0;
+        if (try self.importedSourceZxid()) |source_zxid| {
+            var encoded_zxid: [8]u8 = undefined;
+            std.mem.writeInt(i64, &encoded_zxid, source_zxid, .big);
+            try writer.writeBuffer(import_zxid_key);
+            try writer.writeBuffer(&encoded_zxid);
+            count += 1;
+        }
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
         var iterator = self.db.iterator(self.default_family, .forward, state_prefix);
@@ -408,7 +531,7 @@ pub const RocksStore = struct {
             if (count > std.math.maxInt(i32)) return error.SnapshotTooLarge;
         }
         try writer.patchInt(count_offset, @intCast(count));
-        return writer.toOwnedSliceAssert();
+        return allocator.dupe(u8, writer.bytes());
     }
 
     pub fn restore(
@@ -443,6 +566,8 @@ pub const RocksStore = struct {
         var sessions: std.AutoHashMapUnmanaged(i64, void) = .empty;
         defer sessions.deinit(self.allocator);
         var restored_clock: ?i64 = null;
+        var restored_zxid_base: ?i64 = null;
+        var restored_import_zxid: ?i64 = null;
         var index: u32 = 0;
         while (index < count) : (index += 1) {
             const key = (try reader.readBuffer()) orelse return error.InvalidSnapshot;
@@ -459,6 +584,12 @@ pub const RocksStore = struct {
                     .declared_children = node.child_count,
                     .ephemeral_owner = node.ephemeral_owner,
                 };
+            } else if (std.mem.eql(u8, key, import_zxid_key)) {
+                if (restored_import_zxid != null or value.len != 8) return error.InvalidSnapshot;
+                restored_import_zxid = std.mem.readInt(i64, value[0..8], .big);
+            } else if (std.mem.eql(u8, key, zxid_base_key)) {
+                if (restored_zxid_base != null or value.len != 8) return error.InvalidSnapshot;
+                restored_zxid_base = std.mem.readInt(i64, value[0..8], .big);
             } else if (std.mem.eql(u8, key, session_clock_key)) {
                 if (restored_clock != null or value.len != 8) return error.InvalidSnapshot;
                 const clock = std.mem.readInt(i64, value[0..8], .big);
@@ -496,11 +627,19 @@ pub const RocksStore = struct {
                 return error.InvalidSnapshot;
             }
         }
+        if (restored_import_zxid) |source_zxid| {
+            if (restored_zxid_base == null or restored_zxid_base.? != source_zxid) {
+                return error.InvalidSnapshot;
+            }
+        }
+        const effective_zxid_base = restored_zxid_base orelse 0;
         putSessionClock(&batch, self.default_family, effective_clock);
+        putZxidBase(&batch, self.default_family, effective_zxid_base);
         putApplied(&batch, self.default_family, applied);
         try self.writeSync(batch);
         self.applied = applied;
         self.session_clock_ms = effective_clock;
+        self.zxid_base = effective_zxid_base;
     }
 
     fn validateMutationConnection(
@@ -516,7 +655,7 @@ pub const RocksStore = struct {
         };
         const connection = identity orelse return null;
         if (connection.id == 0 and connection.generation == 0) return null;
-        if (connection.id <= 0 or connection.generation == 0) {
+        if (connection.id == 0 or connection.generation == 0) {
             return .{ .code = .session_moved };
         }
         const code = try self.validateSession(connection.id, connection.generation);
@@ -533,7 +672,7 @@ pub const RocksStore = struct {
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
-        if (session_id <= 0 or password.len != 16 or timeout_ms <= 0 or
+        if (session_id == 0 or password.len != 16 or timeout_ms <= 0 or
             tick_grace_ms <= 0 or generation == 0)
         {
             return .{ .code = .bad_arguments };
@@ -735,7 +874,7 @@ pub const RocksStore = struct {
             }
             parent.?.child_count -= 1;
             parent.?.cversion += 1;
-            parent.?.pzxid = std.math.cast(i64, applied.index) orelse
+            parent.?.pzxid = self.clientZxid(applied.index) catch
                 return error.InvalidEphemeralNode;
         }
 
@@ -797,7 +936,8 @@ pub const RocksStore = struct {
         if (!try acl.allows(parent.acl, acl.create, identities)) return .{ .code = .no_auth };
         if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
-            (!sequential and parent.cversion == std.math.maxInt(i32)))
+            parent.cversion == std.math.maxInt(i32) or
+            parent.sequence_counter == std.math.maxInt(i32))
         {
             return .{ .code = .bad_arguments };
         }
@@ -806,7 +946,7 @@ pub const RocksStore = struct {
         var transfer_path = false;
         defer if (!transfer_path) if (owned_path) |value| self.allocator.free(value);
         const resolved_path: []const u8 = if (sequential) blk: {
-            owned_path = try sequentialPath(self.allocator, path, parent.cversion);
+            owned_path = try sequentialPath(self.allocator, path, parent.sequence_counter);
             break :blk owned_path.?;
         } else path;
         if (!data_tree.isValidPath(resolved_path)) return .{ .code = .bad_arguments };
@@ -816,6 +956,7 @@ pub const RocksStore = struct {
             return .{ .code = .node_exists };
         }
 
+        const zxid = try self.clientZxid(index);
         const node_data = try self.allocator.dupe(u8, data);
         var node_data_owned = true;
         defer if (node_data_owned) self.allocator.free(node_data);
@@ -824,13 +965,13 @@ pub const RocksStore = struct {
         defer if (node_acl_owned) if (node_acl) |value| self.allocator.free(value);
         var node = Node{
             .data = node_data,
-            .czxid = @intCast(index),
-            .mzxid = @intCast(index),
+            .czxid = zxid,
+            .mzxid = zxid,
             .ctime = time_ms,
             .mtime = time_ms,
             .version = 0,
             .cversion = 0,
-            .pzxid = @intCast(index),
+            .pzxid = zxid,
             .child_count = 0,
             .ephemeral_owner = if (ephemeral) session_id else 0,
             .acl = node_acl,
@@ -838,8 +979,9 @@ pub const RocksStore = struct {
         node_data_owned = false;
         node_acl_owned = false;
         defer node.deinit(self.allocator);
-        parent.cversion = if (sequential) parent.cversion +% 1 else parent.cversion + 1;
-        parent.pzxid = @intCast(index);
+        parent.cversion += 1;
+        parent.sequence_counter += 1;
+        parent.pzxid = zxid;
         parent.child_count += 1;
         try self.commitNodes(&.{
             .{ .path = resolved_path, .node = node },
@@ -877,7 +1019,7 @@ pub const RocksStore = struct {
         if (node.child_count != 0) return .{ .code = .not_empty };
         if (parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
         parent.cversion += 1;
-        parent.pzxid = @intCast(index);
+        parent.pzxid = try self.clientZxid(index);
         parent.child_count -= 1;
         try self.commitNodes(
             &.{.{ .path = parent_path, .node = parent }},
@@ -938,7 +1080,7 @@ pub const RocksStore = struct {
         const replacement = try self.allocator.dupe(u8, data);
         self.allocator.free(node.data);
         node.data = replacement;
-        node.mzxid = @intCast(index);
+        node.mzxid = try self.clientZxid(index);
         node.mtime = time_ms;
         node.version += 1;
         try self.commitNodes(
@@ -1006,6 +1148,18 @@ pub const RocksStore = struct {
         return error.MissingAppliedCursor;
     }
 
+    fn loadZxidBase(self: *RocksStore) !?i64 {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, zxid_base_key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            if (data.data.len != 8) return error.InvalidZxidBase;
+            return std.mem.readInt(i64, data.data[0..8], .big);
+        }
+        return null;
+    }
+
     fn loadSessionClock(self: *RocksStore) !?i64 {
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
@@ -1050,7 +1204,7 @@ fn decodeSessionKey(key: []const u8) !i64 {
         return error.InvalidSessionKey;
     }
     const session_id = std.mem.readInt(i64, key[session_prefix.len..][0..8], .big);
-    if (session_id <= 0) return error.InvalidSessionKey;
+    if (session_id == 0) return error.InvalidSessionKey;
     return session_id;
 }
 
@@ -1130,7 +1284,18 @@ fn renewedExpiry(session_clock_ms: i64, timeout_ms: i32, tick_grace_ms: i32) !i6
 
 fn isSnapshotRecordKey(key: []const u8) bool {
     return data_tree.isValidPath(key) or std.mem.eql(u8, key, session_clock_key) or
+        std.mem.eql(u8, key, zxid_base_key) or
         std.mem.startsWith(u8, key, session_prefix);
+}
+
+fn putZxidBase(
+    batch: *const rocksdb.WriteBatch,
+    family: rocksdb.ColumnFamilyHandle,
+    value: i64,
+) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &bytes, value, .big);
+    batch.put(family, zxid_base_key, &bytes);
 }
 
 fn putSessionClock(
@@ -1156,8 +1321,8 @@ fn putApplied(
 
 fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     var writer = jute.Writer.init(allocator);
-    errdefer writer.deinit();
-    try writer.writeBuffer(node.data);
+    defer writer.deinit();
+    try writer.writeBuffer(if (node.data_is_null) null else node.data);
     try writer.writeLong(node.czxid);
     try writer.writeLong(node.mzxid);
     try writer.writeLong(node.ctime);
@@ -1169,12 +1334,14 @@ fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     try writer.writeLong(node.ephemeral_owner);
     try writer.writeInt(node.aversion);
     try writer.writeBuffer(node.acl);
-    return writer.toOwnedSliceAssert();
+    try writer.writeInt(node.sequence_counter);
+    return allocator.dupe(u8, writer.bytes());
 }
 
 fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
     var reader = jute.Reader.init(bytes);
-    const data = try allocator.dupe(u8, (try reader.readBuffer()) orelse return error.InvalidNode);
+    const maybe_data = try reader.readBuffer();
+    const data = try allocator.dupe(u8, maybe_data orelse &.{});
     errdefer allocator.free(data);
     const czxid = try reader.readLong();
     const mzxid = try reader.readLong();
@@ -1194,16 +1361,19 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
     else
         null;
     errdefer if (acl_blob) |value| allocator.free(value);
+    const sequence_counter = if (reader.remaining() == 0) cversion else try reader.readInt();
     if (reader.remaining() != 0) return error.InvalidNode;
     if (acl_blob) |value| acl.validate(value) catch return error.InvalidNode;
     return .{
         .data = data,
+        .data_is_null = maybe_data == null,
         .czxid = czxid,
         .mzxid = mzxid,
         .ctime = ctime,
         .mtime = mtime,
         .version = version,
         .cversion = cversion,
+        .sequence_counter = sequence_counter,
         .aversion = aversion,
         .pzxid = pzxid,
         .child_count = child_count,
@@ -1213,7 +1383,7 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
 }
 
 fn deinitFamilies(allocator: std.mem.Allocator, families: []const rocksdb.ColumnFamily) void {
-    for (families) |family| allocator.free(family.name);
+    // DB.deinit owns the names through its column-family name map.
     allocator.free(families);
 }
 

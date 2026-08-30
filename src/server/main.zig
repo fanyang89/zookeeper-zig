@@ -10,6 +10,8 @@ const usage =
     \\  --raft-listen IPV4:PORT \\
     \\  --data-dir PATH \\
     \\  [--raft-advertise IPV4:PORT] \\
+    \\  [--import-zookeeper-data-dir PATH] \\
+    \\  [--import-zookeeper-log-dir PATH] \\
     \\  [--peer ID=IPV4:PORT ...] [--join]
     \\
 ;
@@ -31,6 +33,14 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer config.deinit();
+
+    if (config.import_zookeeper_data_dir) |source_data_dir| {
+        try zookeeper.server.zookeeper_import.importOnFirstStart(init.gpa, init.io, .{
+            .source_data_dir = source_data_dir,
+            .source_log_dir = config.import_zookeeper_log_dir,
+            .target_data_dir = config.data_dir,
+        });
+    }
 
     const quorum = try zookeeper.server.Quorum.create(
         std.heap.smp_allocator,

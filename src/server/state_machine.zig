@@ -10,11 +10,11 @@ const rocks_store = @import("rocks_store.zig");
 pub const max_snapshot_bytes = rocks_store.max_snapshot_bytes;
 
 pub const DataResult = struct {
-    data: []u8,
+    data: ?[]u8,
     stat: protocol.data.Stat,
 
     pub fn deinit(self: *DataResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.data);
+        if (self.data) |value| allocator.free(value);
         self.* = undefined;
     }
 };
@@ -254,6 +254,12 @@ pub const ZooKeeperStateMachine = struct {
         };
     }
 
+    pub fn clientZxid(self: *ZooKeeperStateMachine) i64 {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.store.clientZxid(self.store.durableApplied().index) catch std.math.maxInt(i64);
+    }
+
     pub fn appliedIndex(self: *ZooKeeperStateMachine) u64 {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
@@ -269,7 +275,6 @@ pub const ZooKeeperStateMachine = struct {
             return .{};
         }
         const mutation = command.decode(entry.data) catch return error.Fatal;
-        const zxid: i64 = std.math.cast(i64, entry.index) orelse return error.Fatal;
 
         const success_response_size = command.resultCapacity(mutation) catch return error.Fatal;
         var writer = jute.Writer.init(self.allocator);
@@ -278,6 +283,7 @@ pub const ZooKeeperStateMachine = struct {
 
         spinLock(&self.mutex);
         defer self.mutex.unlock();
+        const zxid = self.store.clientZxid(entry.index) catch return error.Fatal;
         var result = self.store.apply(mutation, entry.index, entry.term) catch |err|
             return mapStoreError(err);
         defer result.deinit(self.allocator);
@@ -297,7 +303,7 @@ pub const ZooKeeperStateMachine = struct {
                 .stat = result.stat.?,
             }) catch unreachable,
         };
-        return .{ .response = writer.toOwnedSliceAssert() };
+        return .{ .response = writer.toOwnedSlice() catch return error.OutOfMemory };
     }
 
     fn takeSnapshotImpl(

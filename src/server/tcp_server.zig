@@ -839,7 +839,7 @@ fn sendError(
 }
 
 fn appliedZxid(quorum: *quorum_mod.Quorum) i64 {
-    return std.math.cast(i64, quorum.machine.appliedIndex()) orelse std.math.maxInt(i64);
+    return quorum.machine.clientZxid();
 }
 
 fn peerIpv4Alloc(

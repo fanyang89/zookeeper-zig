@@ -189,6 +189,11 @@ The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `293c895a8d966a3ecb92872be4a1daf87d725da2`. Git, Maven, Python 3, and a JDK are
 required.
 
+A new cluster can import an Apache ZooKeeper 3.9.5 `dataDir` before its first
+start. The importer restores the newest valid snapshot, replays transaction
+logs, and retains resumable sessions and ephemeral nodes. See
+[Importing Apache ZooKeeper data](docs/zookeeper-import.md).
+
 ## Roadmap
 
 1. Complete reconnect, watches, and high-level client APIs.

@@ -16,5 +16,6 @@ test {
     _ = jute.Writer;
     _ = protocol.proto.ConnectRequest;
     _ = server;
+    if (builtin.os.tag == .linux) _ = server.zookeeper_import.javaSessionPassword(1);
     _ = wire.OpCode;
 }

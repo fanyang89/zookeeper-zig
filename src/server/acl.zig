@@ -29,7 +29,7 @@ pub const open_unsafe = [_]Entry{.{
 pub fn encode(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
     if (entries.len == 0 or entries.len > std.math.maxInt(i32)) return error.InvalidAcl;
     var writer = jute.Writer.init(allocator);
-    errdefer writer.deinit();
+    defer writer.deinit();
     try writer.writeInt(@intCast(entries.len));
     for (entries) |entry| {
         if (!isValidEntry(entry)) return error.InvalidAcl;
@@ -37,19 +37,19 @@ pub fn encode(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
         try writer.writeString(entry.scheme);
         try writer.writeString(entry.id);
     }
-    return writer.toOwnedSliceAssert();
+    return allocator.dupe(u8, writer.bytes());
 }
 
 pub fn encodeIdentities(allocator: std.mem.Allocator, identities: []const Identity) ![]u8 {
     if (identities.len > std.math.maxInt(i32)) return error.TooManyIdentities;
     var writer = jute.Writer.init(allocator);
-    errdefer writer.deinit();
+    defer writer.deinit();
     try writer.writeInt(@intCast(identities.len));
     for (identities) |identity| {
         try writer.writeString(identity.scheme);
         try writer.writeString(identity.id);
     }
-    return writer.toOwnedSliceAssert();
+    return allocator.dupe(u8, writer.bytes());
 }
 
 pub fn normalize(

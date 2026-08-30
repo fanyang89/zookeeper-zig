@@ -32,12 +32,14 @@ pub const MutationResult = struct {
 
 pub const Node = struct {
     data: []u8,
+    data_is_null: bool = false,
     czxid: i64,
     mzxid: i64,
     ctime: i64,
     mtime: i64,
     version: i32 = 0,
     cversion: i32 = 0,
+    sequence_counter: i32 = 0,
     aversion: i32 = 0,
     pzxid: i64,
     child_count: usize = 0,
@@ -60,7 +62,7 @@ pub const Node = struct {
             .cversion = self.cversion,
             .aversion = self.aversion,
             .ephemeralOwner = self.ephemeral_owner,
-            .dataLength = @intCast(self.data.len),
+            .dataLength = if (self.data_is_null) 0 else @intCast(self.data.len),
             .numChildren = @intCast(self.child_count),
             .pzxid = self.pzxid,
         };
@@ -236,12 +238,12 @@ pub const DataTree = struct {
             }
         }.lessThan);
 
-        try writer.writeInt(-1);
+        try writer.writeInt(-3);
         try writer.writeInt(@intCast(paths.len));
         for (paths) |path| {
             const node = self.nodes.get(path).?;
             try writer.writeString(path);
-            try writer.writeBuffer(node.data);
+            try writer.writeBuffer(if (node.data_is_null) null else node.data);
             try writer.writeLong(node.czxid);
             try writer.writeLong(node.mzxid);
             try writer.writeLong(node.ctime);
@@ -251,12 +253,15 @@ pub const DataTree = struct {
             try writer.writeLong(node.pzxid);
             try writer.writeInt(@intCast(node.child_count));
             try writer.writeLong(node.ephemeral_owner);
+            try writer.writeInt(node.sequence_counter);
         }
     }
 
     pub fn readSnapshot(allocator: std.mem.Allocator, reader: anytype) !DataTree {
         const marker = try reader.readInt();
-        const has_ephemeral_owner = marker == -1;
+        const has_ephemeral_owner = marker == -1 or marker == -2 or marker == -3;
+        const has_nullable_data = marker == -2 or marker == -3;
+        const has_sequence_counter = marker == -3;
         const count = if (has_ephemeral_owner) try reader.readInt() else marker;
         if (count <= 0 or count > 10_000_000) return error.InvalidSnapshot;
         var self = DataTree{
@@ -269,7 +274,9 @@ pub const DataTree = struct {
         while (index < count) : (index += 1) {
             const path = (try reader.readStringAlloc(allocator)) orelse return error.InvalidSnapshot;
             errdefer allocator.free(path);
-            const data = (try reader.readBufferAlloc(allocator)) orelse return error.InvalidSnapshot;
+            const maybe_data = try reader.readBufferAlloc(allocator);
+            if (!has_nullable_data and maybe_data == null) return error.InvalidSnapshot;
+            const data = maybe_data orelse try allocator.alloc(u8, 0);
             errdefer allocator.free(data);
             if (self.nodes.contains(path)) return error.InvalidSnapshot;
             const czxid = try reader.readLong();
@@ -282,14 +289,17 @@ pub const DataTree = struct {
             const child_count = try reader.readInt();
             if (child_count < 0) return error.InvalidSnapshot;
             const ephemeral_owner = if (has_ephemeral_owner) try reader.readLong() else 0;
+            const sequence_counter = if (has_sequence_counter) try reader.readInt() else cversion;
             self.nodes.putAssumeCapacityNoClobber(path, .{
                 .data = data,
+                .data_is_null = maybe_data == null,
                 .czxid = czxid,
                 .mzxid = mzxid,
                 .ctime = ctime,
                 .mtime = mtime,
                 .version = version,
                 .cversion = cversion,
+                .sequence_counter = sequence_counter,
                 .pzxid = pzxid,
                 .child_count = @intCast(child_count),
                 .ephemeral_owner = ephemeral_owner,
