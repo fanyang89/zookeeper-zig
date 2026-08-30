@@ -72,10 +72,6 @@ pub fn build(b: *std.Build) void {
     check_jute.dependOn(&tests.step);
 
     const run_tests = b.addRunArtifact(tests);
-    const test_zig = b.step("test-zig", "Run native Zig unit tests");
-    test_zig.dependOn(&run_tests.step);
-    const test_jute = b.step("test-jute", "Alias for test-zig");
-    test_jute.dependOn(&run_tests.step);
     const test_step = b.step("test", "Run native Zig unit tests");
     test_step.dependOn(&run_tests.step);
 }

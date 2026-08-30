@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run Zig Jute unit tests"
-set -euo pipefail
-
-exec zig build test-jute "$@"
