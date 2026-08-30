@@ -116,15 +116,16 @@ zig-out/bin/zookeeper-quorum-server \
   --peer 1=127.0.0.1:2881 --peer 2=127.0.0.1:2882 --peer 3=127.0.0.1:2883
 ```
 
-The current server supports Connect, ping, closeSession, create/create2, delete,
-setData, exists, getData, getChildren/getChildren2, and sync. Reads use Raft
-ReadIndex before accessing RocksDB. Watches, ACL enforcement, authentication,
-ephemeral nodes, sequential nodes, multi operations, and session replication
-are not implemented yet.
+The current server supports replicated sessions, session resume and expiration,
+ephemeral nodes, Connect, ping, closeSession, create/create2, delete, setData,
+exists, getData, getChildren/getChildren2, and sync. Reads use Raft ReadIndex
+before accessing RocksDB. Session close and expiration atomically remove all
+session-owned ephemeral nodes. Watches, ACL enforcement, authentication,
+sequential nodes, and multi operations are not implemented yet.
 
 ## Roadmap
 
 1. Complete authentication, reconnect, watches, and high-level client APIs.
-2. Add replicated sessions, ephemerals, ACLs, watches, and multi operations.
+2. Add sequential nodes, ACLs, watches, and multi operations.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.

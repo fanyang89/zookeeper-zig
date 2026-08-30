@@ -10,14 +10,23 @@ const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
 const quorum_mod = @import("quorum.zig");
 
-const session_password = [_]u8{0} ** 16;
+const ConnectionSession = struct {
+    id: i64,
+    password: [16]u8,
+    timeout_ms: i32,
+    generation: u64,
+};
+
+const SessionMutationResult = struct {
+    code: data_tree.ErrorCode,
+    zxid: i64,
+};
 
 pub const TcpServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     quorum: *quorum_mod.Quorum,
     address: std.Io.net.IpAddress,
-    next_session_id: std.atomic.Value(u64) = .init(1),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -64,27 +73,7 @@ pub const TcpServer = struct {
         );
         defer self.allocator.free(connect_payload);
         const connect = try wire.decodeConnectRequest(connect_payload);
-        if (connect.value.sessionId != 0) {
-            try sendConnectResponse(&transport, self.allocator, self.io, .{
-                .protocolVersion = 0,
-                .timeOut = 0,
-                .sessionId = 0,
-                .passwd = &.{},
-                .readOnly = false,
-            }, connect.read_only_supported);
-            return;
-        }
-
-        const requested_timeout = @max(connect.value.timeOut, 2_000);
-        const negotiated_timeout = @min(requested_timeout, 40_000);
-        const session_id: i64 = @intCast(self.next_session_id.fetchAdd(1, .monotonic));
-        try sendConnectResponse(&transport, self.allocator, self.io, .{
-            .protocolVersion = 0,
-            .timeOut = negotiated_timeout,
-            .sessionId = session_id,
-            .passwd = &session_password,
-            .readOnly = false,
-        }, connect.read_only_supported);
+        const session = (try self.establishSession(&transport, connect)) orelse return;
 
         while (true) {
             const payload = try transport.readFrameAlloc(
@@ -98,18 +87,133 @@ pub const TcpServer = struct {
                 try sendError(&transport, self.allocator, self.io, request.header.xid, -1, .unimplemented);
                 continue;
             };
-            const keep_open = try self.dispatch(&transport, request.header.xid, opcode, request.body);
+            const keep_open = try self.dispatch(
+                &transport,
+                session,
+                request.header.xid,
+                opcode,
+                request.body,
+            );
             if (!keep_open) return;
         }
+    }
+
+    fn establishSession(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        connect: wire.DecodedConnectRequest,
+    ) !?ConnectionSession {
+        if (connect.value.sessionId == 0) {
+            const requested_timeout = @max(connect.value.timeOut, 2_000);
+            const negotiated_timeout = @min(requested_timeout, 40_000);
+            var attempts: usize = 0;
+            while (attempts < 8) : (attempts += 1) {
+                var entropy: [32]u8 = undefined;
+                try std.Io.randomSecure(self.io, &entropy);
+                const raw_id = std.mem.readInt(u64, entropy[0..8], .big) & std.math.maxInt(i64);
+                const generation: u64 = 1;
+                if (raw_id == 0) continue;
+                const session_id: i64 = @intCast(raw_id);
+                var password: [16]u8 = undefined;
+                @memcpy(&password, entropy[8..24]);
+                const result = try self.proposeSession(.{ .open_session = .{
+                    .session_id = session_id,
+                    .password = &password,
+                    .timeout_ms = negotiated_timeout,
+                    .tick_grace_ms = @intCast(self.quorum.options.session_reap_interval_ms),
+                    .generation = generation,
+                } });
+                if (result.code == .session_moved) continue;
+                if (result.code != .ok) break;
+                try sendConnectResponse(transport, self.allocator, self.io, .{
+                    .protocolVersion = 0,
+                    .timeOut = negotiated_timeout,
+                    .sessionId = session_id,
+                    .passwd = &password,
+                    .readOnly = false,
+                }, connect.read_only_supported);
+                return .{
+                    .id = session_id,
+                    .password = password,
+                    .timeout_ms = negotiated_timeout,
+                    .generation = generation,
+                };
+            }
+            try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
+            return null;
+        }
+
+        try self.quorum.linearizableRead();
+        const stored = (try self.quorum.machine.getSession(connect.value.sessionId)) orelse {
+            try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
+            return null;
+        };
+        const supplied_password = connect.value.passwd orelse &.{};
+        if (supplied_password.len != stored.password.len or
+            !std.mem.eql(u8, supplied_password, &stored.password))
+        {
+            try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
+            return null;
+        }
+        const new_generation = std.math.add(u64, stored.generation, 1) catch {
+            try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
+            return null;
+        };
+        const result = try self.proposeSession(.{ .move_session = .{
+            .session_id = connect.value.sessionId,
+            .password = &stored.password,
+            .expected_generation = stored.generation,
+            .new_generation = new_generation,
+        } });
+        if (result.code != .ok) {
+            try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
+            return null;
+        }
+        try sendConnectResponse(transport, self.allocator, self.io, .{
+            .protocolVersion = 0,
+            .timeOut = stored.timeout_ms,
+            .sessionId = connect.value.sessionId,
+            .passwd = &stored.password,
+            .readOnly = false,
+        }, connect.read_only_supported);
+        return .{
+            .id = connect.value.sessionId,
+            .password = stored.password,
+            .timeout_ms = stored.timeout_ms,
+            .generation = new_generation,
+        };
+    }
+
+    fn proposeSession(self: *TcpServer, mutation: command.Mutation) !SessionMutationResult {
+        var proposal = try self.quorum.propose(mutation);
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.body.len != 0) return error.InvalidProposalResponse;
+        return .{ .code = result.code, .zxid = result.zxid };
     }
 
     fn dispatch(
         self: *TcpServer,
         transport: *TcpTransport,
+        session: ConnectionSession,
         xid: i32,
         opcode: wire.OpCode,
         body: []const u8,
     ) !bool {
+        if (opcode != .close_session) {
+            const touched = self.proposeSession(.{ .touch_session = .{
+                .session_id = session.id,
+                .password = &session.password,
+                .generation = session.generation,
+            } }) catch {
+                try sendError(transport, self.allocator, self.io, xid, -1, .connection_loss);
+                return false;
+            };
+            if (touched.code != .ok) {
+                try sendError(transport, self.allocator, self.io, xid, touched.zxid, touched.code);
+                return false;
+            }
+        }
         switch (opcode) {
             .ping => {
                 try sendReply(transport, self.allocator, self.io, .{
@@ -120,20 +224,32 @@ pub const TcpServer = struct {
                 return true;
             },
             .close_session => {
+                const closed = self.proposeSession(.{ .close_session = .{
+                    .session_id = session.id,
+                    .password = &session.password,
+                    .generation = session.generation,
+                } }) catch {
+                    try sendError(transport, self.allocator, self.io, xid, -1, .connection_loss);
+                    return false;
+                };
+                if (closed.code != .ok) {
+                    try sendError(transport, self.allocator, self.io, xid, closed.zxid, closed.code);
+                    return false;
+                }
                 try sendReply(transport, self.allocator, self.io, .{
                     .xid = xid,
-                    .zxid = -1,
+                    .zxid = closed.zxid,
                     .err = 0,
                 }, {});
                 return false;
             },
-            .create, .create2 => try self.create(transport, xid, opcode, body),
-            .delete => try self.delete(transport, xid, body),
-            .set_data => try self.setData(transport, xid, body),
-            .exists => try self.exists(transport, xid, body),
-            .get_data => try self.getData(transport, xid, body),
-            .get_children, .get_children2 => try self.getChildren(transport, xid, opcode, body),
-            .sync => try self.sync(transport, xid, body),
+            .create, .create2 => try self.create(transport, session, xid, opcode, body),
+            .delete => try self.delete(transport, session, xid, body),
+            .set_data => try self.setData(transport, session, xid, body),
+            .exists => try self.exists(transport, session, xid, body),
+            .get_data => try self.getData(transport, session, xid, body),
+            .get_children, .get_children2 => try self.getChildren(transport, session, xid, opcode, body),
+            .sync => try self.sync(transport, session, xid, body),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
         return true;
@@ -142,6 +258,7 @@ pub const TcpServer = struct {
     fn create(
         self: *TcpServer,
         transport: *TcpTransport,
+        session: ConnectionSession,
         xid: i32,
         opcode: wire.OpCode,
         bytes: []const u8,
@@ -156,7 +273,7 @@ pub const TcpServer = struct {
             -1,
             .bad_arguments,
         );
-        if (request.flags != 0) return sendError(
+        if (request.flags != 0 and request.flags != 1) return sendError(
             transport,
             self.allocator,
             self.io,
@@ -168,6 +285,9 @@ pub const TcpServer = struct {
             .path = path,
             .data = request.data orelse &.{},
             .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .ephemeral = request.flags == 1,
+            .session_id = session.id,
+            .session_generation = session.generation,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -176,7 +296,7 @@ pub const TcpServer = struct {
             -1,
             .connection_loss,
         );
-        defer proposal.deinit(self.allocator);
+        defer proposal.deinit();
         const result = try command.decodeResult(proposal.bytes);
         if (result.code != .ok) return sendError(
             transport,
@@ -204,7 +324,13 @@ pub const TcpServer = struct {
         }
     }
 
-    fn delete(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+    fn delete(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
         const request = try decodeBody(protocol.proto.DeleteRequest, bytes, self.allocator);
         var proposal = self.quorum.propose(.{ .delete = .{
             .path = request.path orelse return sendError(
@@ -216,6 +342,8 @@ pub const TcpServer = struct {
                 .bad_arguments,
             ),
             .expected_version = request.version,
+            .session_id = session.id,
+            .session_generation = session.generation,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -224,7 +352,7 @@ pub const TcpServer = struct {
             -1,
             .connection_loss,
         );
-        defer proposal.deinit(self.allocator);
+        defer proposal.deinit();
         const result = try command.decodeResult(proposal.bytes);
         if (result.code != .ok) return sendError(
             transport,
@@ -241,7 +369,13 @@ pub const TcpServer = struct {
         }, {});
     }
 
-    fn setData(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+    fn setData(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
         const request = try decodeBody(protocol.proto.SetDataRequest, bytes, self.allocator);
         var proposal = self.quorum.propose(.{ .set_data = .{
             .path = request.path orelse return sendError(
@@ -255,6 +389,8 @@ pub const TcpServer = struct {
             .data = request.data orelse &.{},
             .expected_version = request.version,
             .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .session_id = session.id,
+            .session_generation = session.generation,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -263,7 +399,7 @@ pub const TcpServer = struct {
             -1,
             .connection_loss,
         );
-        defer proposal.deinit(self.allocator);
+        defer proposal.deinit();
         const result = try command.decodeResult(proposal.bytes);
         if (result.code != .ok) return sendError(
             transport,
@@ -283,35 +419,71 @@ pub const TcpServer = struct {
         }, response);
     }
 
-    fn exists(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+    fn exists(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
         const request = try decodeBody(protocol.proto.ExistsRequest, bytes, self.allocator);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
-        const stat = (try self.quorum.machine.exists(request.path orelse return sendError(
+        const path = request.path orelse return sendError(
             transport,
             self.allocator,
             self.io,
             xid,
             zxid,
             .bad_arguments,
-        ))) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        );
+        const maybe_stat = self.quorum.machine.existsForSession(
+            session.id,
+            session.generation,
+            path,
+        ) catch |err| return sendMappedSessionError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            zxid,
+            err,
+        );
+        const stat = maybe_stat orelse
+            return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.ExistsResponse{ .stat = stat });
     }
 
-    fn getData(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+    fn getData(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
         const request = try decodeBody(protocol.proto.GetDataRequest, bytes, self.allocator);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
-        var result = (try self.quorum.machine.getData(
+        const path = request.path orelse return sendError(
+            transport,
             self.allocator,
-            request.path orelse return sendError(
-                transport,
-                self.allocator,
-                self.io,
-                xid,
-                zxid,
-                .bad_arguments,
-            ),
+            self.io,
+            xid,
+            zxid,
+            .bad_arguments,
+        );
+        var result = (self.quorum.machine.getDataForSession(
+            self.allocator,
+            session.id,
+            session.generation,
+            path,
+        ) catch |err| return sendMappedSessionError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            zxid,
+            err,
         )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
         defer result.deinit(self.allocator);
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.GetDataResponse{ .data = result.data, .stat = result.stat });
@@ -320,6 +492,7 @@ pub const TcpServer = struct {
     fn getChildren(
         self: *TcpServer,
         transport: *TcpTransport,
+        session: ConnectionSession,
         xid: i32,
         opcode: wire.OpCode,
         bytes: []const u8,
@@ -333,16 +506,26 @@ pub const TcpServer = struct {
         };
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
-        var result = (try self.quorum.machine.getChildren(
+        const resolved_path = path orelse return sendError(
+            transport,
             self.allocator,
-            path orelse return sendError(
-                transport,
-                self.allocator,
-                self.io,
-                xid,
-                zxid,
-                .bad_arguments,
-            ),
+            self.io,
+            xid,
+            zxid,
+            .bad_arguments,
+        );
+        var result = (self.quorum.machine.getChildrenForSession(
+            self.allocator,
+            session.id,
+            session.generation,
+            resolved_path,
+        ) catch |err| return sendMappedSessionError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            zxid,
+            err,
         )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
         defer result.deinit(self.allocator);
         const children = try self.allocator.alloc(?[]const u8, result.names.len);
@@ -355,10 +538,18 @@ pub const TcpServer = struct {
         }
     }
 
-    fn sync(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+    fn sync(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
         const request = try decodeBody(protocol.proto.SyncRequest, bytes, self.allocator);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
+        self.quorum.machine.validateSession(session.id, session.generation) catch |err|
+            return sendMappedSessionError(transport, self.allocator, self.io, xid, zxid, err);
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.SyncResponse{ .path = request.path });
     }
 };
@@ -369,6 +560,21 @@ fn decodeBody(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator)
     errdefer jute.deinitDecoded(value, allocator);
     if (reader.remaining() != 0) return error.TrailingData;
     return value;
+}
+
+fn sendFailedConnect(
+    transport: *TcpTransport,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    include_read_only: bool,
+) !void {
+    try sendConnectResponse(transport, allocator, io, .{
+        .protocolVersion = 0,
+        .timeOut = 0,
+        .sessionId = 0,
+        .passwd = &.{},
+        .readOnly = false,
+    }, include_read_only);
 }
 
 fn sendConnectResponse(
@@ -395,6 +601,22 @@ fn sendReply(
     defer writer.deinit();
     try wire.encodeReply(&writer, header, body);
     try transport.writeFrame(io, writer.bytes());
+}
+
+fn sendMappedSessionError(
+    transport: *TcpTransport,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    xid: i32,
+    zxid: i64,
+    err: anyerror,
+) !void {
+    const code: data_tree.ErrorCode = switch (err) {
+        error.SessionExpired => .session_expired,
+        error.SessionMoved => .session_moved,
+        else => return err,
+    };
+    return sendError(transport, allocator, io, xid, zxid, code);
 }
 
 fn sendError(
@@ -476,6 +698,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         .proposal_timeout_ticks = 100,
         .read_index_timeout_ticks = 100,
         .snapshot_entries_threshold = 10,
+        .session_reap_interval_ms = 10,
     });
     defer quorum.deinit();
     var attempts: usize = 0;
@@ -509,7 +732,8 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         .{ .handshake_timeout = one_second, .io_timeout = one_second },
         .{},
     );
-    defer client.deinit();
+    var client_active = true;
+    defer if (client_active) client.deinit();
 
     const create_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
         .path = "/app",
@@ -599,7 +823,46 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     defer delete_reply.deinit();
     try testing.expectEqual(@as(usize, 0), delete_reply.body().len);
 
-    try client.close(one_second);
+    const ephemeral_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
+        .path = "/ephemeral",
+        .data = "session-owned",
+        .acl = null,
+        .flags = 1,
+    });
+    var ephemeral_reply = try expectResponse(&client, ephemeral_xid);
+    defer ephemeral_reply.deinit();
+
+    const session_id = client.session.session_id;
+    var session_password: [16]u8 = undefined;
+    @memcpy(&session_password, client.session.passwd);
+
+    var resume_future = testing.io.async(serveOneConnection, .{ &server, &listener });
+    defer resume_future.cancel(testing.io) catch {};
+    var resumed = try blocking_client.BlockingClient.connectAddress(
+        testing.allocator,
+        testing.io,
+        address,
+        .{ .handshake_timeout = one_second, .io_timeout = one_second },
+        .{
+            .session_id = session_id,
+            .passwd = &session_password,
+        },
+    );
+    defer resumed.deinit();
+    try testing.expectEqual(session_id, resumed.session.session_id);
+    try client.sendPing();
+    var fenced_reply = try client.receive();
+    defer fenced_reply.deinit();
+    try testing.expectEqual(@as(i32, @intFromEnum(data_tree.ErrorCode.session_moved)), fenced_reply.header.err);
+    client.deinit();
+    client_active = false;
     try server_future.await(testing.io);
+    try testing.expect((try quorum.machine.getSession(session_id)) != null);
+    try testing.expect((try quorum.machine.exists("/ephemeral")) != null);
+
+    try resumed.close(one_second);
+    try resume_future.await(testing.io);
+    try testing.expect((try quorum.machine.getSession(session_id)) == null);
+    try testing.expect((try quorum.machine.exists("/ephemeral")) == null);
     try quorum.shutdown();
 }

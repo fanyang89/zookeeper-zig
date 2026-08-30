@@ -8,8 +8,12 @@ pub const ErrorCode = enum(i32) {
     bad_arguments = -8,
     no_node = -101,
     bad_version = -103,
+    no_children_for_ephemerals = -108,
     node_exists = -110,
     not_empty = -111,
+    session_expired = -112,
+    auth_failed = -115,
+    session_moved = -118,
 };
 
 pub const MutationResult = struct {
@@ -27,6 +31,7 @@ pub const Node = struct {
     cversion: i32 = 0,
     pzxid: i64,
     child_count: usize = 0,
+    ephemeral_owner: i64 = 0,
 
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
@@ -42,7 +47,7 @@ pub const Node = struct {
             .version = self.version,
             .cversion = self.cversion,
             .aversion = 0,
-            .ephemeralOwner = 0,
+            .ephemeralOwner = self.ephemeral_owner,
             .dataLength = @intCast(self.data.len),
             .numChildren = @intCast(self.child_count),
             .pzxid = self.pzxid,
@@ -99,6 +104,7 @@ pub const DataTree = struct {
 
         try self.nodes.ensureUnusedCapacity(1);
         const parent = self.nodes.getPtr(parent_path).?;
+        if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
             parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
         const owned_path = try self.allocator.dupe(u8, path);
@@ -218,6 +224,7 @@ pub const DataTree = struct {
             }
         }.lessThan);
 
+        try writer.writeInt(-1);
         try writer.writeInt(@intCast(paths.len));
         for (paths) |path| {
             const node = self.nodes.get(path).?;
@@ -231,11 +238,14 @@ pub const DataTree = struct {
             try writer.writeInt(node.cversion);
             try writer.writeLong(node.pzxid);
             try writer.writeInt(@intCast(node.child_count));
+            try writer.writeLong(node.ephemeral_owner);
         }
     }
 
     pub fn readSnapshot(allocator: std.mem.Allocator, reader: anytype) !DataTree {
-        const count = try reader.readInt();
+        const marker = try reader.readInt();
+        const has_ephemeral_owner = marker == -1;
+        const count = if (has_ephemeral_owner) try reader.readInt() else marker;
         if (count <= 0 or count > 10_000_000) return error.InvalidSnapshot;
         var self = DataTree{
             .allocator = allocator,
@@ -259,6 +269,7 @@ pub const DataTree = struct {
             const pzxid = try reader.readLong();
             const child_count = try reader.readInt();
             if (child_count < 0) return error.InvalidSnapshot;
+            const ephemeral_owner = if (has_ephemeral_owner) try reader.readLong() else 0;
             self.nodes.putAssumeCapacityNoClobber(path, .{
                 .data = data,
                 .czxid = czxid,
@@ -269,9 +280,34 @@ pub const DataTree = struct {
                 .cversion = cversion,
                 .pzxid = pzxid,
                 .child_count = @intCast(child_count),
+                .ephemeral_owner = ephemeral_owner,
             });
         }
-        if (!self.nodes.contains("/")) return error.InvalidSnapshot;
+        const root = self.nodes.get("/") orelse return error.InvalidSnapshot;
+        if (root.ephemeral_owner != 0) return error.InvalidSnapshot;
+        var actual_children: std.StringHashMapUnmanaged(usize) = .empty;
+        defer actual_children.deinit(allocator);
+        try actual_children.ensureTotalCapacity(allocator, @intCast(self.nodes.count()));
+        var nodes = self.nodes.iterator();
+        while (nodes.next()) |entry| {
+            actual_children.putAssumeCapacity(entry.key_ptr.*, 0);
+            if (entry.value_ptr.ephemeral_owner != 0 and entry.value_ptr.child_count != 0) {
+                return error.InvalidSnapshot;
+            }
+        }
+        nodes = self.nodes.iterator();
+        while (nodes.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "/")) continue;
+            const parent_path = parentPath(entry.key_ptr.*) orelse return error.InvalidSnapshot;
+            const parent_count = actual_children.getPtr(parent_path) orelse return error.InvalidSnapshot;
+            parent_count.* = std.math.add(usize, parent_count.*, 1) catch return error.InvalidSnapshot;
+        }
+        nodes = self.nodes.iterator();
+        while (nodes.next()) |entry| {
+            if (entry.value_ptr.child_count != actual_children.get(entry.key_ptr.*).?) {
+                return error.InvalidSnapshot;
+            }
+        }
         return self;
     }
 };

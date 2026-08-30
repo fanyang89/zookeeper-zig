@@ -10,6 +10,9 @@ const Node = data_tree.Node;
 const ErrorCode = data_tree.ErrorCode;
 
 const applied_key = "\x00applied";
+const state_prefix = "\x01";
+const session_clock_key = "\x01clock";
+const session_prefix = "\x01session/";
 const snapshot_version: u32 = 1;
 pub const max_snapshot_bytes: usize = 256 * 1024 * 1024;
 
@@ -23,12 +26,26 @@ pub const DataResult = struct {
     stat: protocol.data.Stat,
 };
 
+pub const Session = struct {
+    password: [16]u8,
+    timeout_ms: i32,
+    tick_grace_ms: i32,
+    expires_at_ms: i64,
+    generation: u64,
+};
+
+pub const ExpiredSession = struct {
+    session_id: i64,
+    expires_at_ms: i64,
+};
+
 pub const RocksStore = struct {
     allocator: std.mem.Allocator,
     db: rocksdb.DB,
     families: []const rocksdb.ColumnFamily,
     default_family: rocksdb.ColumnFamilyHandle,
     applied: Applied,
+    session_clock_ms: i64,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !RocksStore {
         const path_z = try allocator.dupeZ(u8, path);
@@ -55,11 +72,19 @@ pub const RocksStore = struct {
             .families = families,
             .default_family = default_family,
             .applied = .{},
+            .session_clock_ms = 0,
         };
         if (try store.getNode("/")) |root| {
             var owned_root = root;
             owned_root.deinit(allocator);
             store.applied = try store.loadApplied();
+            store.session_clock_ms = (try store.loadSessionClock()) orelse blk: {
+                var batch = rocksdb.WriteBatch.init();
+                defer batch.deinit();
+                putSessionClock(&batch, default_family, 0);
+                try store.writeSync(batch);
+                break :blk 0;
+            };
         } else {
             var root = Node{
                 .data = try allocator.alloc(u8, 0),
@@ -79,6 +104,7 @@ pub const RocksStore = struct {
             defer allocator.free(encoded_root);
             batch.put(default_family, "/", encoded_root);
             putApplied(&batch, default_family, .{});
+            putSessionClock(&batch, default_family, 0);
             try store.writeSync(batch);
         }
         return store;
@@ -100,14 +126,67 @@ pub const RocksStore = struct {
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
-        const result = switch (operation) {
-            .create => |request| try self.create(request.path, request.data, request.time_ms, index, term),
+        const result = if (try self.validateMutationConnection(operation)) |rejected|
+            rejected
+        else switch (operation) {
+            .create => |request| try self.create(
+                request.path,
+                request.data,
+                request.time_ms,
+                request.ephemeral,
+                request.session_id,
+                index,
+                term,
+            ),
             .delete => |request| try self.delete(request.path, request.expected_version, index, term),
             .set_data => |request| try self.setData(
                 request.path,
                 request.data,
                 request.expected_version,
                 request.time_ms,
+                index,
+                term,
+            ),
+            .open_session => |request| try self.openSession(
+                request.session_id,
+                request.password,
+                request.timeout_ms,
+                request.tick_grace_ms,
+                request.generation,
+                index,
+                term,
+            ),
+            .touch_session => |request| try self.touchSession(
+                request.session_id,
+                request.password,
+                request.generation,
+                index,
+                term,
+            ),
+            .close_session => |request| try self.closeSession(
+                request.session_id,
+                request.password,
+                request.generation,
+                index,
+                term,
+            ),
+            .expire_session => |request| try self.expireSession(
+                request.session_id,
+                request.expected_expires_at_ms,
+                index,
+                term,
+            ),
+            .move_session => |request| try self.moveSession(
+                request.session_id,
+                request.password,
+                request.expected_generation,
+                request.new_generation,
+                index,
+                term,
+            ),
+            .session_tick => |request| try self.sessionTick(
+                request.leader_term,
+                request.elapsed_ms,
                 index,
                 term,
             ),
@@ -194,6 +273,54 @@ pub const RocksStore = struct {
         return try children.toOwnedSlice(allocator);
     }
 
+    pub fn getSession(self: *RocksStore, session_id: i64) !?Session {
+        var key_buffer: [session_prefix.len + 8]u8 = undefined;
+        const key = sessionKey(session_id, &key_buffer);
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            return try decodeSession(data.data);
+        }
+        return null;
+    }
+
+    pub fn validateSession(
+        self: *RocksStore,
+        session_id: i64,
+        generation: u64,
+    ) !data_tree.ErrorCode {
+        const session = (try self.getSession(session_id)) orelse return .session_expired;
+        if (session.generation != generation) return .session_moved;
+        if (session.expires_at_ms <= self.session_clock_ms) return .session_expired;
+        return .ok;
+    }
+
+    pub fn expiredSessions(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+    ) ![]ExpiredSession {
+        var expired: std.ArrayList(ExpiredSession) = .empty;
+        errdefer expired.deinit(allocator);
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, session_prefix);
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (!std.mem.startsWith(u8, entry[0].data, session_prefix)) break;
+            const session_id = try decodeSessionKey(entry[0].data);
+            const session = try decodeSession(entry[1].data);
+            if (session.expires_at_ms <= self.session_clock_ms) {
+                try expired.append(allocator, .{
+                    .session_id = session_id,
+                    .expires_at_ms = session.expires_at_ms,
+                });
+            }
+        }
+        return try expired.toOwnedSlice(allocator);
+    }
+
     pub fn snapshot(self: *RocksStore, allocator: std.mem.Allocator) ![]u8 {
         var writer = jute.Writer.init(allocator);
         errdefer writer.deinit();
@@ -205,10 +332,10 @@ pub const RocksStore = struct {
         var count: u32 = 0;
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
-        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        var iterator = self.db.iterator(self.default_family, .forward, state_prefix);
         defer iterator.deinit();
         while (try iterator.next(&error_data)) |entry| {
-            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            if (!isSnapshotRecordKey(entry[0].data)) break;
             const encoded_size = std.math.add(
                 usize,
                 8,
@@ -249,27 +376,57 @@ pub const RocksStore = struct {
         var batch = rocksdb.WriteBatch.init();
         defer batch.deinit();
         batch.deleteRange(self.default_family, "\x00", "\xff");
-        const Validation = struct { declared_children: usize, actual_children: usize = 0 };
+        const Validation = struct {
+            declared_children: usize,
+            actual_children: usize = 0,
+            ephemeral_owner: i64,
+        };
         var nodes: std.StringHashMapUnmanaged(Validation) = .empty;
         defer nodes.deinit(self.allocator);
+        var sessions: std.AutoHashMapUnmanaged(i64, void) = .empty;
+        defer sessions.deinit(self.allocator);
+        var restored_clock: ?i64 = null;
         var index: u32 = 0;
         while (index < count) : (index += 1) {
             const key = (try reader.readBuffer()) orelse return error.InvalidSnapshot;
             const value = (try reader.readBuffer()) orelse return error.InvalidSnapshot;
-            if (!data_tree.isValidPath(key)) return error.InvalidSnapshot;
-            var node = decodeNode(self.allocator, value) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.InvalidSnapshot,
-            };
-            defer node.deinit(self.allocator);
-            const result = try nodes.getOrPut(self.allocator, key);
-            if (result.found_existing) return error.InvalidSnapshot;
-            result.value_ptr.* = .{ .declared_children = node.child_count };
+            if (data_tree.isValidPath(key)) {
+                var node = decodeNode(self.allocator, value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidSnapshot,
+                };
+                defer node.deinit(self.allocator);
+                const result = try nodes.getOrPut(self.allocator, key);
+                if (result.found_existing) return error.InvalidSnapshot;
+                result.value_ptr.* = .{
+                    .declared_children = node.child_count,
+                    .ephemeral_owner = node.ephemeral_owner,
+                };
+            } else if (std.mem.eql(u8, key, session_clock_key)) {
+                if (restored_clock != null or value.len != 8) return error.InvalidSnapshot;
+                const clock = std.mem.readInt(i64, value[0..8], .big);
+                if (clock < 0) return error.InvalidSnapshot;
+                restored_clock = clock;
+            } else if (std.mem.startsWith(u8, key, session_prefix)) {
+                const session_id = decodeSessionKey(key) catch return error.InvalidSnapshot;
+                _ = decodeSession(value) catch return error.InvalidSnapshot;
+                const result = try sessions.getOrPut(self.allocator, session_id);
+                if (result.found_existing) return error.InvalidSnapshot;
+            } else {
+                return error.InvalidSnapshot;
+            }
             batch.put(self.default_family, key, value);
         }
-        if (reader.remaining() != 0 or !nodes.contains("/")) return error.InvalidSnapshot;
+        if (reader.remaining() != 0 or !nodes.contains("/") or
+            (restored_clock == null and sessions.count() != 0)) return error.InvalidSnapshot;
+        const effective_clock = restored_clock orelse 0;
         var paths = nodes.iterator();
         while (paths.next()) |entry| {
+            if (entry.value_ptr.ephemeral_owner != 0) {
+                if (!sessions.contains(entry.value_ptr.ephemeral_owner) or
+                    entry.value_ptr.declared_children != 0 or
+                    std.mem.eql(u8, entry.key_ptr.*, "/")) return error.InvalidSnapshot;
+            }
             if (std.mem.eql(u8, entry.key_ptr.*, "/")) continue;
             const parent_path = data_tree.parentPath(entry.key_ptr.*) orelse return error.InvalidSnapshot;
             const parent = nodes.getPtr(parent_path) orelse return error.InvalidSnapshot;
@@ -282,9 +439,269 @@ pub const RocksStore = struct {
                 return error.InvalidSnapshot;
             }
         }
+        putSessionClock(&batch, self.default_family, effective_clock);
         putApplied(&batch, self.default_family, applied);
         try self.writeSync(batch);
         self.applied = applied;
+        self.session_clock_ms = effective_clock;
+    }
+
+    fn validateMutationConnection(
+        self: *RocksStore,
+        operation: command.Mutation,
+    ) !?data_tree.MutationResult {
+        const identity: ?struct { id: i64, generation: u64 } = switch (operation) {
+            .create => |request| .{ .id = request.session_id, .generation = request.session_generation },
+            .delete => |request| .{ .id = request.session_id, .generation = request.session_generation },
+            .set_data => |request| .{ .id = request.session_id, .generation = request.session_generation },
+            else => null,
+        };
+        const connection = identity orelse return null;
+        if (connection.id == 0 and connection.generation == 0) return null;
+        if (connection.id <= 0 or connection.generation == 0) {
+            return .{ .code = .session_moved };
+        }
+        const code = try self.validateSession(connection.id, connection.generation);
+        return if (code == .ok) null else .{ .code = code };
+    }
+
+    fn openSession(
+        self: *RocksStore,
+        session_id: i64,
+        password: []const u8,
+        timeout_ms: i32,
+        tick_grace_ms: i32,
+        generation: u64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        if (session_id <= 0 or password.len != 16 or timeout_ms <= 0 or
+            tick_grace_ms <= 0 or generation == 0)
+        {
+            return .{ .code = .bad_arguments };
+        }
+        if (try self.getSession(session_id) != null) return .{ .code = .session_moved };
+        var owned_password: [16]u8 = undefined;
+        @memcpy(&owned_password, password);
+        try self.commitSession(session_id, .{
+            .password = owned_password,
+            .timeout_ms = timeout_ms,
+            .tick_grace_ms = tick_grace_ms,
+            .expires_at_ms = try renewedExpiry(self.session_clock_ms, timeout_ms, tick_grace_ms),
+            .generation = generation,
+        }, .{ .index = index, .term = term });
+        return .{ .code = .ok };
+    }
+
+    fn touchSession(
+        self: *RocksStore,
+        session_id: i64,
+        password: []const u8,
+        generation: u64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        var session = (try self.getSession(session_id)) orelse
+            return .{ .code = .session_expired };
+        if (password.len != session.password.len or !std.mem.eql(u8, &session.password, password)) {
+            return .{ .code = .auth_failed };
+        }
+        if (session.generation != generation) return .{ .code = .session_moved };
+        if (session.expires_at_ms <= self.session_clock_ms) return .{ .code = .session_expired };
+        session.expires_at_ms = try renewedExpiry(
+            self.session_clock_ms,
+            session.timeout_ms,
+            session.tick_grace_ms,
+        );
+        try self.commitSession(session_id, session, .{ .index = index, .term = term });
+        return .{ .code = .ok };
+    }
+
+    fn moveSession(
+        self: *RocksStore,
+        session_id: i64,
+        password: []const u8,
+        expected_generation: u64,
+        new_generation: u64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        var session = (try self.getSession(session_id)) orelse
+            return .{ .code = .session_expired };
+        if (password.len != session.password.len or !std.mem.eql(u8, &session.password, password)) {
+            return .{ .code = .auth_failed };
+        }
+        const required_generation = std.math.add(u64, expected_generation, 1) catch
+            return .{ .code = .session_moved };
+        if (session.generation != expected_generation or new_generation != required_generation) {
+            return .{ .code = .session_moved };
+        }
+        if (session.expires_at_ms <= self.session_clock_ms) return .{ .code = .session_expired };
+        session.generation = new_generation;
+        session.expires_at_ms = try renewedExpiry(
+            self.session_clock_ms,
+            session.timeout_ms,
+            session.tick_grace_ms,
+        );
+        try self.commitSession(session_id, session, .{ .index = index, .term = term });
+        return .{ .code = .ok };
+    }
+
+    fn closeSession(
+        self: *RocksStore,
+        session_id: i64,
+        password: []const u8,
+        generation: u64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        const session = (try self.getSession(session_id)) orelse
+            return .{ .code = .session_expired };
+        if (password.len != session.password.len or !std.mem.eql(u8, &session.password, password)) {
+            return .{ .code = .auth_failed };
+        }
+        if (session.generation != generation) return .{ .code = .session_moved };
+        try self.commitSessionRemoval(session_id, .{ .index = index, .term = term });
+        return .{ .code = .ok };
+    }
+
+    fn expireSession(
+        self: *RocksStore,
+        session_id: i64,
+        expected_expires_at_ms: i64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        const session = (try self.getSession(session_id)) orelse {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        };
+        if (session.expires_at_ms != expected_expires_at_ms or
+            session.expires_at_ms > self.session_clock_ms)
+        {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        }
+        try self.commitSessionRemoval(session_id, .{ .index = index, .term = term });
+        return .{ .code = .ok };
+    }
+
+    fn sessionTick(
+        self: *RocksStore,
+        leader_term: u64,
+        elapsed_ms: i64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        if (leader_term != term or elapsed_ms <= 0 or elapsed_ms > 60_000) {
+            return .{ .code = .session_moved };
+        }
+        const next_clock = std.math.add(i64, self.session_clock_ms, elapsed_ms) catch
+            return .{ .code = .bad_arguments };
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        putSessionClock(&batch, self.default_family, next_clock);
+        putApplied(&batch, self.default_family, .{ .index = index, .term = term });
+        try self.writeSync(batch);
+        self.session_clock_ms = next_clock;
+        return .{ .code = .ok };
+    }
+
+    fn commitSession(
+        self: *RocksStore,
+        session_id: i64,
+        session: ?Session,
+        applied: Applied,
+    ) !void {
+        var key_buffer: [session_prefix.len + 8]u8 = undefined;
+        const key = sessionKey(session_id, &key_buffer);
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        if (session) |value| {
+            var encoded: [40]u8 = undefined;
+            encodeSession(value, &encoded);
+            batch.put(self.default_family, key, &encoded);
+        } else {
+            batch.delete(self.default_family, key);
+        }
+        putApplied(&batch, self.default_family, applied);
+        try self.writeSync(batch);
+    }
+
+    fn commitSessionRemoval(
+        self: *RocksStore,
+        session_id: i64,
+        applied: Applied,
+    ) !void {
+        var ephemeral_paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (ephemeral_paths.items) |path| self.allocator.free(path);
+            ephemeral_paths.deinit(self.allocator);
+        }
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            var node = try decodeNode(self.allocator, entry[1].data);
+            defer node.deinit(self.allocator);
+            if (node.ephemeral_owner != session_id) continue;
+            if (node.child_count != 0) return error.InvalidEphemeralNode;
+            const owned_path = try self.allocator.dupe(u8, entry[0].data);
+            ephemeral_paths.append(self.allocator, owned_path) catch |err| {
+                self.allocator.free(owned_path);
+                return err;
+            };
+        }
+
+        var parents: std.StringHashMapUnmanaged(Node) = .empty;
+        defer {
+            var values = parents.valueIterator();
+            while (values.next()) |node| node.deinit(self.allocator);
+            parents.deinit(self.allocator);
+        }
+        for (ephemeral_paths.items) |path| {
+            const parent_path = data_tree.parentPath(path) orelse return error.InvalidEphemeralNode;
+            var parent = parents.getPtr(parent_path);
+            if (parent == null) {
+                var loaded = (try self.getNode(parent_path)) orelse return error.InvalidEphemeralNode;
+                parents.put(self.allocator, parent_path, loaded) catch |err| {
+                    loaded.deinit(self.allocator);
+                    return err;
+                };
+                parent = parents.getPtr(parent_path).?;
+            }
+            if (parent.?.child_count == 0 or parent.?.cversion == std.math.maxInt(i32)) {
+                return error.InvalidEphemeralNode;
+            }
+            parent.?.child_count -= 1;
+            parent.?.cversion += 1;
+            parent.?.pzxid = std.math.cast(i64, applied.index) orelse
+                return error.InvalidEphemeralNode;
+        }
+
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        var session_key_buffer: [session_prefix.len + 8]u8 = undefined;
+        batch.delete(self.default_family, sessionKey(session_id, &session_key_buffer));
+        for (ephemeral_paths.items) |path| batch.delete(self.default_family, path);
+        var encoded_parents: std.ArrayList([]u8) = .empty;
+        defer {
+            for (encoded_parents.items) |bytes| self.allocator.free(bytes);
+            encoded_parents.deinit(self.allocator);
+        }
+        var parent_entries = parents.iterator();
+        while (parent_entries.next()) |entry| {
+            const encoded = try encodeNode(self.allocator, entry.value_ptr.*);
+            encoded_parents.append(self.allocator, encoded) catch |err| {
+                self.allocator.free(encoded);
+                return err;
+            };
+            batch.put(self.default_family, entry.key_ptr.*, encoded);
+        }
+        putApplied(&batch, self.default_family, applied);
+        try self.writeSync(batch);
     }
 
     fn create(
@@ -292,6 +709,8 @@ pub const RocksStore = struct {
         path: []const u8,
         data: []const u8,
         time_ms: i64,
+        ephemeral: bool,
+        session_id: i64,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
@@ -305,11 +724,17 @@ pub const RocksStore = struct {
             existing.deinit(self.allocator);
             return .{ .code = .node_exists };
         }
+        if (ephemeral) {
+            const session = (try self.getSession(session_id)) orelse
+                return .{ .code = .session_expired };
+            if (session.expires_at_ms <= self.session_clock_ms) return .{ .code = .session_expired };
+        }
         const parent_path = data_tree.parentPath(path) orelse return .{ .code = .bad_arguments };
         const maybe_parent = try self.getNode(parent_path);
         if (maybe_parent == null) return .{ .code = .no_node };
         var parent = maybe_parent.?;
         defer parent.deinit(self.allocator);
+        if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
             parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
 
@@ -323,6 +748,7 @@ pub const RocksStore = struct {
             .cversion = 0,
             .pzxid = @intCast(index),
             .child_count = 0,
+            .ephemeral_owner = if (ephemeral) session_id else 0,
         };
         defer node.deinit(self.allocator);
         parent.cversion += 1;
@@ -454,6 +880,20 @@ pub const RocksStore = struct {
         return error.MissingAppliedCursor;
     }
 
+    fn loadSessionClock(self: *RocksStore) !?i64 {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, session_clock_key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            if (data.data.len != 8) return error.InvalidSessionClock;
+            const value = std.mem.readInt(i64, data.data[0..8], .big);
+            if (value < 0) return error.InvalidSessionClock;
+            return value;
+        }
+        return null;
+    }
+
     fn writeSync(self: *RocksStore, batch: rocksdb.WriteBatch) !void {
         const options = rocksdb_c.rocksdb_writeoptions_create() orelse return error.OutOfMemory;
         defer rocksdb_c.rocksdb_writeoptions_destroy(options);
@@ -472,6 +912,81 @@ pub const RocksStore = struct {
         }
     }
 };
+
+fn sessionKey(session_id: i64, output: *[session_prefix.len + 8]u8) []const u8 {
+    @memcpy(output[0..session_prefix.len], session_prefix);
+    std.mem.writeInt(i64, output[session_prefix.len..][0..8], session_id, .big);
+    return output;
+}
+
+fn decodeSessionKey(key: []const u8) !i64 {
+    if (key.len != session_prefix.len + 8 or !std.mem.startsWith(u8, key, session_prefix)) {
+        return error.InvalidSessionKey;
+    }
+    const session_id = std.mem.readInt(i64, key[session_prefix.len..][0..8], .big);
+    if (session_id <= 0) return error.InvalidSessionKey;
+    return session_id;
+}
+
+fn encodeSession(session: Session, output: *[40]u8) void {
+    @memcpy(output[0..16], &session.password);
+    std.mem.writeInt(i32, output[16..20], session.timeout_ms, .big);
+    std.mem.writeInt(i32, output[20..24], session.tick_grace_ms, .big);
+    std.mem.writeInt(i64, output[24..32], session.expires_at_ms, .big);
+    std.mem.writeInt(u64, output[32..40], session.generation, .big);
+}
+
+fn decodeSession(bytes: []const u8) !Session {
+    if (bytes.len != 28 and bytes.len != 36 and bytes.len != 40) return error.InvalidSession;
+    var password: [16]u8 = undefined;
+    @memcpy(&password, bytes[0..16]);
+    const timeout_ms = std.mem.readInt(i32, bytes[16..20], .big);
+    const tick_grace_ms: i32 = if (bytes.len == 40)
+        std.mem.readInt(i32, bytes[20..24], .big)
+    else
+        500;
+    const expires_at_ms = if (bytes.len == 40)
+        std.mem.readInt(i64, bytes[24..32], .big)
+    else
+        std.mem.readInt(i64, bytes[20..28], .big);
+    const generation = if (bytes.len == 40)
+        std.mem.readInt(u64, bytes[32..40], .big)
+    else if (bytes.len == 36)
+        std.mem.readInt(u64, bytes[28..36], .big)
+    else
+        1;
+    if (timeout_ms <= 0 or tick_grace_ms <= 0 or expires_at_ms <= 0 or generation == 0) {
+        return error.InvalidSession;
+    }
+    return .{
+        .password = password,
+        .timeout_ms = timeout_ms,
+        .tick_grace_ms = tick_grace_ms,
+        .expires_at_ms = expires_at_ms,
+        .generation = generation,
+    };
+}
+
+fn renewedExpiry(session_clock_ms: i64, timeout_ms: i32, tick_grace_ms: i32) !i64 {
+    const lifetime = std.math.add(i64, timeout_ms, tick_grace_ms) catch
+        return error.SessionClockOverflow;
+    return std.math.add(i64, session_clock_ms, lifetime) catch error.SessionClockOverflow;
+}
+
+fn isSnapshotRecordKey(key: []const u8) bool {
+    return data_tree.isValidPath(key) or std.mem.eql(u8, key, session_clock_key) or
+        std.mem.startsWith(u8, key, session_prefix);
+}
+
+fn putSessionClock(
+    batch: *const rocksdb.WriteBatch,
+    family: rocksdb.ColumnFamilyHandle,
+    value: i64,
+) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &bytes, value, .big);
+    batch.put(family, session_clock_key, &bytes);
+}
 
 fn putApplied(
     batch: *const rocksdb.WriteBatch,
@@ -496,6 +1011,7 @@ fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     try writer.writeInt(node.cversion);
     try writer.writeLong(node.pzxid);
     try writer.writeLong(@bitCast(node.child_count));
+    try writer.writeLong(node.ephemeral_owner);
     return writer.toOwnedSliceAssert();
 }
 
@@ -503,20 +1019,33 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
     var reader = jute.Reader.init(bytes);
     const data = try allocator.dupe(u8, (try reader.readBuffer()) orelse return error.InvalidNode);
     errdefer allocator.free(data);
-    const node = Node{
-        .data = data,
-        .czxid = try reader.readLong(),
-        .mzxid = try reader.readLong(),
-        .ctime = try reader.readLong(),
-        .mtime = try reader.readLong(),
-        .version = try reader.readInt(),
-        .cversion = try reader.readInt(),
-        .pzxid = try reader.readLong(),
-        .child_count = std.math.cast(usize, @as(u64, @bitCast(try reader.readLong()))) orelse
-            return error.InvalidNode,
+    const czxid = try reader.readLong();
+    const mzxid = try reader.readLong();
+    const ctime = try reader.readLong();
+    const mtime = try reader.readLong();
+    const version = try reader.readInt();
+    const cversion = try reader.readInt();
+    const pzxid = try reader.readLong();
+    const child_count = std.math.cast(usize, @as(u64, @bitCast(try reader.readLong()))) orelse
+        return error.InvalidNode;
+    const ephemeral_owner = switch (reader.remaining()) {
+        0 => 0,
+        8 => try reader.readLong(),
+        else => return error.InvalidNode,
     };
     if (reader.remaining() != 0) return error.InvalidNode;
-    return node;
+    return .{
+        .data = data,
+        .czxid = czxid,
+        .mzxid = mzxid,
+        .ctime = ctime,
+        .mtime = mtime,
+        .version = version,
+        .cversion = cversion,
+        .pzxid = pzxid,
+        .child_count = child_count,
+        .ephemeral_owner = ephemeral_owner,
+    };
 }
 
 fn deinitFamilies(allocator: std.mem.Allocator, families: []const rocksdb.ColumnFamily) void {

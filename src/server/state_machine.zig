@@ -29,6 +29,8 @@ pub const ChildrenResult = struct {
     }
 };
 
+pub const SessionReadError = error{ SessionExpired, SessionMoved };
+
 pub const ZooKeeperStateMachine = struct {
     allocator: std.mem.Allocator,
     store: rocks_store.RocksStore,
@@ -79,6 +81,88 @@ pub const ZooKeeperStateMachine = struct {
         return .{ .names = names, .stat = stat };
     }
 
+    pub fn existsForSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+    ) !?protocol.data.Stat {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+        return self.store.exists(path);
+    }
+
+    pub fn getDataForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+    ) !?DataResult {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+        const result = (try self.store.getData(allocator, path)) orelse return null;
+        return .{ .data = result.data, .stat = result.stat };
+    }
+
+    pub fn getChildrenForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+    ) !?ChildrenResult {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+        const stat = (try self.store.exists(path)) orelse return null;
+        const names = (try self.store.getChildren(allocator, path)).?;
+        return .{ .names = names, .stat = stat };
+    }
+
+    pub fn validateSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+    ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+    }
+
+    pub fn getSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+    ) !?rocks_store.Session {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.store.getSession(session_id);
+    }
+
+    pub fn expiredSessions(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+    ) ![]rocks_store.ExpiredSession {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.store.expiredSessions(allocator);
+    }
+
+    fn validateSessionLocked(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+    ) !void {
+        return switch (try self.store.validateSession(session_id, generation)) {
+            .ok => {},
+            .session_expired => error.SessionExpired,
+            .session_moved => error.SessionMoved,
+            else => error.SessionMoved,
+        };
+    }
+
     pub fn appliedIndex(self: *ZooKeeperStateMachine) u64 {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
@@ -113,7 +197,7 @@ pub const ZooKeeperStateMachine = struct {
                 .path = value.path,
                 .stat = result.stat.?,
             }) catch unreachable,
-            .delete => {},
+            .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => {},
             .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
                 .stat = result.stat.?,
             }) catch unreachable,
@@ -267,10 +351,47 @@ test "RocksDB state machine atomically persists commands and restores snapshots"
         .time_ms = 300,
     } });
     try testing.expectEqual(data_tree.ErrorCode.no_node, rejected.code);
-    try testing.expectEqual(@as(u64, 4), machine.appliedIndex());
+    const password = [_]u8{0x5a} ** 16;
+    const opened = try applyMutation(&machine, testing.allocator, 5, .{ .open_session = .{
+        .session_id = 99,
+        .password = &password,
+        .timeout_ms = 3_000,
+        .tick_grace_ms = 500,
+        .generation = 7,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, opened.code);
+    const ticked = try applyMutation(&machine, testing.allocator, 6, .{ .session_tick = .{
+        .leader_term = 1,
+        .elapsed_ms = 1_000,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, ticked.code);
+    const touched = try applyMutation(&machine, testing.allocator, 7, .{ .touch_session = .{
+        .session_id = 99,
+        .password = &password,
+        .generation = 7,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, touched.code);
+    try testing.expectEqual(@as(i64, 4_500), (try machine.getSession(99)).?.expires_at_ms);
+    const moved = try applyMutation(&machine, testing.allocator, 8, .{ .move_session = .{
+        .session_id = 99,
+        .password = &password,
+        .expected_generation = 7,
+        .new_generation = 8,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, moved.code);
+    const stale_create = try applyMutation(&machine, testing.allocator, 9, .{ .create = .{
+        .path = "/stale",
+        .data = "rejected",
+        .time_ms = 2_000,
+        .session_id = 99,
+        .session_generation = 7,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.session_moved, stale_create.code);
+    try testing.expect((try machine.exists("/stale")) == null);
+    try testing.expectEqual(@as(u64, 9), machine.appliedIndex());
 
     const conf_state = raft.ConfState{};
-    var snapshot = try machine.stateMachine().takeSnapshot(testing.allocator, 4, 1, conf_state);
+    var snapshot = try machine.stateMachine().takeSnapshot(testing.allocator, 9, 1, conf_state);
     defer snapshot.deinit(testing.allocator);
 
     var target_dir = std.testing.tmpDir(.{});
@@ -285,5 +406,16 @@ test "RocksDB state machine atomically persists commands and restores snapshots"
     defer data.deinit(testing.allocator);
     try testing.expectEqualStrings("two", data.data);
     try testing.expectEqual(@as(i32, 1), data.stat.version);
-    try testing.expectEqual(@as(u64, 4), restored.appliedIndex());
+    const restored_session = (try restored.getSession(99)).?;
+    try testing.expectEqualSlices(u8, &password, &restored_session.password);
+    try testing.expectEqual(@as(i64, 4_500), restored_session.expires_at_ms);
+    try testing.expectEqual(@as(u64, 9), restored.appliedIndex());
+    try testing.expectEqual(@as(u64, 8), restored_session.generation);
+    const closed = try applyMutation(&restored, testing.allocator, 10, .{ .close_session = .{
+        .session_id = 99,
+        .password = &password,
+        .generation = 8,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, closed.code);
+    try testing.expectEqual(@as(?rocks_store.Session, null), try restored.getSession(99));
 }

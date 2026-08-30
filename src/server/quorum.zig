@@ -3,6 +3,7 @@ const linux = std.os.linux;
 const raft = @import("raftz");
 const command = @import("command.zig");
 const config_mod = @import("config.zig");
+const data_tree = @import("data_tree.zig");
 const state_machine = @import("state_machine.zig");
 
 pub const Options = struct {
@@ -12,14 +13,16 @@ pub const Options = struct {
     proposal_timeout_ticks: u64 = 200,
     read_index_timeout_ticks: u64 = 200,
     snapshot_entries_threshold: u64 = 10_000,
+    session_reap_interval_ms: u64 = 500,
 };
 
 pub const ProposalResponse = struct {
+    allocator: std.mem.Allocator,
     storage: []u8,
     bytes: []u8,
 
-    pub fn deinit(self: *ProposalResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.storage);
+    pub fn deinit(self: *ProposalResponse) void {
+        self.allocator.free(self.storage);
         self.* = undefined;
     }
 };
@@ -32,7 +35,9 @@ pub const Quorum = struct {
     transport: *raft.GrpcLiteTransport,
     raftor: *raft.Raftor,
     driver_thread: std.Thread,
+    session_reaper_thread: std.Thread,
     driver_stop: std.atomic.Value(bool) = .init(false),
+    session_reaper_stop: std.atomic.Value(bool) = .init(false),
     driver_failed: std.atomic.Value(bool) = .init(false),
     running: bool = false,
 
@@ -43,13 +48,16 @@ pub const Quorum = struct {
         options: Options,
     ) !*Quorum {
         if (options.tick_interval_ms == 0 or options.heartbeat_tick == 0 or
-            options.election_tick <= options.heartbeat_tick) return error.InvalidConfig;
+            options.election_tick <= options.heartbeat_tick or
+            options.session_reap_interval_ms == 0 or
+            options.session_reap_interval_ms > std.math.maxInt(i32)) return error.InvalidConfig;
         const self = try allocator.create(Quorum);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.io = io;
         self.options = options;
         self.driver_stop = .init(false);
+        self.session_reaper_stop = .init(false);
         self.driver_failed = .init(false);
         self.running = false;
 
@@ -107,12 +115,19 @@ pub const Quorum = struct {
             self.raftor.stop();
             self.driver_thread.join();
         }
+        self.session_reaper_thread = try std.Thread.spawn(.{}, runSessionReaper, .{self});
+        errdefer {
+            self.session_reaper_stop.store(true, .release);
+            self.session_reaper_thread.join();
+        }
         self.running = true;
         return self;
     }
 
     pub fn shutdown(self: *Quorum) !void {
         if (!self.running) return;
+        self.session_reaper_stop.store(true, .release);
+        self.session_reaper_thread.join();
         self.driver_stop.store(true, .release);
         self.raftor.stop();
         self.driver_thread.join();
@@ -141,6 +156,7 @@ pub const Quorum = struct {
         });
         const response_length = try waiter.wait();
         return .{
+            .allocator = self.allocator,
             .storage = response_storage,
             .bytes = response_storage[0..response_length],
         };
@@ -172,6 +188,74 @@ pub const Quorum = struct {
             sleepNanoseconds(self.options.tick_interval_ms * std.time.ns_per_ms);
         }
         if (self.driver_failed.load(.acquire)) self.raftor.stop();
+    }
+
+    fn runSessionReaper(self: *Quorum) void {
+        var last_tick_ms: ?i64 = null;
+        var last_leader_term: u64 = 0;
+        while (!self.session_reaper_stop.load(.acquire)) {
+            sleepNanoseconds(self.options.session_reap_interval_ms * std.time.ns_per_ms);
+            if (self.session_reaper_stop.load(.acquire)) break;
+            const leader_status = self.status();
+            if (leader_status.role != .leader) {
+                last_tick_ms = null;
+                last_leader_term = 0;
+                continue;
+            }
+            const monotonic_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
+            if (last_tick_ms == null or last_leader_term != leader_status.term) {
+                last_tick_ms = monotonic_ms;
+                last_leader_term = leader_status.term;
+                continue;
+            }
+            const elapsed_ms = monotonic_ms - last_tick_ms.?;
+            if (elapsed_ms <= 0) continue;
+            const bounded_elapsed = @min(
+                elapsed_ms,
+                @as(i64, @intCast(self.options.session_reap_interval_ms)),
+            );
+            var tick_response = self.propose(.{ .session_tick = .{
+                .leader_term = leader_status.term,
+                .elapsed_ms = bounded_elapsed,
+            } }) catch |err| {
+                if (!self.session_reaper_stop.load(.acquire)) {
+                    raft.log.warn(@src(), "failed to advance session clock: {s}", .{@errorName(err)});
+                }
+                continue;
+            };
+            const tick_result = command.decodeResult(tick_response.bytes) catch {
+                tick_response.deinit();
+                continue;
+            };
+            tick_response.deinit();
+            const current_status = self.status();
+            if (tick_result.code == .ok) last_tick_ms.? += bounded_elapsed;
+            if (tick_result.code != .ok or current_status.role != .leader or
+                current_status.term != leader_status.term) continue;
+            const expired = self.machine.expiredSessions(self.allocator) catch |err| {
+                raft.log.warn(@src(), "failed to scan expired sessions: {s}", .{@errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(expired);
+            for (expired) |session| {
+                if (self.session_reaper_stop.load(.acquire)) break;
+                const latest_status = self.status();
+                if (latest_status.role != .leader or latest_status.term != leader_status.term) break;
+                var response = self.propose(.{ .expire_session = .{
+                    .session_id = session.session_id,
+                    .expected_expires_at_ms = session.expires_at_ms,
+                } }) catch |err| {
+                    if (!self.session_reaper_stop.load(.acquire)) {
+                        raft.log.warn(@src(), "failed to expire session {}: {s}", .{
+                            session.session_id,
+                            @errorName(err),
+                        });
+                    }
+                    continue;
+                };
+                response.deinit();
+            }
+        }
     }
 };
 
@@ -312,18 +396,49 @@ test "single-node quorum persists committed state through WAL restart" {
         .proposal_timeout_ticks = 100,
         .read_index_timeout_ticks = 100,
         .snapshot_entries_threshold = 1,
+        .session_reap_interval_ms = 10,
     };
 
     {
         const quorum = try Quorum.create(std.heap.smp_allocator, testing.io, &config, options);
         defer quorum.deinit();
         try waitForLeader(quorum, testing.io);
+        const password = [_]u8{0x33} ** 16;
+        const now_ms = std.Io.Clock.real.now(testing.io).toMilliseconds();
+        var opened_session = try quorum.propose(.{ .open_session = .{
+            .session_id = 77,
+            .password = &password,
+            .timeout_ms = 200,
+            .tick_grace_ms = 10,
+            .generation = 1,
+        } });
+        const opened_result = try command.decodeResult(opened_session.bytes);
+        try testing.expectEqual(data_tree.ErrorCode.ok, opened_result.code);
+        opened_session.deinit();
+        var ephemeral = try quorum.propose(.{ .create = .{
+            .path = "/expires-with-session",
+            .data = "temporary",
+            .time_ms = now_ms,
+            .ephemeral = true,
+            .session_id = 77,
+            .session_generation = 1,
+        } });
+        const ephemeral_result = try command.decodeResult(ephemeral.bytes);
+        try testing.expectEqual(data_tree.ErrorCode.ok, ephemeral_result.code);
+        ephemeral.deinit();
+        var expiration_attempts: usize = 0;
+        while ((try quorum.machine.getSession(77)) != null and expiration_attempts < 100) : (expiration_attempts += 1) {
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        try testing.expect((try quorum.machine.getSession(77)) == null);
+        try testing.expect((try quorum.machine.exists("/expires-with-session")) == null);
+
         var response = try quorum.propose(.{ .create = .{
             .path = "/durable",
             .data = "value",
             .time_ms = 1,
         } });
-        defer response.deinit(std.heap.smp_allocator);
+        defer response.deinit();
         const result = try command.decodeResult(response.bytes);
         try testing.expectEqual(@as(i32, 0), @intFromEnum(result.code));
         try quorum.linearizableRead();
@@ -455,6 +570,7 @@ test "three-node quorum replicates through follower and survives leader restart"
         .proposal_timeout_ticks = 300,
         .read_index_timeout_ticks = 300,
         .snapshot_entries_threshold = 2,
+        .session_reap_interval_ms = 10,
     };
     var nodes: [3]?*Quorum = .{ null, null, null };
     defer for (&nodes) |*maybe_node| if (maybe_node.*) |node| {
@@ -479,7 +595,7 @@ test "three-node quorum replicates through follower and survives leader restart"
         .data = "v1",
         .time_ms = 1,
     } });
-    defer first_response.deinit(std.heap.smp_allocator);
+    defer first_response.deinit();
     try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(first_response.bytes)).code));
     for (nodes) |maybe_node| try waitForReplicatedPath(maybe_node.?, "/cluster", testing.io);
 
@@ -502,7 +618,7 @@ test "three-node quorum replicates through follower and survives leader restart"
         .data = "v2",
         .time_ms = 2,
     } });
-    defer second_response.deinit(std.heap.smp_allocator);
+    defer second_response.deinit();
     try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(second_response.bytes)).code));
 
     nodes[stopped_index] = try Quorum.create(
