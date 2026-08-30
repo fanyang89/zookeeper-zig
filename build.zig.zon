@@ -11,6 +11,10 @@
             .url = "https://github.com/Syndica/rocksdb-zig/archive/20cc086f2702d9ec4aff144c242962ea3b666ee5.tar.gz",
             .hash = "rocksdb-9.7.4-z_CUTs3JAAArXHjTd4mMpiXG2_mKhw479lWGduaWuNeA",
         },
+        .zest = .{
+            .url = "https://github.com/cloudboss/zest/archive/2ec1ae4848887223e585e105a92ca57d7612d332.tar.gz",
+            .hash = "zest-0.1.0-2zk2nsZKAAD5f-v2ykUVtvZNmA_Wh2Nwhe49-PbLNdAx",
+        },
     },
     .paths = .{
         "build.zig",

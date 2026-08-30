@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const zest = b.dependency("zest", .{});
 
     const linux_server = target.result.os.tag == .linux;
     const raftz_module = if (linux_server)
@@ -40,7 +41,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = imports,
     });
-    const tests = b.addTest(.{ .root_module = test_module });
+    const tests = b.addTest(.{
+        .root_module = test_module,
+        .test_runner = .{
+            .path = zest.path("src/root.zig"),
+            .mode = .simple,
+        },
+    });
 
     if (raftz_module) |module| {
         const server_module = b.createModule(.{
