@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run end-to-end tests with thread sanitizer"
-set -euo pipefail
-
-runtime_dir=$(clang --print-runtime-dir)
-export ZIG_E2E_FLAGS="-Dsanitize=thread"
-export TSAN_OPTIONS="suppressions=$PWD/tests/tsan.supp${TSAN_OPTIONS:+:$TSAN_OPTIONS}"
-exec .mise/tasks/e2e

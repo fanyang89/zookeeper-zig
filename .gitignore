@@ -3,6 +3,3 @@ zig-out/
 zig-pkg/
 .pi/
 .mise.local.toml
-coverage/
-tests/.runtime/
-tests/fuzz/corpus/

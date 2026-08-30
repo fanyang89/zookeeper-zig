@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run end-to-end tests with undefined behavior sanitizer"
-set -euo pipefail
-
-export ZIG_E2E_FLAGS="-Dsanitize=undefined"
-exec .mise/tasks/e2e

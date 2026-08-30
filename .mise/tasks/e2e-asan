@@ -1,8 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run end-to-end tests with address sanitizer"
-set -euo pipefail
-
-runtime_dir=$(clang --print-runtime-dir)
-export ZIG_E2E_FLAGS="-Dsanitize=address -Dclang-runtime-dir=$runtime_dir"
-export ASAN_OPTIONS="halt_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
-exec .mise/tasks/e2e

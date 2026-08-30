@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run libFuzzer fuzz targets"
-set -euo pipefail
-
-runtime_dir=$(clang --print-runtime-dir)
-mkdir -p tests/.runtime/fuzz
-exec zig build fuzz -Dfuzz=true -Dclang-runtime-dir="$runtime_dir" -- \
-    -max_total_time="${FUZZ_DURATION:-60}" -max_len="${FUZZ_MAX_LEN:-4096}" \
-    -artifact_prefix=tests/.runtime/fuzz/ "$@"

@@ -1,7 +1,7 @@
 .{
-    .name = .zookeeper_c,
-    .version = "3.9.5",
-    .fingerprint = 0x93cdc1ec4a2052ec, // Changing this has security and trust implications.
+    .name = .zookeeper_zig,
+    .version = "0.1.0",
+    .fingerprint = 0x2b6f731e2fe96126, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
@@ -11,7 +11,5 @@
         "LICENSE",
         "README.md",
         "src",
-        "tests",
-        "vendor",
     },
 }

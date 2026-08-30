@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-#MISE description="Run unit tests with undefined behavior sanitizer"
-set -euo pipefail
-
-exec zig build test -Dsanitize=undefined "$@"
