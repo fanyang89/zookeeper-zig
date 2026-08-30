@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
         .module = module,
     }} else &.{};
 
-    _ = b.addModule("zookeeper", .{
+    const zookeeper_module = b.addModule("zookeeper", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -35,6 +35,23 @@ pub fn build(b: *std.Build) void {
         .imports = imports,
     });
     const tests = b.addTest(.{ .root_module = test_module });
+
+    if (raftz_module) |module| {
+        const server_module = b.createModule(.{
+            .root_source_file = b.path("src/server/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zookeeper", .module = zookeeper_module },
+                .{ .name = "raftz", .module = module },
+            },
+        });
+        const server = b.addExecutable(.{
+            .name = "zookeeper-quorum-server",
+            .root_module = server_module,
+        });
+        b.installArtifact(server);
+    }
 
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");
     check_zig.dependOn(&tests.step);

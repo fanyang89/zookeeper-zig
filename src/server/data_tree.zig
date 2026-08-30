@@ -3,6 +3,7 @@ const protocol = @import("../protocol.zig");
 
 pub const ErrorCode = enum(i32) {
     ok = 0,
+    connection_loss = -4,
     unimplemented = -6,
     bad_arguments = -8,
     no_node = -101,

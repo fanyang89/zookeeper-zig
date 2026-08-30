@@ -1,0 +1,583 @@
+const std = @import("std");
+const raft = @import("raftz");
+const jute = @import("../jute.zig");
+const protocol = @import("../protocol.zig");
+const wire = @import("../wire.zig");
+const blocking_client = @import("../client/blocking.zig");
+const TcpTransport = @import("../client/tcp_transport.zig").TcpTransport;
+const command = @import("command.zig");
+const config_mod = @import("config.zig");
+const data_tree = @import("data_tree.zig");
+const quorum_mod = @import("quorum.zig");
+
+const session_password = [_]u8{0} ** 16;
+
+pub const TcpServer = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    quorum: *quorum_mod.Quorum,
+    address: std.Io.net.IpAddress,
+    next_session_id: std.atomic.Value(u64) = .init(1),
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        quorum: *quorum_mod.Quorum,
+        host: []const u8,
+        port: u16,
+    ) !TcpServer {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .quorum = quorum,
+            .address = try std.Io.net.IpAddress.parseIp4(host, port),
+        };
+    }
+
+    pub fn serve(self: *TcpServer) !void {
+        var listener = try self.address.listen(self.io, .{ .reuse_address = true });
+        defer listener.deinit(self.io);
+        while (true) {
+            const stream = try listener.accept(self.io);
+            const thread = std.Thread.spawn(.{}, serveThread, .{ self, stream }) catch |err| {
+                stream.close(self.io);
+                return err;
+            };
+            thread.detach();
+        }
+    }
+
+    fn serveThread(self: *TcpServer, stream: std.Io.net.Stream) void {
+        self.serveConnection(stream) catch |err| {
+            std.log.warn("ZooKeeper client connection closed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn serveConnection(self: *TcpServer, stream: std.Io.net.Stream) !void {
+        var transport = TcpTransport.fromStream(stream);
+        defer transport.close(self.io);
+
+        const connect_payload = try transport.readFrameAlloc(
+            self.allocator,
+            self.io,
+            wire.default_max_payload,
+        );
+        defer self.allocator.free(connect_payload);
+        const connect = try wire.decodeConnectRequest(connect_payload);
+        if (connect.value.sessionId != 0) {
+            try sendConnectResponse(&transport, self.allocator, self.io, .{
+                .protocolVersion = 0,
+                .timeOut = 0,
+                .sessionId = 0,
+                .passwd = &.{},
+                .readOnly = false,
+            }, connect.read_only_supported);
+            return;
+        }
+
+        const requested_timeout = @max(connect.value.timeOut, 2_000);
+        const negotiated_timeout = @min(requested_timeout, 40_000);
+        const session_id: i64 = @intCast(self.next_session_id.fetchAdd(1, .monotonic));
+        try sendConnectResponse(&transport, self.allocator, self.io, .{
+            .protocolVersion = 0,
+            .timeOut = negotiated_timeout,
+            .sessionId = session_id,
+            .passwd = &session_password,
+            .readOnly = false,
+        }, connect.read_only_supported);
+
+        while (true) {
+            const payload = try transport.readFrameAlloc(
+                self.allocator,
+                self.io,
+                wire.default_max_payload,
+            );
+            defer self.allocator.free(payload);
+            const request = try wire.requestView(payload);
+            const opcode = wire.OpCode.fromInt(request.header.type) orelse {
+                try sendError(&transport, self.allocator, self.io, request.header.xid, -1, .unimplemented);
+                continue;
+            };
+            const keep_open = try self.dispatch(&transport, request.header.xid, opcode, request.body);
+            if (!keep_open) return;
+        }
+    }
+
+    fn dispatch(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        xid: i32,
+        opcode: wire.OpCode,
+        body: []const u8,
+    ) !bool {
+        switch (opcode) {
+            .ping => {
+                try sendReply(transport, self.allocator, self.io, .{
+                    .xid = wire.Xid.ping,
+                    .zxid = -1,
+                    .err = 0,
+                }, {});
+                return true;
+            },
+            .close_session => {
+                try sendReply(transport, self.allocator, self.io, .{
+                    .xid = xid,
+                    .zxid = -1,
+                    .err = 0,
+                }, {});
+                return false;
+            },
+            .create, .create2 => try self.create(transport, xid, opcode, body),
+            .delete => try self.delete(transport, xid, body),
+            .set_data => try self.setData(transport, xid, body),
+            .exists => try self.exists(transport, xid, body),
+            .get_data => try self.getData(transport, xid, body),
+            .get_children, .get_children2 => try self.getChildren(transport, xid, opcode, body),
+            .sync => try self.sync(transport, xid, body),
+            else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
+        }
+        return true;
+    }
+
+    fn create(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        xid: i32,
+        opcode: wire.OpCode,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.CreateRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const path = request.path orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        if (request.flags != 0) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .unimplemented,
+        );
+        var proposal = self.quorum.propose(.{ .create = .{
+            .path = path,
+            .data = request.data orelse &.{},
+            .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit(self.allocator);
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            result.zxid,
+            result.code,
+        );
+        var reader = jute.Reader.init(result.body);
+        const response = try jute.deserialize(protocol.proto.CreateResponse, &reader, self.allocator);
+        if (reader.remaining() != 0) return error.InvalidProposalResponse;
+        if (opcode == .create2) {
+            const stat = self.quorum.machine.exists(path) orelse return error.InvalidProposalResponse;
+            try sendReply(transport, self.allocator, self.io, .{
+                .xid = xid,
+                .zxid = result.zxid,
+                .err = 0,
+            }, protocol.proto.Create2Response{ .path = response.path, .stat = stat });
+        } else {
+            try sendReply(transport, self.allocator, self.io, .{
+                .xid = xid,
+                .zxid = result.zxid,
+                .err = 0,
+            }, response);
+        }
+    }
+
+    fn delete(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+        const request = try decodeBody(protocol.proto.DeleteRequest, bytes, self.allocator);
+        var proposal = self.quorum.propose(.{ .delete = .{
+            .path = request.path orelse return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .bad_arguments,
+            ),
+            .expected_version = request.version,
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit(self.allocator);
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            result.zxid,
+            result.code,
+        );
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, {});
+    }
+
+    fn setData(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+        const request = try decodeBody(protocol.proto.SetDataRequest, bytes, self.allocator);
+        var proposal = self.quorum.propose(.{ .set_data = .{
+            .path = request.path orelse return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .bad_arguments,
+            ),
+            .data = request.data orelse &.{},
+            .expected_version = request.version,
+            .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit(self.allocator);
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            result.zxid,
+            result.code,
+        );
+        var reader = jute.Reader.init(result.body);
+        const response = try jute.deserialize(protocol.proto.SetDataResponse, &reader, self.allocator);
+        if (reader.remaining() != 0) return error.InvalidProposalResponse;
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, response);
+    }
+
+    fn exists(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+        const request = try decodeBody(protocol.proto.ExistsRequest, bytes, self.allocator);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        const stat = self.quorum.machine.exists(request.path orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            zxid,
+            .bad_arguments,
+        )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.ExistsResponse{ .stat = stat });
+    }
+
+    fn getData(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+        const request = try decodeBody(protocol.proto.GetDataRequest, bytes, self.allocator);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        var result = (try self.quorum.machine.getData(
+            self.allocator,
+            request.path orelse return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                .bad_arguments,
+            ),
+        )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        defer result.deinit(self.allocator);
+        try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.GetDataResponse{ .data = result.data, .stat = result.stat });
+    }
+
+    fn getChildren(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        xid: i32,
+        opcode: wire.OpCode,
+        bytes: []const u8,
+    ) !void {
+        const path: ?[]const u8 = if (opcode == .get_children) blk: {
+            const request = try decodeBody(protocol.proto.GetChildrenRequest, bytes, self.allocator);
+            break :blk request.path;
+        } else blk: {
+            const request = try decodeBody(protocol.proto.GetChildren2Request, bytes, self.allocator);
+            break :blk request.path;
+        };
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        var result = (try self.quorum.machine.getChildren(
+            self.allocator,
+            path orelse return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                .bad_arguments,
+            ),
+        )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        defer result.deinit(self.allocator);
+        const children = try self.allocator.alloc(?[]const u8, result.names.len);
+        defer self.allocator.free(children);
+        for (result.names, 0..) |name, index| children[index] = name;
+        if (opcode == .get_children) {
+            try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.GetChildrenResponse{ .children = children });
+        } else {
+            try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.GetChildren2Response{ .children = children, .stat = result.stat });
+        }
+    }
+
+    fn sync(self: *TcpServer, transport: *TcpTransport, xid: i32, bytes: []const u8) !void {
+        const request = try decodeBody(protocol.proto.SyncRequest, bytes, self.allocator);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.SyncResponse{ .path = request.path });
+    }
+};
+
+fn decodeBody(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator) !T {
+    var reader = jute.Reader.init(bytes);
+    const value = try jute.deserialize(T, &reader, allocator);
+    errdefer jute.deinitDecoded(value, allocator);
+    if (reader.remaining() != 0) return error.TrailingData;
+    return value;
+}
+
+fn sendConnectResponse(
+    transport: *TcpTransport,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    response: protocol.proto.ConnectResponse,
+    include_read_only: bool,
+) !void {
+    var writer = jute.Writer.init(allocator);
+    defer writer.deinit();
+    try wire.encodeConnectResponse(&writer, response, include_read_only);
+    try transport.writeFrame(io, writer.bytes());
+}
+
+fn sendReply(
+    transport: *TcpTransport,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    header: protocol.proto.ReplyHeader,
+    body: anytype,
+) !void {
+    var writer = jute.Writer.init(allocator);
+    defer writer.deinit();
+    try wire.encodeReply(&writer, header, body);
+    try transport.writeFrame(io, writer.bytes());
+}
+
+fn sendError(
+    transport: *TcpTransport,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    xid: i32,
+    zxid: i64,
+    code: data_tree.ErrorCode,
+) !void {
+    return sendReply(transport, allocator, io, .{
+        .xid = xid,
+        .zxid = zxid,
+        .err = @intFromEnum(code),
+    }, {});
+}
+
+fn appliedZxid(quorum: *quorum_mod.Quorum) i64 {
+    return std.math.cast(i64, quorum.machine.appliedIndex()) orelse std.math.maxInt(i64);
+}
+
+fn reserveTestPort(io: std.Io) !u16 {
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        listener.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    return std.mem.bigToNative(u16, local_address.port);
+}
+
+fn serveOneConnection(server: *TcpServer, listener: *std.Io.net.Server) !void {
+    const stream = try listener.accept(server.io);
+    try server.serveConnection(stream);
+}
+
+fn expectResponse(client: *blocking_client.BlockingClient, xid: i32) !blocking_client.Inbound {
+    const inbound = try client.receive();
+    try std.testing.expectEqual(xid, inbound.header.xid);
+    try std.testing.expectEqual(@as(i32, 0), inbound.header.err);
+    return inbound;
+}
+
+test "ZooKeeper TCP server serves replicated CRUD requests" {
+    const testing = std.testing;
+    try raft.log.initGlobal(std.heap.smp_allocator, testing.io, false);
+    defer raft.log.deinitGlobal(std.heap.smp_allocator);
+
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root_path = try temporary.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root_path);
+    const raft_port = try reserveTestPort(testing.io);
+    const client_port = try reserveTestPort(testing.io);
+    const raft_endpoint = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{raft_port});
+    defer testing.allocator.free(raft_endpoint);
+    const client_endpoint = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{client_port});
+    defer testing.allocator.free(client_endpoint);
+    const peer = try std.fmt.allocPrint(testing.allocator, "1={s}", .{raft_endpoint});
+    defer testing.allocator.free(peer);
+    const arguments = [_][]const u8{
+        "--node-id",       "1",
+        "--cluster-id",    "0198f54d-5c2a-7000-8000-000000000002",
+        "--client-listen", client_endpoint,
+        "--raft-listen",   raft_endpoint,
+        "--data-dir",      root_path,
+        "--peer",          peer,
+    };
+    var config = try config_mod.parse(testing.allocator, &arguments);
+    defer config.deinit();
+    const quorum = try quorum_mod.Quorum.create(std.heap.smp_allocator, testing.io, &config, .{
+        .tick_interval_ms = 10,
+        .election_tick = 5,
+        .heartbeat_tick = 1,
+        .proposal_timeout_ticks = 100,
+        .read_index_timeout_ticks = 100,
+        .snapshot_entries_threshold = 10,
+    });
+    defer quorum.deinit();
+    var attempts: usize = 0;
+    while (quorum.status().leader_id == 0 and attempts < 500) : (attempts += 1) {
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expect(quorum.status().leader_id != 0);
+
+    const listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", client_port);
+    var listener = try listen_address.listen(testing.io, .{ .reuse_address = true });
+    defer listener.deinit(testing.io);
+    var server = try TcpServer.init(
+        std.heap.smp_allocator,
+        testing.io,
+        quorum,
+        "127.0.0.1",
+        client_port,
+    );
+    var server_future = testing.io.async(serveOneConnection, .{ &server, &listener });
+    defer server_future.cancel(testing.io) catch {};
+
+    const one_second: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromSeconds(1),
+        .clock = .awake,
+    } };
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", client_port);
+    var client = try blocking_client.BlockingClient.connectAddress(
+        testing.allocator,
+        testing.io,
+        address,
+        .{ .handshake_timeout = one_second, .io_timeout = one_second },
+        .{},
+    );
+    defer client.deinit();
+
+    const create_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
+        .path = "/app",
+        .data = "one",
+        .acl = null,
+        .flags = 0,
+    });
+    var create_reply = try expectResponse(&client, create_xid);
+    defer create_reply.deinit();
+    const create_response = try wire.decodeFrameRecord(
+        protocol.proto.CreateResponse,
+        create_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqualStrings("/app", create_response.path.?);
+
+    const set_xid = try client.sendRequest(.set_data, protocol.proto.SetDataRequest{
+        .path = "/app",
+        .data = "two",
+        .version = 0,
+    });
+    var set_reply = try expectResponse(&client, set_xid);
+    defer set_reply.deinit();
+    const set_response = try wire.decodeFrameRecord(
+        protocol.proto.SetDataResponse,
+        set_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), set_response.stat.version);
+
+    const get_xid = try client.sendRequest(.get_data, protocol.proto.GetDataRequest{
+        .path = "/app",
+        .watch = false,
+    });
+    var get_reply = try expectResponse(&client, get_xid);
+    defer get_reply.deinit();
+    const get_response = try wire.decodeFrameRecord(
+        protocol.proto.GetDataResponse,
+        get_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqualStrings("two", get_response.data.?);
+
+    const children_xid = try client.sendRequest(.get_children, protocol.proto.GetChildrenRequest{
+        .path = "/",
+        .watch = false,
+    });
+    var children_reply = try expectResponse(&client, children_xid);
+    defer children_reply.deinit();
+    const children_response = try wire.decodeFrameRecord(
+        protocol.proto.GetChildrenResponse,
+        children_reply.body(),
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(children_response, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), children_response.children.?.len);
+    try testing.expectEqualStrings("app", children_response.children.?[0].?);
+
+    const delete_xid = try client.sendRequest(.delete, protocol.proto.DeleteRequest{
+        .path = "/app",
+        .version = 1,
+    });
+    var delete_reply = try expectResponse(&client, delete_xid);
+    defer delete_reply.deinit();
+    try testing.expectEqual(@as(usize, 0), delete_reply.body().len);
+
+    try client.close(one_second);
+    try server_future.await(testing.io);
+    try quorum.shutdown();
+}
