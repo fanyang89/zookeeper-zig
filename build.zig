@@ -4,10 +4,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const raftz_module = if (target.result.os.tag == .linux)
+        b.dependency("raftz", .{
+            .target = target,
+            .optimize = optimize,
+        }).module("raftz")
+    else
+        null;
+    const imports: []const std.Build.Module.Import = if (raftz_module) |module| &.{.{
+        .name = "raftz",
+        .module = module,
+    }} else &.{};
+
     _ = b.addModule("zookeeper", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = imports,
     });
     _ = b.addModule("jute", .{
         .root_source_file = b.path("src/jute.zig"),
@@ -19,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = imports,
     });
     const tests = b.addTest(.{ .root_module = test_module });
 

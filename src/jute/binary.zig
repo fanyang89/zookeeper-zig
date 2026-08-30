@@ -47,6 +47,14 @@ pub const Writer = struct {
         return self.buffer.items.len;
     }
 
+    pub fn ensureTotalCapacityPrecise(self: *Writer, capacity: usize) std.mem.Allocator.Error!void {
+        try self.buffer.ensureTotalCapacityPrecise(self.allocator, capacity);
+    }
+
+    pub fn toOwnedSliceAssert(self: *Writer) []u8 {
+        return self.buffer.toOwnedSliceAssert();
+    }
+
     pub fn truncate(self: *Writer, length: usize) void {
         std.debug.assert(length <= self.buffer.items.len);
         self.buffer.items.len = length;
