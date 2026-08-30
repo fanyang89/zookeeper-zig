@@ -34,6 +34,14 @@ pub const ResultView = struct {
     body: []const u8,
 };
 
+pub fn resultCapacity(mutation: Mutation) error{SizeOverflow}!usize {
+    return switch (mutation) {
+        .create => |value| std.math.add(usize, 84, value.path.len) catch error.SizeOverflow,
+        .delete => 12,
+        .set_data => 80,
+    };
+}
+
 pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
     var writer = jute.Writer.init(allocator);
     defer writer.deinit();

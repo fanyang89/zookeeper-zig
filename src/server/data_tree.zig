@@ -17,7 +17,7 @@ pub const MutationResult = struct {
     stat: ?protocol.data.Stat = null,
 };
 
-const Node = struct {
+pub const Node = struct {
     data: []u8,
     czxid: i64,
     mzxid: i64,
@@ -28,12 +28,12 @@ const Node = struct {
     pzxid: i64,
     child_count: usize = 0,
 
-    fn deinit(self: *Node, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
         self.* = undefined;
     }
 
-    fn stat(self: *const Node) protocol.data.Stat {
+    pub fn stat(self: *const Node) protocol.data.Stat {
         return .{
             .czxid = self.czxid,
             .mzxid = self.mzxid,
@@ -99,7 +99,8 @@ pub const DataTree = struct {
 
         try self.nodes.ensureUnusedCapacity(1);
         const parent = self.nodes.getPtr(parent_path).?;
-        if (parent.child_count == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
+        if (parent.child_count == std.math.maxInt(i32) or
+            parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
         const owned_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned_path);
         const owned_data = try self.allocator.dupe(u8, data);
@@ -123,6 +124,9 @@ pub const DataTree = struct {
         const node = self.nodes.getPtr(path) orelse return .{ .code = .no_node };
         if (node.child_count != 0) return .{ .code = .not_empty };
         if (version != -1 and version != node.version) return .{ .code = .bad_version };
+        if (self.nodes.get(parent_path).?.cversion == std.math.maxInt(i32)) {
+            return .{ .code = .bad_arguments };
+        }
 
         const removed = self.nodes.fetchRemove(path).?;
         self.allocator.free(removed.key);
@@ -272,14 +276,18 @@ pub const DataTree = struct {
     }
 };
 
-fn parentPath(path: []const u8) ?[]const u8 {
+pub fn isValidPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/") or parentPath(path) != null;
+}
+
+pub fn parentPath(path: []const u8) ?[]const u8 {
     if (path.len < 2 or path[0] != '/' or path[path.len - 1] == '/') return null;
     if (std.mem.indexOf(u8, path, "//") != null) return null;
     const separator = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
     return if (separator == 0) "/" else path[0..separator];
 }
 
-fn directChildName(parent: []const u8, candidate: []const u8) ?[]const u8 {
+pub fn directChildName(parent: []const u8, candidate: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, parent, candidate)) return null;
     if (std.mem.eql(u8, parent, "/")) {
         if (candidate.len < 2 or candidate[0] != '/') return null;

@@ -7,6 +7,10 @@
         .raftz = .{
             .path = "../raftz",
         },
+        .rocksdb = .{
+            .url = "https://github.com/Syndica/rocksdb-zig/archive/20cc086f2702d9ec4aff144c242962ea3b666ee5.tar.gz",
+            .hash = "rocksdb-9.7.4-z_CUTs3JAAArXHjTd4mMpiXG2_mKhw479lWGduaWuNeA",
+        },
     },
     .paths = .{
         "build.zig",

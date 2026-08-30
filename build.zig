@@ -4,17 +4,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const raftz_module = if (target.result.os.tag == .linux)
+    const linux_server = target.result.os.tag == .linux;
+    const raftz_module = if (linux_server)
         b.dependency("raftz", .{
             .target = target,
             .optimize = optimize,
         }).module("raftz")
     else
         null;
-    const imports: []const std.Build.Module.Import = if (raftz_module) |module| &.{.{
-        .name = "raftz",
-        .module = module,
-    }} else &.{};
+    const rocksdb_dependency = if (linux_server) b.dependency("rocksdb", .{
+        .target = target,
+        .optimize = optimize,
+    }) else null;
+    const imports: []const std.Build.Module.Import = if (raftz_module) |raftz| &.{
+        .{ .name = "raftz", .module = raftz },
+        .{ .name = "rocksdb", .module = rocksdb_dependency.?.module("bindings") },
+        .{ .name = "rocksdb_c", .module = rocksdb_dependency.?.module("rocksdb") },
+    } else &.{};
 
     const zookeeper_module = b.addModule("zookeeper", .{
         .root_source_file = b.path("src/root.zig"),

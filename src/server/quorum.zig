@@ -15,10 +15,11 @@ pub const Options = struct {
 };
 
 pub const ProposalResponse = struct {
+    storage: []u8,
     bytes: []u8,
 
     pub fn deinit(self: *ProposalResponse, allocator: std.mem.Allocator) void {
-        allocator.free(self.bytes);
+        allocator.free(self.storage);
         self.* = undefined;
     }
 };
@@ -51,12 +52,15 @@ pub const Quorum = struct {
         self.driver_stop = .init(false);
         self.driver_failed = .init(false);
         self.running = false;
-        self.machine = try state_machine.ZooKeeperStateMachine.init(allocator);
-        errdefer self.machine.deinit();
 
+        try std.Io.Dir.cwd().createDirPath(io, config.data_dir);
         const data_dir = try std.fmt.allocPrintSentinel(allocator, "{s}", .{config.data_dir}, 0);
         defer allocator.free(data_dir);
         _ = try raft.realFileSystem().makeDir(data_dir);
+        const state_dir = try std.fmt.allocPrint(allocator, "{s}/state.rocksdb", .{config.data_dir});
+        defer allocator.free(state_dir);
+        self.machine = try state_machine.ZooKeeperStateMachine.init(allocator, state_dir);
+        errdefer self.machine.deinit();
 
         const max_transport_message = state_machine.max_snapshot_bytes + 1024 * 1024;
         self.transport = try raft.GrpcLiteTransport.create(allocator, .{
@@ -128,12 +132,18 @@ pub const Quorum = struct {
     pub fn propose(self: *Quorum, mutation: command.Mutation) !ProposalResponse {
         const bytes = try command.encode(self.allocator, mutation);
         defer self.allocator.free(bytes);
-        var waiter = ProposalWaiter.init(self.allocator, self.io);
+        const response_storage = try self.allocator.alloc(u8, try command.resultCapacity(mutation));
+        errdefer self.allocator.free(response_storage);
+        var waiter = ProposalWaiter.init(self.io, response_storage);
         try self.raftor.propose(bytes, .{
             .ctx = &waiter,
             .function = ProposalWaiter.callback,
         });
-        return .{ .bytes = try waiter.wait() };
+        const response_length = try waiter.wait();
+        return .{
+            .storage = response_storage,
+            .bytes = response_storage[0..response_length],
+        };
     }
 
     pub fn linearizableRead(self: *Quorum) !void {
@@ -166,22 +176,26 @@ pub const Quorum = struct {
 };
 
 const ProposalWaiter = struct {
-    allocator: std.mem.Allocator,
     io: std.Io,
+    response_storage: []u8,
     done: std.atomic.Value(u32) = .init(0),
-    response: ?[]u8 = null,
+    response_length: usize = 0,
     failure: ?raft.Error = null,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io) ProposalWaiter {
-        return .{ .allocator = allocator, .io = io };
+    fn init(io: std.Io, response_storage: []u8) ProposalWaiter {
+        return .{ .io = io, .response_storage = response_storage };
     }
 
     fn callback(ctx: *anyopaque, result: raft.ProposalResult) void {
         const self: *ProposalWaiter = @ptrCast(@alignCast(ctx));
         switch (result) {
-            .ok => |response| self.response = self.allocator.dupe(u8, response) catch blk: {
-                self.failure = error.OutOfMemory;
-                break :blk null;
+            .ok => |response| {
+                if (response.len > self.response_storage.len) {
+                    self.failure = error.Fatal;
+                } else {
+                    @memcpy(self.response_storage[0..response.len], response);
+                    self.response_length = response.len;
+                }
             },
             .err => |err| self.failure = err,
         }
@@ -189,12 +203,12 @@ const ProposalWaiter = struct {
         std.Io.futexWake(self.io, u32, &self.done.raw, 1);
     }
 
-    fn wait(self: *ProposalWaiter) ![]u8 {
+    fn wait(self: *ProposalWaiter) !usize {
         while (self.done.load(.acquire) == 0) {
             std.Io.futexWaitUncancelable(self.io, u32, &self.done.raw, 0);
         }
         if (self.failure) |err| return err;
-        return self.response.?;
+        return self.response_length;
     }
 };
 
@@ -329,4 +343,180 @@ test "single-node quorum persists committed state through WAL restart" {
         try testing.expectEqualStrings("value", restored.data);
         try quorum.shutdown();
     }
+}
+
+fn reserveLoopbackPorts(io: std.Io, output: []u16) !void {
+    const listeners = try std.heap.smp_allocator.alloc(std.Io.net.Server, output.len);
+    defer std.heap.smp_allocator.free(listeners);
+    var initialized: usize = 0;
+    defer for (listeners[0..initialized]) |*listener| listener.deinit(io);
+    for (output, 0..) |*port, index| {
+        const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+        listeners[index] = try address.listen(io, .{});
+        initialized += 1;
+        var local_address: std.posix.sockaddr.in = undefined;
+        var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+        if (std.posix.errno(std.posix.system.getsockname(
+            listeners[index].socket.handle,
+            @ptrCast(&local_address),
+            &address_length,
+        )) != .SUCCESS) return error.AddressQueryFailed;
+        port.* = std.mem.bigToNative(u16, local_address.port);
+    }
+}
+
+fn waitForClusterLeader(nodes: []const ?*Quorum, io: std.Io) !u64 {
+    var attempts: usize = 0;
+    while (attempts < 1_000) : (attempts += 1) {
+        var elected: u64 = 0;
+        var consistent = true;
+        var reports: usize = 0;
+        for (nodes) |maybe_node| if (maybe_node) |node| {
+            const leader_id = node.status().leader_id;
+            if (leader_id == 0) {
+                consistent = false;
+                continue;
+            }
+            if (elected == 0) elected = leader_id else if (elected != leader_id) consistent = false;
+            reports += 1;
+        };
+        if (consistent and reports >= 2 and elected != 0) return elected;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.LeaderElectionTimeout;
+}
+
+fn waitForReplicatedPath(node: *Quorum, path: []const u8, io: std.Io) !void {
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        node.linearizableRead() catch {
+            try io.sleep(.fromMilliseconds(10), .awake);
+            continue;
+        };
+        if ((try node.machine.exists(path)) != null) return;
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.ReplicationTimeout;
+}
+
+test "three-node quorum replicates through follower and survives leader restart" {
+    const testing = std.testing;
+    try raft.log.initGlobal(std.heap.smp_allocator, testing.io, false);
+    defer raft.log.deinitGlobal(std.heap.smp_allocator);
+
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const root_path = try temporary.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(root_path);
+
+    var ports: [6]u16 = undefined;
+    try reserveLoopbackPorts(testing.io, &ports);
+    var raft_endpoints: [3][]u8 = undefined;
+    var client_endpoints: [3][]u8 = undefined;
+    var peer_values: [3][]u8 = undefined;
+    var data_dirs: [3][]u8 = undefined;
+    for (0..3) |index| {
+        raft_endpoints[index] = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{ports[index]});
+        client_endpoints[index] = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{ports[index + 3]});
+        peer_values[index] = try std.fmt.allocPrint(testing.allocator, "{}={s}", .{ index + 1, raft_endpoints[index] });
+        data_dirs[index] = try std.fmt.allocPrint(testing.allocator, "{s}/node{}", .{ root_path, index + 1 });
+    }
+    defer for (0..3) |index| {
+        testing.allocator.free(data_dirs[index]);
+        testing.allocator.free(peer_values[index]);
+        testing.allocator.free(client_endpoints[index]);
+        testing.allocator.free(raft_endpoints[index]);
+    };
+
+    var configs: [3]config_mod.ServerConfig = undefined;
+    var config_count: usize = 0;
+    defer for (configs[0..config_count]) |*config| config.deinit();
+    for (0..3) |index| {
+        const node_id = try std.fmt.allocPrint(testing.allocator, "{}", .{index + 1});
+        defer testing.allocator.free(node_id);
+        const arguments = [_][]const u8{
+            "--node-id",       node_id,
+            "--cluster-id",    "0198f54d-5c2a-7000-8000-000000000003",
+            "--client-listen", client_endpoints[index],
+            "--raft-listen",   raft_endpoints[index],
+            "--data-dir",      data_dirs[index],
+            "--peer",          peer_values[0],
+            "--peer",          peer_values[1],
+            "--peer",          peer_values[2],
+        };
+        configs[index] = try config_mod.parse(testing.allocator, &arguments);
+        config_count += 1;
+    }
+
+    const options = Options{
+        .tick_interval_ms = 10,
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .proposal_timeout_ticks = 300,
+        .read_index_timeout_ticks = 300,
+        .snapshot_entries_threshold = 2,
+    };
+    var nodes: [3]?*Quorum = .{ null, null, null };
+    defer for (&nodes) |*maybe_node| if (maybe_node.*) |node| {
+        if (node.running) node.shutdown() catch {};
+        node.deinit();
+        maybe_node.* = null;
+    };
+    for (0..3) |index| {
+        nodes[index] = try Quorum.create(std.heap.smp_allocator, testing.io, &configs[index], options);
+    }
+
+    const first_leader = try waitForClusterLeader(&nodes, testing.io);
+    var follower: *Quorum = undefined;
+    for (nodes) |maybe_node| if (maybe_node) |node| {
+        if (node.status().node_id != first_leader) {
+            follower = node;
+            break;
+        }
+    };
+    var first_response = try follower.propose(.{ .create = .{
+        .path = "/cluster",
+        .data = "v1",
+        .time_ms = 1,
+    } });
+    defer first_response.deinit(std.heap.smp_allocator);
+    try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(first_response.bytes)).code));
+    for (nodes) |maybe_node| try waitForReplicatedPath(maybe_node.?, "/cluster", testing.io);
+
+    const stopped_index: usize = @intCast(first_leader - 1);
+    try nodes[stopped_index].?.shutdown();
+    nodes[stopped_index].?.deinit();
+    nodes[stopped_index] = null;
+    const second_leader = try waitForClusterLeader(&nodes, testing.io);
+    try testing.expect(second_leader != first_leader);
+
+    var survivor: *Quorum = undefined;
+    for (nodes) |maybe_node| if (maybe_node) |node| {
+        if (node.status().node_id != second_leader) {
+            survivor = node;
+            break;
+        }
+    };
+    var second_response = try survivor.propose(.{ .create = .{
+        .path = "/after-failover",
+        .data = "v2",
+        .time_ms = 2,
+    } });
+    defer second_response.deinit(std.heap.smp_allocator);
+    try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(second_response.bytes)).code));
+
+    nodes[stopped_index] = try Quorum.create(
+        std.heap.smp_allocator,
+        testing.io,
+        &configs[stopped_index],
+        options,
+    );
+    _ = try waitForClusterLeader(&nodes, testing.io);
+    try waitForReplicatedPath(nodes[stopped_index].?, "/after-failover", testing.io);
+    var restored = (try nodes[stopped_index].?.machine.getData(
+        testing.allocator,
+        "/after-failover",
+    )).?;
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqualStrings("v2", restored.data);
 }

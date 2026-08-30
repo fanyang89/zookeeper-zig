@@ -187,21 +187,20 @@ pub const TcpServer = struct {
             result.code,
         );
         var reader = jute.Reader.init(result.body);
-        const response = try jute.deserialize(protocol.proto.CreateResponse, &reader, self.allocator);
+        const response = try jute.deserialize(protocol.proto.Create2Response, &reader, self.allocator);
         if (reader.remaining() != 0) return error.InvalidProposalResponse;
         if (opcode == .create2) {
-            const stat = self.quorum.machine.exists(path) orelse return error.InvalidProposalResponse;
-            try sendReply(transport, self.allocator, self.io, .{
-                .xid = xid,
-                .zxid = result.zxid,
-                .err = 0,
-            }, protocol.proto.Create2Response{ .path = response.path, .stat = stat });
-        } else {
             try sendReply(transport, self.allocator, self.io, .{
                 .xid = xid,
                 .zxid = result.zxid,
                 .err = 0,
             }, response);
+        } else {
+            try sendReply(transport, self.allocator, self.io, .{
+                .xid = xid,
+                .zxid = result.zxid,
+                .err = 0,
+            }, protocol.proto.CreateResponse{ .path = response.path });
         }
     }
 
@@ -288,14 +287,14 @@ pub const TcpServer = struct {
         const request = try decodeBody(protocol.proto.ExistsRequest, bytes, self.allocator);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
-        const stat = self.quorum.machine.exists(request.path orelse return sendError(
+        const stat = (try self.quorum.machine.exists(request.path orelse return sendError(
             transport,
             self.allocator,
             self.io,
             xid,
             zxid,
             .bad_arguments,
-        )) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        ))) orelse return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.ExistsResponse{ .stat = stat });
     }
 
@@ -526,6 +525,29 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqualStrings("/app", create_response.path.?);
+
+    const create2_xid = try client.sendRequest(.create2, protocol.proto.CreateRequest{
+        .path = "/temporary",
+        .data = "created-with-stat",
+        .acl = null,
+        .flags = 0,
+    });
+    var create2_reply = try expectResponse(&client, create2_xid);
+    defer create2_reply.deinit();
+    const create2_response = try wire.decodeFrameRecord(
+        protocol.proto.Create2Response,
+        create2_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqualStrings("/temporary", create2_response.path.?);
+    try testing.expect(create2_response.stat.czxid > 0);
+
+    const temporary_delete_xid = try client.sendRequest(.delete, protocol.proto.DeleteRequest{
+        .path = "/temporary",
+        .version = 0,
+    });
+    var temporary_delete_reply = try expectResponse(&client, temporary_delete_xid);
+    defer temporary_delete_reply.deinit();
 
     const set_xid = try client.sendRequest(.set_data, protocol.proto.SetDataRequest{
         .path = "/app",
