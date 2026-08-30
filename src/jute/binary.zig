@@ -47,6 +47,18 @@ pub const Writer = struct {
         return self.buffer.items.len;
     }
 
+    pub fn truncate(self: *Writer, length: usize) void {
+        std.debug.assert(length <= self.buffer.items.len);
+        self.buffer.items.len = length;
+    }
+
+    pub fn patchInt(self: *Writer, offset: usize, value: i32) error{InvalidOffset}!void {
+        if (offset > self.buffer.items.len or self.buffer.items.len - offset < 4) {
+            return error.InvalidOffset;
+        }
+        std.mem.writeInt(i32, self.buffer.items[offset..][0..4], value, .big);
+    }
+
     pub fn writeByte(self: *Writer, value: i8) std.mem.Allocator.Error!void {
         try self.buffer.append(self.allocator, @bitCast(value));
     }

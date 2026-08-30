@@ -56,20 +56,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const jute_test_module = b.createModule(.{
+    const zig_test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const jute_tests = b.addTest(.{ .root_module = jute_test_module });
-    const jute_check_step = b.step("check-jute", "Compile Zig Jute tests without running them");
-    jute_check_step.dependOn(&jute_tests.step);
-    const run_jute_tests = b.addRunArtifact(jute_tests);
-    const jute_test_step = b.step("test-jute", "Run Zig Jute unit tests");
-    jute_test_step.dependOn(&run_jute_tests.step);
+    const zig_tests = b.addTest(.{ .root_module = zig_test_module });
+    const check_zig_step = b.step("check-zig", "Compile native Zig tests without running them");
+    check_zig_step.dependOn(&zig_tests.step);
+    const check_jute_step = b.step("check-jute", "Alias for check-zig");
+    check_jute_step.dependOn(&zig_tests.step);
+
+    const run_zig_tests = b.addRunArtifact(zig_tests);
+    const test_zig_step = b.step("test-zig", "Run native Zig unit tests");
+    test_zig_step.dependOn(&run_zig_tests.step);
+    const test_jute_step = b.step("test-jute", "Alias for test-zig");
+    test_jute_step.dependOn(&run_zig_tests.step);
 
     const test_step = b.step("test", "Run available unit tests");
-    test_step.dependOn(&run_jute_tests.step);
+    test_step.dependOn(&run_zig_tests.step);
 
     if (target.result.os.tag != .linux) return;
 

@@ -27,7 +27,7 @@ single-threaded (`zookeeper_st`) libraries. Its sources are local; see
 ```sh
 mise install
 mise run build
-mise run test-jute
+mise run test-zig
 mise run test
 mise run test-asan
 mise run test-ubsan
@@ -48,10 +48,10 @@ More test and instrumentation tasks will be listed by `mise tasks`.
 
 ## Native Zig API
 
-The build exports portable `zookeeper` and `jute` modules. The Jute archive
-supports big-endian primitives, nullable strings and buffers, collection
-lengths, zero-copy reads, allocating reads, record hooks, and decode limits.
-Only the legacy C client build is Linux-specific.
+The build exports portable `zookeeper` and `jute` modules. The native API
+includes the Jute archive, protocol records, ZooKeeper opcodes, length-prefixed
+TCP framing, and typed request/reply codecs. Only the legacy C client build is
+Linux-specific.
 
 ```zig
 const jute = @import("jute");
@@ -70,7 +70,24 @@ const request = @import("zookeeper").protocol.proto.GetDataRequest{
     .watch = true,
 };
 try jute.serialize(&writer, request);
+
+const zookeeper = @import("zookeeper");
+writer.truncate(0);
+try zookeeper.wire.encodeRequest(&writer, 1, .get_data, request);
+const frame = (try zookeeper.wire.parseFrame(
+    writer.bytes(),
+    zookeeper.wire.default_max_payload,
+)).?;
 ```
+
+The wire layer validates signed frame lengths, enforces configurable frame and
+Jute limits, supports fragmented receive buffers, and handles header-only
+control packets. Connect frames intentionally omit `RequestHeader`. Dedicated
+Connect codecs accept legacy peers that omit the final `readOnly` byte and let
+the server mirror that capability in its response.
+
+Borrowed decode APIs require the receive buffer to remain stable. Owned decode
+APIs keep an internal payload copy for responses retained across buffer reuse.
 
 The protocol modules contain all 72 records from ZooKeeper 3.9.5's
 `zookeeper.jute`: `data`, `proto`, `quorum`, `persistence`, and `txn`.

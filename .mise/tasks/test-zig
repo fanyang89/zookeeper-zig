@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Run native Zig unit tests"
+set -euo pipefail
+
+exec zig build test-zig "$@"
