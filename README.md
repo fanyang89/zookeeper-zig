@@ -1,9 +1,9 @@
 # ZooKeeper for Zig
 
 This project is evolving into a native Zig implementation of ZooKeeper. The
-first native layer is the Jute binary archive in `src/jute/`. It implements the
-wire primitives used by ZooKeeper records while enforcing configurable decode
-limits.
+first native layer is the Jute binary archive in `src/jute/`, with ZooKeeper
+record structs in `src/protocol/`. Comptime reflection serializes fields in
+declaration order, so the protocol structs require no generated codec methods.
 
 The repository also builds the unmodified Apache ZooKeeper 3.9.5 C client. It
 provides compatibility coverage while the native client and server are built.
@@ -64,13 +64,24 @@ try writer.writeString("/zookeeper");
 var reader = jute.Reader.init(writer.bytes());
 const value = try reader.readInt();
 const path = (try reader.readString()).?;
+
+const request = @import("zookeeper").protocol.proto.GetDataRequest{
+    .path = "/zookeeper",
+    .watch = true,
+};
+try jute.serialize(&writer, request);
 ```
+
+The protocol modules contain all 72 records from ZooKeeper 3.9.5's
+`zookeeper.jute`: `data`, `proto`, `quorum`, `persistence`, and `txn`.
+Deserialization borrows string and buffer bytes from the input while allocating
+vector storage; release decoded vectors with `jute.deinitDecoded`.
 
 `ustring` values currently use caller-supplied wire bytes without transcoding.
 This matches the C archive and standard UTF-8 ZooKeeper clients. Java's legacy
 `BinaryOutputArchive` emits CESU-8-like bytes for supplementary Unicode
-characters; exact transcoding for that edge case remains part of record-codegen
-compatibility work. Collection decoding also intentionally rejects malformed
+characters; exact transcoding for that edge case remains compatibility work.
+Collection decoding also intentionally rejects malformed
 negative counts and applies a configurable element limit.
 
 Use `zig build check-jute -Dtarget=<target>` to compile the Jute tests for a
@@ -78,7 +89,7 @@ non-native target without running them.
 
 ## Roadmap
 
-1. Jute binary archive and schema-driven Zig record generation.
+1. Jute binary archive, comptime reflection, and Zig protocol structs.
 2. Native protocol framing, sessions, authentication, watches, and client API.
 3. ZooKeeper data tree, persistence, and server request processing.
 4. Replicated server state backed by `raftz` consensus.
