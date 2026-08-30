@@ -50,8 +50,8 @@ More test and instrumentation tasks will be listed by `mise tasks`.
 
 The build exports portable `zookeeper` and `jute` modules. The native API
 includes the Jute archive, protocol records, ZooKeeper opcodes, length-prefixed
-TCP framing, and typed request/reply codecs. Only the legacy C client build is
-Linux-specific.
+TCP framing, typed request/reply codecs, a blocking TCP transport, and the
+client session state machine. Only the legacy C client build is Linux-specific.
 
 ```zig
 const jute = @import("jute");
@@ -89,6 +89,15 @@ the server mirror that capability in its response.
 Borrowed decode APIs require the receive buffer to remain stable. Owned decode
 APIs keep an internal payload copy for responses retained across buffer reuse.
 
+`zookeeper.client.BlockingClient` performs the Connect handshake, negotiates the
+session, writes complete frames, tracks ordered XIDs, handles special replies,
+and supports bounded connect, handshake, read, and write operations. It uses the
+monotonic awake clock for session activity. Disconnects drain outstanding
+requests into `failedRequests()` with a connection-loss reason, and `close()`
+performs the ordered `closeSession` exchange. The client is single-threaded and
+does not yet reconnect, authenticate, or restore watches automatically; callers
+responsible for ping and expiration checks should configure finite I/O timeouts.
+
 The protocol modules contain all 72 records from ZooKeeper 3.9.5's
 `zookeeper.jute`: `data`, `proto`, `quorum`, `persistence`, and `txn`.
 Deserialization borrows string and buffer bytes from the input while allocating
@@ -107,7 +116,7 @@ non-native target without running them.
 ## Roadmap
 
 1. Jute binary archive, comptime reflection, and Zig protocol structs.
-2. Native protocol framing, sessions, authentication, watches, and client API.
+2. Native transport, sessions, authentication, watches, and client API.
 3. ZooKeeper data tree, persistence, and server request processing.
 4. Replicated server state backed by `raftz` consensus.
 
