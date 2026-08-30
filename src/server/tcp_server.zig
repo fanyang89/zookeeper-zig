@@ -88,6 +88,11 @@ pub const TcpServer = struct {
         const session = (try self.establishSession(&transport, connect)) orelse return;
         var context = ConnectionContext{ .session = session };
         defer context.deinit(self.allocator);
+        const remote_ip = try peerIpv4Alloc(self.allocator, transport.stream);
+        context.identities.append(self.allocator, .{ .scheme = "ip", .id = remote_ip }) catch |err| {
+            self.allocator.free(remote_ip);
+            return err;
+        };
 
         while (true) {
             const payload = try transport.readFrameAlloc(
@@ -282,11 +287,18 @@ pub const TcpServer = struct {
         const request = try decodeBody(protocol.proto.AuthPacket, bytes, self.allocator);
         const scheme = request.scheme orelse
             return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
-        const credentials = request.auth orelse
-            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
+        if (std.mem.eql(u8, scheme, "ip")) {
+            return sendReply(transport, self.allocator, self.io, .{
+                .xid = wire.Xid.auth,
+                .zxid = -1,
+                .err = 0,
+            }, {});
+        }
         if (!std.mem.eql(u8, scheme, "digest")) {
             return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
         }
+        const credentials = request.auth orelse
+            return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
         const identity = acl.digestIdentity(self.allocator, credentials) catch
             return sendError(transport, self.allocator, self.io, wire.Xid.auth, -1, .auth_failed);
         for (context.identities.items) |existing| {
@@ -830,6 +842,21 @@ fn appliedZxid(quorum: *quorum_mod.Quorum) i64 {
     return std.math.cast(i64, quorum.machine.appliedIndex()) orelse std.math.maxInt(i64);
 }
 
+fn peerIpv4Alloc(
+    allocator: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+) ![]u8 {
+    var address: std.posix.sockaddr.storage = undefined;
+    var length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    try std.posix.getpeername(stream.socket.handle, @ptrCast(&address), &length);
+    if (address.family != std.posix.AF.INET) return error.UnsupportedPeerAddress;
+    const ipv4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&address));
+    const bytes = std.mem.asBytes(&ipv4.addr);
+    return std.fmt.allocPrint(allocator, "{}.{}.{}.{}", .{
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    });
+}
+
 fn reserveTestPort(io: std.Io) !u16 {
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
     var listener = try address.listen(io, .{});
@@ -1021,6 +1048,24 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqualStrings("/member-0000000003", sequential_response.path.?);
+
+    const ip_secure_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
+        .path = "/ip-secure",
+        .data = "loopback-only",
+        .acl = &.{.{ .perms = acl.read, .id = .{
+            .scheme = "ip",
+            .id = "127.0.0.0/8",
+        } }},
+        .flags = 0,
+    });
+    var ip_secure_reply = try expectResponse(&client, ip_secure_xid);
+    defer ip_secure_reply.deinit();
+    const ip_get_xid = try client.sendRequest(.get_data, protocol.proto.GetDataRequest{
+        .path = "/ip-secure",
+        .watch = false,
+    });
+    var ip_get_reply = try expectResponse(&client, ip_get_xid);
+    defer ip_get_reply.deinit();
 
     const delete_xid = try client.sendRequest(.delete, protocol.proto.DeleteRequest{
         .path = "/app",

@@ -121,12 +121,13 @@ ephemeral and sequential nodes, digest authentication, ACL enforcement,
 Connect, ping, closeSession, create/create2, delete, setData, getACL/setACL,
 exists, getData, getChildren/getChildren2, and sync. Reads use Raft ReadIndex
 before accessing RocksDB. Session close and expiration atomically remove all
-session-owned ephemeral nodes. ACLs support `world`, `auth`, and `digest`; IP,
-SASL, watches, and multi operations are not implemented yet.
+session-owned ephemeral nodes. ACLs support `world`, `auth`, `digest`, and IPv4
+`ip` identities, including CIDR masks. IPv6 ACL identities, SASL, watches, and
+multi operations are not implemented yet.
 
 ## Roadmap
 
 1. Complete reconnect, watches, and high-level client APIs.
-2. Add IP/SASL authentication, watches, and multi operations.
+2. Add IPv6/SASL authentication, watches, and multi operations.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.
