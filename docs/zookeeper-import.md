@@ -48,19 +48,17 @@ existing client to resume with its saved credentials.
 
 ## Supported source state
 
-- Plain and gzip-compressed snapshots
-- Persistent and ordinary ephemeral nodes
+- Plain, gzip-compressed, and Xerial legacy Snappy snapshots
+- Persistent, ordinary ephemeral, container, and TTL nodes
 - Nullable node data
 - ZooKeeper ACLs using schemes supported by this server
 - Session create/close records
-- Create, create2, delete, setData, setACL, reconfig, and multi log records
+- Create, create2, createContainer, createTTL, delete, deleteContainer, setData, setACL, reconfig, and multi log records
 - Legacy create and close-session transaction layouts
 
 The importer intentionally rejects rather than weakens or changes unsupported
 state:
 
-- Xerial Snappy snapshots
-- Container and TTL nodes or transactions
 - ACL schemes unavailable in this server, such as SASL and X.509
 - Corrupt or truncated logs
 - Snapshot-only recovery when no valid snapshot exists
@@ -70,3 +68,9 @@ ZooKeeper source zxids are preserved in node stats but are not reused as Raft
 indexes. New Raft history starts from index 1 over the imported baseline, while
 client-visible zxids use the imported source zxid as an offset so they remain
 strictly greater than imported zxids.
+
+Container and TTL cleanup is driven by the same Raft-replicated maintenance
+clock used by the leader reaper. TTL nodes expire only while empty after their
+encoded TTL has elapsed since `mtime`. Empty containers become candidates after
+having children, or after five minutes if never used. Cleanup proposals fence
+path recreation with the node `czxid` and kind.

@@ -241,6 +241,16 @@ pub const ZooKeeperStateMachine = struct {
         return self.store.expiredSessions(allocator);
     }
 
+    pub fn expiredExtendedNodes(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        limit: usize,
+    ) ![]rocks_store.ExtendedCandidate {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.store.expiredExtendedNodes(allocator, limit);
+    }
+
     fn validateSessionLocked(
         self: *ZooKeeperStateMachine,
         session_id: i64,
@@ -295,7 +305,7 @@ pub const ZooKeeperStateMachine = struct {
                 .path = result.created_path orelse value.path,
                 .stat = result.stat.?,
             }) catch unreachable,
-            .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => {},
+            .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => {},
             .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
                 .stat = result.stat.?,
             }) catch unreachable,

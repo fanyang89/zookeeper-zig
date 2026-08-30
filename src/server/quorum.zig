@@ -217,6 +217,7 @@ pub const Quorum = struct {
             var tick_response = self.propose(.{ .session_tick = .{
                 .leader_term = leader_status.term,
                 .elapsed_ms = bounded_elapsed,
+                .leader_wall_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
             } }) catch |err| {
                 if (!self.session_reaper_stop.load(.acquire)) {
                     raft.log.warn(@src(), "failed to advance session clock: {s}", .{@errorName(err)});
@@ -236,7 +237,6 @@ pub const Quorum = struct {
                 raft.log.warn(@src(), "failed to scan expired sessions: {s}", .{@errorName(err)});
                 continue;
             };
-            defer self.allocator.free(expired);
             for (expired) |session| {
                 if (self.session_reaper_stop.load(.acquire)) break;
                 const latest_status = self.status();
@@ -255,6 +255,33 @@ pub const Quorum = struct {
                 };
                 response.deinit();
             }
+            self.allocator.free(expired);
+
+            const extended = self.machine.expiredExtendedNodes(self.allocator, 64) catch |err| {
+                raft.log.warn(@src(), "failed to scan expired extended nodes: {s}", .{@errorName(err)});
+                continue;
+            };
+            for (extended) |candidate| {
+                if (self.session_reaper_stop.load(.acquire)) break;
+                const latest_status = self.status();
+                if (latest_status.role != .leader or latest_status.term != leader_status.term) break;
+                var response = self.propose(.{ .delete_extended = .{
+                    .path = candidate.path,
+                    .expected_czxid = candidate.czxid,
+                    .expected_kind = candidate.kind,
+                } }) catch |err| {
+                    if (!self.session_reaper_stop.load(.acquire)) {
+                        raft.log.warn(@src(), "failed to delete extended node {s}: {s}", .{
+                            candidate.path,
+                            @errorName(err),
+                        });
+                    }
+                    continue;
+                };
+                response.deinit();
+            }
+            for (extended) |candidate| self.allocator.free(candidate.path);
+            self.allocator.free(extended);
         }
     }
 };

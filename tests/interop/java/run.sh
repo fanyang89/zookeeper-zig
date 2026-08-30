@@ -80,8 +80,8 @@ python3 "$test_dir/patch_client_base.py" \
     "$worktree/zookeeper-server/src/test/java/org/apache/zookeeper/test/ClientBase.java"
 overlay_target="$worktree/zookeeper-server/src/test/java/top/fuis/zookeeperzig/interop"
 mkdir -p "$overlay_target"
-cp "$test_dir/overlay/src/test/java/top/fuis/zookeeperzig/interop/ZigServerProcess.java" \
-    "$overlay_target/ZigServerProcess.java"
+cp "$test_dir/overlay/src/test/java/top/fuis/zookeeperzig/interop/"*.java \
+    "$overlay_target/"
 
 async_methods=(
     testAsyncCreate
@@ -136,7 +136,7 @@ join_by_plus() {
     local IFS=+
     echo "$*"
 }
-default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}")"
+default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest"
 test_selector=${ZOOKEEPER_TEST_SELECTOR:-$default_test_selector}
 
 maven_settings_args=()

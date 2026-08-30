@@ -1,5 +1,8 @@
 const std = @import("std");
 const protocol = @import("../protocol.zig");
+const ephemeral = @import("ephemeral.zig");
+
+pub const NodeKind = ephemeral.NodeKind;
 
 pub const ErrorCode = enum(i32) {
     ok = 0,
@@ -44,6 +47,7 @@ pub const Node = struct {
     pzxid: i64,
     child_count: usize = 0,
     ephemeral_owner: i64 = 0,
+    kind: NodeKind = .persistent,
     acl: ?[]u8 = null,
 
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
@@ -61,7 +65,7 @@ pub const Node = struct {
             .version = self.version,
             .cversion = self.cversion,
             .aversion = self.aversion,
-            .ephemeralOwner = self.ephemeral_owner,
+            .ephemeralOwner = ephemeral.clientOwner(self.kind, self.ephemeral_owner),
             .dataLength = if (self.data_is_null) 0 else @intCast(self.data.len),
             .numChildren = @intCast(self.child_count),
             .pzxid = self.pzxid,
@@ -118,7 +122,7 @@ pub const DataTree = struct {
 
         try self.nodes.ensureUnusedCapacity(1);
         const parent = self.nodes.getPtr(parent_path).?;
-        if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
+        if (!ephemeral.permitsChildren(parent.kind)) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
             parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
         const owned_path = try self.allocator.dupe(u8, path);
@@ -238,7 +242,7 @@ pub const DataTree = struct {
             }
         }.lessThan);
 
-        try writer.writeInt(-3);
+        try writer.writeInt(-4);
         try writer.writeInt(@intCast(paths.len));
         for (paths) |path| {
             const node = self.nodes.get(path).?;
@@ -254,14 +258,16 @@ pub const DataTree = struct {
             try writer.writeInt(@intCast(node.child_count));
             try writer.writeLong(node.ephemeral_owner);
             try writer.writeInt(node.sequence_counter);
+            try writer.writeByte(@bitCast(@intFromEnum(node.kind)));
         }
     }
 
     pub fn readSnapshot(allocator: std.mem.Allocator, reader: anytype) !DataTree {
         const marker = try reader.readInt();
-        const has_ephemeral_owner = marker == -1 or marker == -2 or marker == -3;
-        const has_nullable_data = marker == -2 or marker == -3;
-        const has_sequence_counter = marker == -3;
+        const has_ephemeral_owner = marker == -1 or marker == -2 or marker == -3 or marker == -4;
+        const has_nullable_data = marker == -2 or marker == -3 or marker == -4;
+        const has_sequence_counter = marker == -3 or marker == -4;
+        const has_node_kind = marker == -4;
         const count = if (has_ephemeral_owner) try reader.readInt() else marker;
         if (count <= 0 or count > 10_000_000) return error.InvalidSnapshot;
         var self = DataTree{
@@ -290,6 +296,13 @@ pub const DataTree = struct {
             if (child_count < 0) return error.InvalidSnapshot;
             const ephemeral_owner = if (has_ephemeral_owner) try reader.readLong() else 0;
             const sequence_counter = if (has_sequence_counter) try reader.readInt() else cversion;
+            const kind: NodeKind = if (has_node_kind)
+                ephemeral.kindFromByte(@bitCast(try reader.readByte())) orelse return error.InvalidSnapshot
+            else if (ephemeral_owner == 0)
+                .persistent
+            else
+                .ephemeral;
+            ephemeral.validate(kind, ephemeral_owner) catch return error.InvalidSnapshot;
             self.nodes.putAssumeCapacityNoClobber(path, .{
                 .data = data,
                 .data_is_null = maybe_data == null,
@@ -303,17 +316,18 @@ pub const DataTree = struct {
                 .pzxid = pzxid,
                 .child_count = @intCast(child_count),
                 .ephemeral_owner = ephemeral_owner,
+                .kind = kind,
             });
         }
         const root = self.nodes.get("/") orelse return error.InvalidSnapshot;
-        if (root.ephemeral_owner != 0) return error.InvalidSnapshot;
+        if (root.kind != .persistent or root.ephemeral_owner != 0) return error.InvalidSnapshot;
         var actual_children: std.StringHashMapUnmanaged(usize) = .empty;
         defer actual_children.deinit(allocator);
         try actual_children.ensureTotalCapacity(allocator, @intCast(self.nodes.count()));
         var nodes = self.nodes.iterator();
         while (nodes.next()) |entry| {
             actual_children.putAssumeCapacity(entry.key_ptr.*, 0);
-            if (entry.value_ptr.ephemeral_owner != 0 and entry.value_ptr.child_count != 0) {
+            if (entry.value_ptr.kind == .ephemeral and entry.value_ptr.child_count != 0) {
                 return error.InvalidSnapshot;
             }
         }
@@ -361,6 +375,25 @@ pub fn directChildName(parent: []const u8, candidate: []const u8) ?[]const u8 {
 fn freeChildren(allocator: std.mem.Allocator, names: [][]u8) void {
     for (names) |name| allocator.free(name);
     allocator.free(names);
+}
+
+test "extended node owners are hidden from client Stat" {
+    const testing = std.testing;
+    var node = Node{
+        .data = try testing.allocator.alloc(u8, 0),
+        .czxid = 1,
+        .mzxid = 1,
+        .ctime = 1,
+        .mtime = 1,
+        .pzxid = 1,
+        .ephemeral_owner = ephemeral.container_owner,
+        .kind = .container,
+    };
+    defer node.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 0), node.stat().ephemeralOwner);
+    node.kind = .ephemeral;
+    node.ephemeral_owner = -42;
+    try testing.expectEqual(@as(i64, -42), node.stat().ephemeralOwner);
 }
 
 test "data tree applies CRUD with ZooKeeper versions and child metadata" {

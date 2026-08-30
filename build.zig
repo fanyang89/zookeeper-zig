@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     const rocksdb_dependency = if (linux_server) b.dependency("rocksdb", .{
         .target = target,
         .optimize = optimize,
+        .enable_snappy = true,
     }) else null;
     const imports: []const std.Build.Module.Import = if (raftz_module) |raftz| &.{
         .{ .name = "raftz", .module = raftz },

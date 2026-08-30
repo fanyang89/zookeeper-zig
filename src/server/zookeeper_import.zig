@@ -4,6 +4,10 @@ const protocol = @import("../protocol.zig");
 const acl = @import("acl.zig");
 const data_tree = @import("data_tree.zig");
 const rocks_store = @import("rocks_store.zig");
+const ephemeral = @import("ephemeral.zig");
+
+extern fn snappy_uncompressed_length(compressed: [*]const u8, compressed_length: usize, result: *usize) c_int;
+extern fn snappy_uncompress(compressed: [*]const u8, compressed_length: usize, uncompressed: [*]u8, uncompressed_length: *usize) c_int;
 
 const snapshot_magic: i32 = 0x5a4b534e;
 const log_magic: i32 = 0x5a4b4c47;
@@ -38,6 +42,7 @@ const ImportedNode = struct {
     sequence_counter: i32 = 0,
     aversion: i32,
     ephemeral_owner: i64,
+    kind: ephemeral.NodeKind,
     pzxid: i64,
     child_count: usize = 0,
 
@@ -145,8 +150,9 @@ fn isNonFallbackImportError(err: anyerror) bool {
         error.OutOfMemory,
         error.SnapshotTooLarge,
         error.TransactionLogTooLarge,
-        error.UnsupportedSnappySnapshot,
         error.UnsupportedAclScheme,
+        error.IncompatibleSnappyVersion,
+        error.InvalidExtendedOwner,
         error.UnsupportedExtendedNodeType,
         error.UnsupportedTransaction,
         => true,
@@ -165,7 +171,7 @@ fn parseSnapshotFile(
     const bytes = switch (candidate.compression) {
         .plain => try allocator.dupe(u8, encoded),
         .gzip => try decompressGzip(allocator, encoded),
-        .snappy => return error.UnsupportedSnappySnapshot,
+        .snappy => try decompressSnappy(allocator, encoded),
     };
     defer allocator.free(bytes);
     if (bytes.len > max_import_bytes) return error.SnapshotTooLarge;
@@ -180,7 +186,9 @@ fn parseSnapshotFile(
     while (session_index < session_count) : (session_index += 1) {
         const session_id = try reader.readLong();
         const timeout_ms = try reader.readInt();
-        if (session_id == 0 or timeout_ms <= 0) return error.InvalidSession;
+        if (session_id == 0 or session_id == ephemeral.container_owner or timeout_ms <= 0) {
+            return error.InvalidSession;
+        }
         const result = try state.sessions.getOrPut(session_id);
         if (result.found_existing) return error.DuplicateSession;
         result.value_ptr.* = timeout_ms;
@@ -217,18 +225,34 @@ fn parseSnapshotFile(
         else
             return error.UnknownAclId;
         errdefer if (acl_blob) |value| allocator.free(value);
+        const czxid = try reader.readLong();
+        const mzxid = try reader.readLong();
+        const ctime = try reader.readLong();
+        const mtime = try reader.readLong();
+        const node_version = try reader.readInt();
+        const internal_cversion = try reader.readInt();
+        const aversion = try reader.readInt();
+        const owner = try reader.readLong();
+        const pzxid = try reader.readLong();
+        const kind: ephemeral.NodeKind = if (owner == ephemeral.container_owner)
+            .container
+        else if (owner != 0 and state.sessions.contains(owner))
+            .ephemeral
+        else
+            ephemeral.classifyOwner(owner) catch return error.InvalidExtendedOwner;
         const node = ImportedNode{
             .data = if (maybe_data) |value| try allocator.dupe(u8, value) else null,
             .acl_blob = acl_blob,
-            .czxid = try reader.readLong(),
-            .mzxid = try reader.readLong(),
-            .ctime = try reader.readLong(),
-            .mtime = try reader.readLong(),
-            .version = try reader.readInt(),
-            .internal_cversion = try reader.readInt(),
-            .aversion = try reader.readInt(),
-            .ephemeral_owner = try reader.readLong(),
-            .pzxid = try reader.readLong(),
+            .czxid = czxid,
+            .mzxid = mzxid,
+            .ctime = ctime,
+            .mtime = mtime,
+            .version = node_version,
+            .internal_cversion = internal_cversion,
+            .aversion = aversion,
+            .ephemeral_owner = owner,
+            .kind = kind,
+            .pzxid = pzxid,
         };
         errdefer if (node.data) |value| allocator.free(value);
         const owned_path = try allocator.dupe(u8, path);
@@ -320,7 +344,9 @@ fn applyTransaction(
         },
         -10 => {
             const txn = try decodeBody(protocol.txn.CreateSessionTxn, reader, state.allocator);
-            if (header.clientId == 0 or txn.timeOut <= 0) return error.InvalidSession;
+            if (header.clientId == 0 or header.clientId == ephemeral.container_owner or txn.timeOut <= 0) {
+                return error.InvalidSession;
+            }
             try state.sessions.put(header.clientId, txn.timeOut);
         },
         -11 => try applyCloseSession(state, header, reader),
@@ -332,7 +358,9 @@ fn applyTransaction(
             _ = try decodeBody(protocol.txn.CheckVersionTxn, reader, state.allocator);
         },
         14 => try applyMulti(state, header, reader),
-        19, 20, 21 => return error.UnsupportedExtendedNodeType,
+        19 => try applyCreateContainer(state, header, reader),
+        20 => try applyDelete(state, header, reader),
+        21 => try applyCreateTtl(state, header, reader),
         else => return error.UnsupportedTransaction,
     }
     try consumeOptionalDigest(reader);
@@ -344,16 +372,32 @@ fn applyCreate(state: *ImportState, header: protocol.txn.TxnHeader, reader: *jut
         reader.* = saved;
         const legacy = try jute.deserialize(protocol.txn.CreateTxnV0, reader, state.allocator);
         defer jute.deinitDecoded(legacy, state.allocator);
-        return applyCreateFields(state, header, legacy.path, legacy.data, legacy.acl, legacy.ephemeral, -1);
+        const kind: ephemeral.NodeKind = if (legacy.ephemeral) .ephemeral else .persistent;
+        return applyCreateFields(state, header, legacy.path, legacy.data, legacy.acl, kind, if (legacy.ephemeral) header.clientId else 0, -1);
     };
     defer jute.deinitDecoded(current, state.allocator);
     if (!hasValidDigestRemainder(reader.remaining())) {
         reader.* = saved;
         const legacy = try jute.deserialize(protocol.txn.CreateTxnV0, reader, state.allocator);
         defer jute.deinitDecoded(legacy, state.allocator);
-        return applyCreateFields(state, header, legacy.path, legacy.data, legacy.acl, legacy.ephemeral, -1);
+        const kind: ephemeral.NodeKind = if (legacy.ephemeral) .ephemeral else .persistent;
+        return applyCreateFields(state, header, legacy.path, legacy.data, legacy.acl, kind, if (legacy.ephemeral) header.clientId else 0, -1);
     }
-    try applyCreateFields(state, header, current.path, current.data, current.acl, current.ephemeral, current.parentCVersion);
+    const kind: ephemeral.NodeKind = if (current.ephemeral) .ephemeral else .persistent;
+    try applyCreateFields(state, header, current.path, current.data, current.acl, kind, if (current.ephemeral) header.clientId else 0, current.parentCVersion);
+}
+
+fn applyCreateContainer(state: *ImportState, header: protocol.txn.TxnHeader, reader: *jute.Reader) !void {
+    const txn = try jute.deserialize(protocol.txn.CreateContainerTxn, reader, state.allocator);
+    defer jute.deinitDecoded(txn, state.allocator);
+    try applyCreateFields(state, header, txn.path, txn.data, txn.acl, .container, ephemeral.container_owner, txn.parentCVersion);
+}
+
+fn applyCreateTtl(state: *ImportState, header: protocol.txn.TxnHeader, reader: *jute.Reader) !void {
+    const txn = try jute.deserialize(protocol.txn.CreateTTLTxn, reader, state.allocator);
+    defer jute.deinitDecoded(txn, state.allocator);
+    const owner = try ephemeral.ttlOwner(txn.ttl);
+    try applyCreateFields(state, header, txn.path, txn.data, txn.acl, .ttl, owner, txn.parentCVersion);
 }
 
 fn applyCreateFields(
@@ -362,26 +406,32 @@ fn applyCreateFields(
     maybe_path: ?[]const u8,
     data: ?[]const u8,
     entries: ?[]const protocol.data.ACL,
-    ephemeral: bool,
+    kind: ephemeral.NodeKind,
+    owner: i64,
     parent_cversion: i32,
 ) !void {
     const path = maybe_path orelse return error.InvalidTransaction;
     if (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/")) return error.InvalidPath;
+    ephemeral.validate(kind, owner) catch return error.InvalidExtendedOwner;
     try validateImportedAclSchemes(entries);
-    const blob = try acl.normalize(state.allocator, entries, &.{});
-    errdefer state.allocator.free(blob);
-    if (state.nodes.getPtr(path)) |existing| {
-        if (existing.acl_blob) |value| state.allocator.free(value);
-        existing.acl_blob = blob;
-        return;
-    }
     const parent_path = data_tree.parentPath(path) orelse return error.InvalidPath;
     const parent = state.nodes.getPtr(parent_path) orelse return error.MissingParent;
-    const next_cversion = if (parent_cversion == -1) parent.internal_cversion +% 1 else parent_cversion;
-    if (next_cversion > parent.internal_cversion) {
-        parent.internal_cversion = next_cversion;
-        parent.pzxid = header.zxid;
+    if (state.nodes.contains(path)) {
+        // Fuzzy snapshots can already contain a node created after their header
+        // zxid. Preserve that complete node image while replaying its create,
+        // but repair parent metadata when the transaction carries an
+        // authoritative parent cversion.
+        if (parent_cversion != -1 and parent_cversion > parent.internal_cversion) {
+            parent.internal_cversion = parent_cversion;
+        }
+        if (header.zxid > parent.pzxid) parent.pzxid = header.zxid;
+        return;
     }
+    const next_cversion = if (parent_cversion == -1) parent.internal_cversion +% 1 else parent_cversion;
+    if (next_cversion > parent.internal_cversion) parent.internal_cversion = next_cversion;
+    if (header.zxid > parent.pzxid) parent.pzxid = header.zxid;
+    const blob = try acl.normalize(state.allocator, entries, &.{});
+    errdefer state.allocator.free(blob);
     const owned_data = if (data) |value| try state.allocator.dupe(u8, value) else null;
     errdefer if (owned_data) |value| state.allocator.free(value);
     const owned_path = try state.allocator.dupe(u8, path);
@@ -396,7 +446,8 @@ fn applyCreateFields(
         .version = 0,
         .internal_cversion = 0,
         .aversion = 0,
-        .ephemeral_owner = if (ephemeral) header.clientId else 0,
+        .ephemeral_owner = owner,
+        .kind = kind,
         .pzxid = header.zxid,
     });
 }
@@ -472,7 +523,7 @@ fn applyCloseSession(
         paths.deinit(state.allocator);
     }
     var nodes = state.nodes.iterator();
-    while (nodes.next()) |entry| if (entry.value_ptr.ephemeral_owner == session_id) {
+    while (nodes.next()) |entry| if (entry.value_ptr.kind == .ephemeral and entry.value_ptr.ephemeral_owner == session_id) {
         try paths.append(state.allocator, try state.allocator.dupe(u8, entry.key_ptr.*));
     };
     for (paths.items) |path| removeNodeAtZxid(state, path, header.zxid);
@@ -500,7 +551,9 @@ fn applyMulti(state: *ImportState, header: protocol.txn.TxnHeader, reader: *jute
             2 => try applyDelete(state, header, &nested),
             5 => try applySetData(state, header, &nested),
             13 => _ = try decodeBody(protocol.txn.CheckVersionTxn, &nested, state.allocator),
-            19, 20, 21 => return error.UnsupportedExtendedNodeType,
+            19 => try applyCreateContainer(state, header, &nested),
+            20 => try applyDelete(state, header, &nested),
+            21 => try applyCreateTtl(state, header, &nested),
             else => return error.UnsupportedTransaction,
         }
         if (nested.remaining() != 0) return error.InvalidTransaction;
@@ -517,13 +570,11 @@ fn finalizeState(state: *ImportState) !void {
     while (nodes.next()) |entry| {
         entry.value_ptr.child_count = 0;
         const owner = entry.value_ptr.ephemeral_owner;
-        if (owner == std.math.minInt(i64)) return error.UnsupportedExtendedNodeType;
-        if (owner != 0 and !state.sessions.contains(owner) and
-            (@as(u64, @bitCast(owner)) >> 56) == 0xff)
-        {
-            return error.UnsupportedExtendedNodeType;
+        ephemeral.validate(entry.value_ptr.kind, owner) catch return error.InvalidExtendedOwner;
+        if (std.mem.eql(u8, entry.key_ptr.*, "/") and entry.value_ptr.kind != .persistent) {
+            return error.InvalidRoot;
         }
-        if (owner != 0 and !state.sessions.contains(owner)) {
+        if (entry.value_ptr.kind == .ephemeral and !state.sessions.contains(owner)) {
             try orphan_paths.append(state.allocator, try state.allocator.dupe(u8, entry.key_ptr.*));
         }
     }
@@ -537,11 +588,14 @@ fn finalizeState(state: *ImportState) !void {
     }
     nodes = state.nodes.iterator();
     while (nodes.next()) |entry| {
-        if (entry.value_ptr.ephemeral_owner != 0 and entry.value_ptr.child_count != 0) {
+        if (entry.value_ptr.kind == .ephemeral and entry.value_ptr.child_count != 0) {
             return error.EphemeralHasChildren;
         }
         const child_count: i32 = std.math.cast(i32, entry.value_ptr.child_count) orelse
             return error.TooManyChildren;
+        // ZooKeeper persists a create-only counter in StatPersisted.cversion.
+        // Sequential suffixes use that raw value, while copyStat exposes
+        // raw_cversion * 2 - child_count to clients.
         entry.value_ptr.sequence_counter = entry.value_ptr.internal_cversion;
         entry.value_ptr.internal_cversion = entry.value_ptr.internal_cversion *% 2 -% child_count;
     }
@@ -564,6 +618,7 @@ fn materializeNodes(allocator: std.mem.Allocator, state: *ImportState) ![]rocks_
         .sequence_counter = entry.value_ptr.sequence_counter,
         .aversion = entry.value_ptr.aversion,
         .ephemeral_owner = entry.value_ptr.ephemeral_owner,
+        .kind = entry.value_ptr.kind,
         .pzxid = entry.value_ptr.pzxid,
         .child_count = entry.value_ptr.child_count,
     };
@@ -791,6 +846,48 @@ fn targetImportAlreadyComplete(
     return false;
 }
 
+fn decompressSnappy(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const magic = [_]u8{ 0x82, 'S', 'N', 'A', 'P', 'P', 'Y', 0 };
+    var position: usize = 0;
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var saw_header = false;
+    while (position < encoded.len) {
+        if (encoded.len - position >= 16 and std.mem.eql(u8, encoded[position..][0..8], &magic)) {
+            const version = std.mem.readInt(i32, encoded[position + 8 ..][0..4], .big);
+            _ = std.mem.readInt(i32, encoded[position + 12 ..][0..4], .big);
+            if (version < 1) return error.IncompatibleSnappyVersion;
+            position += 16;
+            saw_header = true;
+            continue;
+        }
+        if (!saw_header or encoded.len - position < 4) return error.TruncatedSnappyStream;
+        const signed_length = std.mem.readInt(i32, encoded[position..][0..4], .big);
+        position += 4;
+        if (signed_length <= 0) return error.InvalidSnappyChunk;
+        const compressed_length: usize = @intCast(signed_length);
+        if (compressed_length > encoded.len - position) return error.TruncatedSnappyStream;
+        const compressed = encoded[position..][0..compressed_length];
+        position += compressed_length;
+        var uncompressed_length: usize = 0;
+        if (snappy_uncompressed_length(compressed.ptr, compressed.len, &uncompressed_length) != 0) {
+            return error.InvalidSnappyChunk;
+        }
+        if (uncompressed_length == 0) return error.InvalidSnappyChunk;
+        if (uncompressed_length > max_import_bytes -| output.items.len) return error.SnapshotTooLarge;
+        const old_length = output.items.len;
+        try output.resize(allocator, old_length + uncompressed_length);
+        var actual_length = uncompressed_length;
+        if (snappy_uncompress(compressed.ptr, compressed.len, output.items[old_length..].ptr, &actual_length) != 0 or
+            actual_length != uncompressed_length)
+        {
+            return error.InvalidSnappyChunk;
+        }
+    }
+    if (!saw_header) return error.InvalidSnappyHeader;
+    return output.toOwnedSlice(allocator);
+}
+
 fn decompressGzip(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     var input: std.Io.Reader = .fixed(encoded);
     var output: std.Io.Writer.Allocating = .init(allocator);
@@ -800,6 +897,18 @@ fn decompressGzip(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     if (decompressor.err) |err| return err;
     if (output.written().len > max_import_bytes) return error.SnapshotTooLarge;
     return output.toOwnedSlice();
+}
+
+test "Xerial legacy Snappy stream is decoded with libsnappy" {
+    const encoded = [_]u8{
+        0x82, 'S', 'N', 'A', 'P', 'P',  'Y', 0,
+        0,    0,   0,   1,   0,   0,    0,   1,
+        0,    0,   0,   7,   5,   0x10, 'h', 'e',
+        'l',  'l', 'o',
+    };
+    const decoded = try decompressSnappy(std.testing.allocator, &encoded);
+    defer std.testing.allocator.free(decoded);
+    try std.testing.expectEqualStrings("hello", decoded);
 }
 
 test "gzip snapshots are decompressed through the bounded path" {
@@ -829,6 +938,99 @@ fn allZero(bytes: []const u8) bool {
     return std.mem.allEqual(u8, bytes, 0);
 }
 
+test "replays container TTL and delete-container transactions" {
+    const testing = std.testing;
+    var state = ImportState.init(testing.allocator, 0);
+    defer state.deinit();
+    const root_path = try testing.allocator.dupe(u8, "/");
+    const root_data = try testing.allocator.alloc(u8, 0);
+    try state.nodes.putNoClobber(root_path, .{
+        .data = root_data,
+        .acl_blob = null,
+        .czxid = 0,
+        .mzxid = 0,
+        .ctime = 0,
+        .mtime = 0,
+        .version = 0,
+        .internal_cversion = 0,
+        .aversion = 0,
+        .ephemeral_owner = 0,
+        .kind = .persistent,
+        .pzxid = 0,
+    });
+    const open_acl = [_]protocol.data.ACL{.{
+        .perms = acl.all,
+        .id = .{ .scheme = "world", .id = "anyone" },
+    }};
+
+    var container_body = jute.Writer.init(testing.allocator);
+    defer container_body.deinit();
+    try jute.serialize(&container_body, protocol.txn.CreateContainerTxn{
+        .path = "/container",
+        .data = "",
+        .acl = &open_acl,
+        .parentCVersion = 1,
+    });
+    var container_reader = jute.Reader.init(container_body.bytes());
+    try applyTransaction(&state, .{
+        .clientId = 1,
+        .cxid = 1,
+        .zxid = 1,
+        .time = 100,
+        .type = 19,
+    }, &container_reader);
+    try testing.expectEqual(ephemeral.NodeKind.container, state.nodes.get("/container").?.kind);
+
+    // A fuzzy snapshot may contain the child but stale parent metadata. Replay
+    // repairs the parent without overwriting the newer complete child image.
+    state.nodes.getPtr("/").?.internal_cversion = 0;
+    state.nodes.getPtr("/").?.pzxid = 0;
+    try applyCreateFields(&state, .{
+        .clientId = 1,
+        .cxid = 1,
+        .zxid = 1,
+        .time = 100,
+        .type = 19,
+    }, "/container", "replacement", &open_acl, .container, ephemeral.container_owner, 1);
+    try testing.expectEqual(@as(i32, 1), state.nodes.get("/").?.internal_cversion);
+    try testing.expectEqual(@as(i64, 1), state.nodes.get("/").?.pzxid);
+    try testing.expectEqualStrings("", state.nodes.get("/container").?.data.?);
+
+    var ttl_body = jute.Writer.init(testing.allocator);
+    defer ttl_body.deinit();
+    try jute.serialize(&ttl_body, protocol.txn.CreateTTLTxn{
+        .path = "/ttl",
+        .data = "ttl",
+        .acl = &open_acl,
+        .parentCVersion = 2,
+        .ttl = 5_000,
+    });
+    var ttl_reader = jute.Reader.init(ttl_body.bytes());
+    try applyTransaction(&state, .{
+        .clientId = 1,
+        .cxid = 2,
+        .zxid = 2,
+        .time = 200,
+        .type = 21,
+    }, &ttl_reader);
+    const ttl_node = state.nodes.get("/ttl").?;
+    try testing.expectEqual(ephemeral.NodeKind.ttl, ttl_node.kind);
+    try testing.expectEqual(@as(i64, 5_000), try ephemeral.ttlValue(ttl_node.ephemeral_owner));
+
+    var delete_body = jute.Writer.init(testing.allocator);
+    defer delete_body.deinit();
+    try jute.serialize(&delete_body, protocol.txn.DeleteTxn{ .path = "/container" });
+    var delete_reader = jute.Reader.init(delete_body.bytes());
+    try applyTransaction(&state, .{
+        .clientId = 0,
+        .cxid = 0,
+        .zxid = 3,
+        .time = 300,
+        .type = 20,
+    }, &delete_reader);
+    try testing.expect(!state.nodes.contains("/container"));
+}
+
 test "imports a ZooKeeper snapshot and replays transaction logs" {
     const testing = std.testing;
     var temporary = std.testing.tmpDir(.{ .iterate = true });
@@ -855,11 +1057,19 @@ test "imports a ZooKeeper snapshot and replays transaction logs" {
     try snapshot.writeString("");
     try snapshot.writeBuffer("");
     try snapshot.writeLong(-1);
-    try writePersistedStat(&snapshot, .{ .czxid = 0, .mzxid = 0, .ctime = 0, .mtime = 0, .version = 0, .cversion = 1, .aversion = 0, .ephemeralOwner = 0, .pzxid = 1 });
+    try writePersistedStat(&snapshot, .{ .czxid = 0, .mzxid = 0, .ctime = 0, .mtime = 0, .version = 0, .cversion = 3, .aversion = 0, .ephemeralOwner = 0, .pzxid = 1 });
     try snapshot.writeString("/ephemeral");
     try snapshot.writeBuffer("snapshot");
     try snapshot.writeLong(-1);
     try writePersistedStat(&snapshot, .{ .czxid = 1, .mzxid = 1, .ctime = 100, .mtime = 100, .version = 0, .cversion = 0, .aversion = 0, .ephemeralOwner = session_id, .pzxid = 1 });
+    try snapshot.writeString("/container");
+    try snapshot.writeBuffer(null);
+    try snapshot.writeLong(-1);
+    try writePersistedStat(&snapshot, .{ .czxid = 1, .mzxid = 1, .ctime = 100, .mtime = 100, .version = 0, .cversion = 0, .aversion = 0, .ephemeralOwner = ephemeral.container_owner, .pzxid = 1 });
+    try snapshot.writeString("/ttl");
+    try snapshot.writeBuffer("ttl");
+    try snapshot.writeLong(-1);
+    try writePersistedStat(&snapshot, .{ .czxid = 1, .mzxid = 1, .ctime = 100, .mtime = 100, .version = 0, .cversion = 0, .aversion = 0, .ephemeralOwner = try ephemeral.ttlOwner(60_000), .pzxid = 1 });
     try snapshot.writeString("/");
     try writeTestSeal(&snapshot);
     try temporary.dir.writeFile(testing.io, .{
@@ -915,6 +1125,8 @@ test "imports a ZooKeeper snapshot and replays transaction logs" {
     defer if (imported.data) |value| testing.allocator.free(value);
     try testing.expectEqualStrings("replayed", imported.data.?);
     try testing.expectEqual(@as(i32, 1), imported.stat.version);
+    try testing.expectEqual(@as(i64, 0), (try store.exists("/container")).?.ephemeralOwner);
+    try testing.expectEqual(@as(i64, 0), (try store.exists("/ttl")).?.ephemeralOwner);
     try testing.expectEqual(@as(i64, 2), (try store.importedSourceZxid()).?);
     const session = (try store.getSession(session_id)).?;
     try testing.expectEqualSlices(u8, &javaSessionPassword(session_id), &session.password);

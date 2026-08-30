@@ -9,6 +9,7 @@ const acl = @import("acl.zig");
 const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
+const ephemeral = @import("ephemeral.zig");
 const quorum_mod = @import("quorum.zig");
 
 const ConnectionSession = struct {
@@ -264,7 +265,8 @@ pub const TcpServer = struct {
                 return false;
             },
             .auth => try self.authenticate(transport, context, body),
-            .create, .create2 => try self.create(transport, session, context.identities.items, xid, opcode, body),
+            .create, .create2, .create_container => try self.create(transport, session, context.identities.items, xid, opcode, body),
+            .create_ttl => try self.createTtl(transport, session, context.identities.items, xid, body),
             .delete => try self.delete(transport, session, context.identities.items, xid, body),
             .set_acl => try self.setAcl(transport, session, context.identities.items, xid, body),
             .set_data => try self.setData(transport, session, context.identities.items, xid, body),
@@ -341,13 +343,14 @@ pub const TcpServer = struct {
             -1,
             .bad_arguments,
         );
-        if (request.flags < 0 or request.flags > 3) return sendError(
+        if (request.flags < 0 or request.flags > 4 or
+            (opcode == .create_container) != (request.flags == 4)) return sendError(
             transport,
             self.allocator,
             self.io,
             xid,
             -1,
-            .unimplemented,
+            .bad_arguments,
         );
         const acl_blob = acl.normalize(self.allocator, request.acl, identities) catch
             return sendError(transport, self.allocator, self.io, xid, -1, .invalid_acl);
@@ -364,6 +367,12 @@ pub const TcpServer = struct {
             .sequential = (request.flags & 2) != 0,
             .acl = acl_blob,
             .identities = identities_blob,
+            .node_kind = if (request.flags == 4)
+                .container
+            else if ((request.flags & 1) != 0)
+                .ephemeral
+            else
+                .persistent,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -385,7 +394,7 @@ pub const TcpServer = struct {
         var reader = jute.Reader.init(result.body);
         const response = try jute.deserialize(protocol.proto.Create2Response, &reader, self.allocator);
         if (reader.remaining() != 0) return error.InvalidProposalResponse;
-        if (opcode == .create2) {
+        if (opcode == .create2 or opcode == .create_container) {
             try sendReply(transport, self.allocator, self.io, .{
                 .xid = xid,
                 .zxid = result.zxid,
@@ -398,6 +407,60 @@ pub const TcpServer = struct {
                 .err = 0,
             }, protocol.proto.CreateResponse{ .path = response.path });
         }
+    }
+
+    fn createTtl(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.CreateTTLRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const path = request.path orelse
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        if ((request.flags != 5 and request.flags != 6) or !ephemeral.isValidTtl(request.ttl)) {
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        }
+        const acl_blob = acl.normalize(self.allocator, request.acl, identities) catch
+            return sendError(transport, self.allocator, self.io, xid, -1, .invalid_acl);
+        defer self.allocator.free(acl_blob);
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        var proposal = self.quorum.propose(.{ .create = .{
+            .path = path,
+            .data = request.data orelse &.{},
+            .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .session_id = session.id,
+            .session_generation = session.generation,
+            .sequential = request.flags == 6,
+            .acl = acl_blob,
+            .identities = identities_blob,
+            .node_kind = .ttl,
+            .ttl_ms = request.ttl,
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, result.zxid, result.code);
+        }
+        var reader = jute.Reader.init(result.body);
+        const response = try jute.deserialize(protocol.proto.Create2Response, &reader, self.allocator);
+        if (reader.remaining() != 0) return error.InvalidProposalResponse;
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, response);
     }
 
     fn delete(

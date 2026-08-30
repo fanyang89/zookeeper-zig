@@ -158,13 +158,13 @@ zig-out/bin/zookeeper-quorum-server \
 ```
 
 The current server supports replicated sessions, session resume and expiration,
-ephemeral and sequential nodes, digest authentication, ACL enforcement,
-Connect, ping, closeSession, create/create2, delete, setData, getACL/setACL,
-exists, getData, getChildren/getChildren2, and sync. Reads use Raft ReadIndex
-before accessing RocksDB. Session close and expiration atomically remove all
-session-owned ephemeral nodes. ACLs support `world`, `auth`, `digest`, and IPv4
-`ip` identities, including CIDR masks. IPv6 ACL identities, SASL, watches, and
-multi operations are not implemented yet.
+ephemeral, sequential, container, and TTL nodes, digest authentication, ACL
+enforcement, Connect, ping, closeSession, create/create2/createContainer/createTTL,
+delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2, and
+sync. Reads use Raft ReadIndex before accessing RocksDB. Session close and
+expiration atomically remove all session-owned ephemeral nodes. ACLs support
+`world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks. IPv6
+ACL identities, SASL, watches, and multi operations are not implemented yet.
 
 ## Java client interoperability
 
@@ -179,10 +179,10 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream `AsyncOpsTest` and
 `ClientTest` methods unchanged. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current selection covers 45
+server starts an isolated Zig server instead. The current selection covers 46
 synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-large-data, sync, and error-code tests; watch, multi, and Java-server-internal
-tests remain excluded.
+container, TTL, large-data, sync, lifecycle cleanup, and error-code tests;
+watch, multi, and Java-server-internal tests remain excluded.
 
 The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit

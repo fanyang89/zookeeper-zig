@@ -6,6 +6,7 @@ const protocol = @import("../protocol.zig");
 const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
+const ephemeral = @import("ephemeral.zig");
 
 const Node = data_tree.Node;
 const ErrorCode = data_tree.ErrorCode;
@@ -15,6 +16,7 @@ const import_zxid_key = "\x00import-zxid";
 const state_prefix = "\x01";
 const session_clock_key = "\x01clock";
 const zxid_base_key = "\x01zxid-base";
+const maintenance_clock_key = "\x01maintenance-clock";
 const session_prefix = "\x01session/";
 const snapshot_version: u32 = 1;
 pub const max_snapshot_bytes: usize = 256 * 1024 * 1024;
@@ -52,6 +54,12 @@ pub const ExpiredSession = struct {
     expires_at_ms: i64,
 };
 
+pub const ExtendedCandidate = struct {
+    path: []u8,
+    czxid: i64,
+    kind: ephemeral.NodeKind,
+};
+
 pub const ImportNode = struct {
     path: []const u8,
     data: ?[]const u8,
@@ -65,6 +73,7 @@ pub const ImportNode = struct {
     sequence_counter: i32,
     aversion: i32,
     ephemeral_owner: i64,
+    kind: ephemeral.NodeKind = .persistent,
     pzxid: i64,
     child_count: usize,
 };
@@ -83,6 +92,7 @@ pub const RocksStore = struct {
     applied: Applied,
     session_clock_ms: i64,
     zxid_base: i64,
+    maintenance_clock_ms: i64,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !RocksStore {
         const path_z = try allocator.dupeZ(u8, path);
@@ -111,6 +121,7 @@ pub const RocksStore = struct {
             .applied = .{},
             .session_clock_ms = 0,
             .zxid_base = 0,
+            .maintenance_clock_ms = 0,
         };
         if (try store.getNode("/")) |root| {
             var owned_root = root;
@@ -124,6 +135,7 @@ pub const RocksStore = struct {
                 break :blk 0;
             };
             store.zxid_base = (try store.loadZxidBase()) orelse 0;
+            store.maintenance_clock_ms = (try store.loadMaintenanceClock()) orelse 0;
         } else {
             var root = Node{
                 .data = try allocator.alloc(u8, 0),
@@ -145,6 +157,7 @@ pub const RocksStore = struct {
             putApplied(&batch, default_family, .{});
             putSessionClock(&batch, default_family, 0);
             putZxidBase(&batch, default_family, 0);
+            putMaintenanceClock(&batch, default_family, 0);
             try store.writeSync(batch);
         }
         return store;
@@ -180,6 +193,7 @@ pub const RocksStore = struct {
         for (nodes) |imported| {
             if (!data_tree.isValidPath(imported.path)) return error.InvalidImport;
             found_root = found_root or std.mem.eql(u8, imported.path, "/");
+            ephemeral.validate(imported.kind, imported.ephemeral_owner) catch return error.InvalidImport;
             const node = Node{
                 .data = @constCast(imported.data orelse &.{}),
                 .data_is_null = imported.data == null,
@@ -194,6 +208,7 @@ pub const RocksStore = struct {
                 .pzxid = imported.pzxid,
                 .child_count = imported.child_count,
                 .ephemeral_owner = imported.ephemeral_owner,
+                .kind = imported.kind,
                 .acl = if (imported.acl) |value| @constCast(value) else null,
             };
             const encoded = try encodeNode(self.allocator, node);
@@ -220,6 +235,7 @@ pub const RocksStore = struct {
         }
         putSessionClock(&batch, self.default_family, 0);
         putZxidBase(&batch, self.default_family, source_zxid);
+        putMaintenanceClock(&batch, self.default_family, 0);
         putApplied(&batch, self.default_family, .{});
         var source_zxid_bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &source_zxid_bytes, source_zxid, .big);
@@ -228,6 +244,7 @@ pub const RocksStore = struct {
         self.applied = .{};
         self.session_clock_ms = 0;
         self.zxid_base = source_zxid;
+        self.maintenance_clock_ms = 0;
     }
 
     pub fn apply(
@@ -243,7 +260,8 @@ pub const RocksStore = struct {
                 request.path,
                 request.data,
                 request.time_ms,
-                request.ephemeral,
+                request.node_kind,
+                request.ttl_ms,
                 request.session_id,
                 request.sequential,
                 request.acl,
@@ -315,6 +333,14 @@ pub const RocksStore = struct {
             .session_tick => |request| try self.sessionTick(
                 request.leader_term,
                 request.elapsed_ms,
+                request.leader_wall_ms,
+                index,
+                term,
+            ),
+            .delete_extended => |request| try self.deleteExtended(
+                request.path,
+                request.expected_czxid,
+                request.expected_kind,
                 index,
                 term,
             ),
@@ -494,6 +520,40 @@ pub const RocksStore = struct {
         return try expired.toOwnedSlice(allocator);
     }
 
+    pub fn expiredExtendedNodes(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+        limit: usize,
+    ) ![]ExtendedCandidate {
+        var candidates: std.ArrayList(ExtendedCandidate) = .empty;
+        errdefer {
+            for (candidates.items) |candidate| allocator.free(candidate.path);
+            candidates.deinit(allocator);
+        }
+        if (limit == 0 or self.maintenance_clock_ms == 0) return candidates.toOwnedSlice(allocator);
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        defer iterator.deinit();
+        while (candidates.items.len < limit) {
+            const entry = (try iterator.next(&error_data)) orelse break;
+            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            var node = try decodeNode(self.allocator, entry[1].data);
+            defer node.deinit(self.allocator);
+            if (!extendedEligible(node, self.maintenance_clock_ms)) continue;
+            const owned_path = try allocator.dupe(u8, entry[0].data);
+            candidates.append(allocator, .{
+                .path = owned_path,
+                .czxid = node.czxid,
+                .kind = node.kind,
+            }) catch |err| {
+                allocator.free(owned_path);
+                return err;
+            };
+        }
+        return candidates.toOwnedSlice(allocator);
+    }
+
     pub fn snapshot(self: *RocksStore, allocator: std.mem.Allocator) ![]u8 {
         var writer = jute.Writer.init(allocator);
         defer writer.deinit();
@@ -560,6 +620,7 @@ pub const RocksStore = struct {
             declared_children: usize,
             actual_children: usize = 0,
             ephemeral_owner: i64,
+            kind: ephemeral.NodeKind,
         };
         var nodes: std.StringHashMapUnmanaged(Validation) = .empty;
         defer nodes.deinit(self.allocator);
@@ -567,6 +628,7 @@ pub const RocksStore = struct {
         defer sessions.deinit(self.allocator);
         var restored_clock: ?i64 = null;
         var restored_zxid_base: ?i64 = null;
+        var restored_maintenance_clock: ?i64 = null;
         var restored_import_zxid: ?i64 = null;
         var index: u32 = 0;
         while (index < count) : (index += 1) {
@@ -583,6 +645,7 @@ pub const RocksStore = struct {
                 result.value_ptr.* = .{
                     .declared_children = node.child_count,
                     .ephemeral_owner = node.ephemeral_owner,
+                    .kind = node.kind,
                 };
             } else if (std.mem.eql(u8, key, import_zxid_key)) {
                 if (restored_import_zxid != null or value.len != 8) return error.InvalidSnapshot;
@@ -590,6 +653,11 @@ pub const RocksStore = struct {
             } else if (std.mem.eql(u8, key, zxid_base_key)) {
                 if (restored_zxid_base != null or value.len != 8) return error.InvalidSnapshot;
                 restored_zxid_base = std.mem.readInt(i64, value[0..8], .big);
+            } else if (std.mem.eql(u8, key, maintenance_clock_key)) {
+                if (restored_maintenance_clock != null or value.len != 8) return error.InvalidSnapshot;
+                const clock = std.mem.readInt(i64, value[0..8], .big);
+                if (clock < 0) return error.InvalidSnapshot;
+                restored_maintenance_clock = clock;
             } else if (std.mem.eql(u8, key, session_clock_key)) {
                 if (restored_clock != null or value.len != 8) return error.InvalidSnapshot;
                 const clock = std.mem.readInt(i64, value[0..8], .big);
@@ -610,10 +678,15 @@ pub const RocksStore = struct {
         const effective_clock = restored_clock orelse 0;
         var paths = nodes.iterator();
         while (paths.next()) |entry| {
-            if (entry.value_ptr.ephemeral_owner != 0) {
+            ephemeral.validate(entry.value_ptr.kind, entry.value_ptr.ephemeral_owner) catch
+                return error.InvalidSnapshot;
+            if (entry.value_ptr.kind == .ephemeral) {
                 if (!sessions.contains(entry.value_ptr.ephemeral_owner) or
                     entry.value_ptr.declared_children != 0 or
                     std.mem.eql(u8, entry.key_ptr.*, "/")) return error.InvalidSnapshot;
+            }
+            if (std.mem.eql(u8, entry.key_ptr.*, "/") and entry.value_ptr.kind != .persistent) {
+                return error.InvalidSnapshot;
             }
             if (std.mem.eql(u8, entry.key_ptr.*, "/")) continue;
             const parent_path = data_tree.parentPath(entry.key_ptr.*) orelse return error.InvalidSnapshot;
@@ -634,12 +707,15 @@ pub const RocksStore = struct {
         }
         const effective_zxid_base = restored_zxid_base orelse 0;
         putSessionClock(&batch, self.default_family, effective_clock);
+        const effective_maintenance_clock = restored_maintenance_clock orelse 0;
         putZxidBase(&batch, self.default_family, effective_zxid_base);
+        putMaintenanceClock(&batch, self.default_family, effective_maintenance_clock);
         putApplied(&batch, self.default_family, applied);
         try self.writeSync(batch);
         self.applied = applied;
         self.session_clock_ms = effective_clock;
         self.zxid_base = effective_zxid_base;
+        self.maintenance_clock_ms = effective_maintenance_clock;
     }
 
     fn validateMutationConnection(
@@ -787,6 +863,7 @@ pub const RocksStore = struct {
         self: *RocksStore,
         leader_term: u64,
         elapsed_ms: i64,
+        leader_wall_ms: i64,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
@@ -795,12 +872,18 @@ pub const RocksStore = struct {
         }
         const next_clock = std.math.add(i64, self.session_clock_ms, elapsed_ms) catch
             return .{ .code = .bad_arguments };
+        const next_maintenance_clock = if (self.maintenance_clock_ms == 0) blk: {
+            break :blk if (leader_wall_ms > 0) leader_wall_ms else 0;
+        } else std.math.add(i64, self.maintenance_clock_ms, elapsed_ms) catch
+            return .{ .code = .bad_arguments };
         var batch = rocksdb.WriteBatch.init();
         defer batch.deinit();
         putSessionClock(&batch, self.default_family, next_clock);
+        putMaintenanceClock(&batch, self.default_family, next_maintenance_clock);
         putApplied(&batch, self.default_family, .{ .index = index, .term = term });
         try self.writeSync(batch);
         self.session_clock_ms = next_clock;
+        self.maintenance_clock_ms = next_maintenance_clock;
         return .{ .code = .ok };
     }
 
@@ -843,7 +926,7 @@ pub const RocksStore = struct {
             if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
             var node = try decodeNode(self.allocator, entry[1].data);
             defer node.deinit(self.allocator);
-            if (node.ephemeral_owner != session_id) continue;
+            if (node.kind != .ephemeral or node.ephemeral_owner != session_id) continue;
             if (node.child_count != 0) return error.InvalidEphemeralNode;
             const owned_path = try self.allocator.dupe(u8, entry[0].data);
             ephemeral_paths.append(self.allocator, owned_path) catch |err| {
@@ -906,7 +989,8 @@ pub const RocksStore = struct {
         path: []const u8,
         data: []const u8,
         time_ms: i64,
-        ephemeral: bool,
+        kind: ephemeral.NodeKind,
+        ttl_ms: i64,
         session_id: i64,
         sequential: bool,
         acl_blob: ?[]const u8,
@@ -924,7 +1008,14 @@ pub const RocksStore = struct {
             return .{ .code = .bad_arguments };
         }
         if (acl_blob) |value| acl.validate(value) catch return .{ .code = .invalid_acl };
-        if (ephemeral) {
+        if (kind != .ttl and ttl_ms != 0) return .{ .code = .bad_arguments };
+        ephemeral.validate(kind, switch (kind) {
+            .persistent => 0,
+            .ephemeral => session_id,
+            .container => ephemeral.container_owner,
+            .ttl => ephemeral.ttlOwner(ttl_ms) catch return .{ .code = .bad_arguments },
+        }) catch return .{ .code = .bad_arguments };
+        if (kind == .ephemeral) {
             const session = (try self.getSession(session_id)) orelse
                 return .{ .code = .session_expired };
             if (session.expires_at_ms <= self.session_clock_ms) return .{ .code = .session_expired };
@@ -934,7 +1025,7 @@ pub const RocksStore = struct {
         var parent = maybe_parent.?;
         defer parent.deinit(self.allocator);
         if (!try acl.allows(parent.acl, acl.create, identities)) return .{ .code = .no_auth };
-        if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
+        if (!ephemeral.permitsChildren(parent.kind)) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
             parent.cversion == std.math.maxInt(i32) or
             parent.sequence_counter == std.math.maxInt(i32))
@@ -973,7 +1064,13 @@ pub const RocksStore = struct {
             .cversion = 0,
             .pzxid = zxid,
             .child_count = 0,
-            .ephemeral_owner = if (ephemeral) session_id else 0,
+            .ephemeral_owner = switch (kind) {
+                .persistent => 0,
+                .ephemeral => session_id,
+                .container => ephemeral.container_owner,
+                .ttl => try ephemeral.ttlOwner(ttl_ms),
+            },
+            .kind = kind,
             .acl = node_acl,
         };
         node_data_owned = false;
@@ -1021,6 +1118,51 @@ pub const RocksStore = struct {
         parent.cversion += 1;
         parent.pzxid = try self.clientZxid(index);
         parent.child_count -= 1;
+        try self.commitNodes(
+            &.{.{ .path = parent_path, .node = parent }},
+            path,
+            .{ .index = index, .term = term },
+        );
+        return .{ .code = .ok };
+    }
+
+    fn deleteExtended(
+        self: *RocksStore,
+        path: []const u8,
+        expected_czxid: i64,
+        expected_kind: ephemeral.NodeKind,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        const maybe_node = try self.getNode(path);
+        if (maybe_node == null) {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        }
+        var node = maybe_node.?;
+        defer node.deinit(self.allocator);
+        if (node.czxid != expected_czxid or node.kind != expected_kind or
+            !extendedEligible(node, self.maintenance_clock_ms))
+        {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        }
+        const parent_path = data_tree.parentPath(path) orelse {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        };
+        var parent = (try self.getNode(parent_path)) orelse {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        };
+        defer parent.deinit(self.allocator);
+        if (parent.cversion == std.math.maxInt(i32) or parent.child_count == 0) {
+            try self.advanceApplied(index, term);
+            return .{ .code = .ok };
+        }
+        parent.cversion += 1;
+        parent.child_count -= 1;
+        parent.pzxid = try self.clientZxid(index);
         try self.commitNodes(
             &.{.{ .path = parent_path, .node = parent }},
             path,
@@ -1160,6 +1302,20 @@ pub const RocksStore = struct {
         return null;
     }
 
+    fn loadMaintenanceClock(self: *RocksStore) !?i64 {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, maintenance_clock_key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            if (data.data.len != 8) return error.InvalidMaintenanceClock;
+            const value = std.mem.readInt(i64, data.data[0..8], .big);
+            if (value < 0) return error.InvalidMaintenanceClock;
+            return value;
+        }
+        return null;
+    }
+
     fn loadSessionClock(self: *RocksStore) !?i64 {
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
@@ -1192,6 +1348,16 @@ pub const RocksStore = struct {
         }
     }
 };
+
+fn extendedEligible(node: Node, maintenance_clock_ms: i64) bool {
+    if (node.child_count != 0 or maintenance_clock_ms <= node.mtime) return false;
+    const elapsed = maintenance_clock_ms - node.mtime;
+    return switch (node.kind) {
+        .container => node.cversion > 0 or elapsed > ephemeral.container_unused_timeout_ms,
+        .ttl => elapsed > (ephemeral.ttlValue(node.ephemeral_owner) catch return false),
+        else => false,
+    };
+}
 
 fn sessionKey(session_id: i64, output: *[session_prefix.len + 8]u8) []const u8 {
     @memcpy(output[0..session_prefix.len], session_prefix);
@@ -1285,6 +1451,7 @@ fn renewedExpiry(session_clock_ms: i64, timeout_ms: i32, tick_grace_ms: i32) !i6
 fn isSnapshotRecordKey(key: []const u8) bool {
     return data_tree.isValidPath(key) or std.mem.eql(u8, key, session_clock_key) or
         std.mem.eql(u8, key, zxid_base_key) or
+        std.mem.eql(u8, key, maintenance_clock_key) or
         std.mem.startsWith(u8, key, session_prefix);
 }
 
@@ -1296,6 +1463,16 @@ fn putZxidBase(
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(i64, &bytes, value, .big);
     batch.put(family, zxid_base_key, &bytes);
+}
+
+fn putMaintenanceClock(
+    batch: *const rocksdb.WriteBatch,
+    family: rocksdb.ColumnFamilyHandle,
+    value: i64,
+) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &bytes, value, .big);
+    batch.put(family, maintenance_clock_key, &bytes);
 }
 
 fn putSessionClock(
@@ -1335,6 +1512,7 @@ fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     try writer.writeInt(node.aversion);
     try writer.writeBuffer(node.acl);
     try writer.writeInt(node.sequence_counter);
+    try writer.writeByte(@bitCast(@intFromEnum(node.kind)));
     return allocator.dupe(u8, writer.bytes());
 }
 
@@ -1362,7 +1540,12 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
         null;
     errdefer if (acl_blob) |value| allocator.free(value);
     const sequence_counter = if (reader.remaining() == 0) cversion else try reader.readInt();
+    const kind: ephemeral.NodeKind = if (reader.remaining() == 0)
+        if (ephemeral_owner == 0) .persistent else .ephemeral
+    else
+        ephemeral.kindFromByte(@bitCast(try reader.readByte())) orelse return error.InvalidNode;
     if (reader.remaining() != 0) return error.InvalidNode;
+    ephemeral.validate(kind, ephemeral_owner) catch return error.InvalidNode;
     if (acl_blob) |value| acl.validate(value) catch return error.InvalidNode;
     return .{
         .data = data,
@@ -1378,6 +1561,7 @@ fn decodeNode(allocator: std.mem.Allocator, bytes: []const u8) !Node {
         .pzxid = pzxid,
         .child_count = child_count,
         .ephemeral_owner = ephemeral_owner,
+        .kind = kind,
         .acl = acl_blob,
     };
 }
@@ -1390,6 +1574,37 @@ fn deinitFamilies(allocator: std.mem.Allocator, families: []const rocksdb.Column
 fn deinitErrorData(error_data: *?rocksdb.Data) void {
     if (error_data.*) |data| data.deinit();
     error_data.* = null;
+}
+
+test "node encoding appends kind while legacy nonzero owners remain ephemeral" {
+    const testing = std.testing;
+    var writer = jute.Writer.init(testing.allocator);
+    defer writer.deinit();
+    try writer.writeBuffer("");
+    try writer.writeLong(1);
+    try writer.writeLong(1);
+    try writer.writeLong(1);
+    try writer.writeLong(1);
+    try writer.writeInt(0);
+    try writer.writeInt(0);
+    try writer.writeLong(1);
+    try writer.writeLong(0);
+    try writer.writeLong(-1);
+    try writer.writeInt(0);
+    try writer.writeBuffer(null);
+    try writer.writeInt(0);
+    var legacy = try decodeNode(testing.allocator, writer.bytes());
+    defer legacy.deinit(testing.allocator);
+    try testing.expectEqual(ephemeral.NodeKind.ephemeral, legacy.kind);
+
+    legacy.kind = .container;
+    legacy.ephemeral_owner = ephemeral.container_owner;
+    const encoded = try encodeNode(testing.allocator, legacy);
+    defer testing.allocator.free(encoded);
+    var decoded = try decodeNode(testing.allocator, encoded);
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(ephemeral.NodeKind.container, decoded.kind);
+    try testing.expectEqual(@as(i64, 0), decoded.stat().ephemeralOwner);
 }
 
 test "snapshot restore rejects a missing root without changing live state" {
@@ -1469,6 +1684,79 @@ test "sequential creates use persistent parent cversion suffixes" {
         defer third.deinit(testing.allocator);
         try testing.expectEqualStrings("/member-0000000003", third.created_path.?);
     }
+}
+
+test "container and TTL nodes use replicated lifecycle cleanup" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+
+    _ = try store.apply(.{ .session_tick = .{ .leader_term = 1, .elapsed_ms = 1, .leader_wall_ms = 1_000 } }, 1, 1);
+    var container = try store.apply(.{ .create = .{
+        .path = "/container",
+        .data = "",
+        .time_ms = 1_000,
+        .node_kind = .container,
+    } }, 2, 1);
+    defer container.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 0), container.stat.?.ephemeralOwner);
+    var child = try store.apply(.{ .create = .{ .path = "/container/child", .data = "", .time_ms = 1_000 } }, 3, 1);
+    defer child.deinit(testing.allocator);
+    _ = try store.apply(.{ .delete = .{ .path = "/container/child", .expected_version = -1 } }, 4, 1);
+    var ttl = try store.apply(.{ .create = .{
+        .path = "/ttl-",
+        .data = "",
+        .time_ms = 1_000,
+        .sequential = true,
+        .node_kind = .ttl,
+        .ttl_ms = 10,
+    } }, 5, 1);
+    defer ttl.deinit(testing.allocator);
+    try testing.expectEqualStrings("/ttl-0000000001", ttl.created_path.?);
+    _ = try store.apply(.{ .session_tick = .{ .leader_term = 1, .elapsed_ms = 11, .leader_wall_ms = 9_999 } }, 6, 1);
+
+    const candidates = try store.expiredExtendedNodes(testing.allocator, 16);
+    defer {
+        for (candidates) |candidate| testing.allocator.free(candidate.path);
+        testing.allocator.free(candidates);
+    }
+    try testing.expectEqual(@as(usize, 2), candidates.len);
+    const candidate = for (candidates) |value| {
+        if (std.mem.eql(u8, value.path, "/container")) break value;
+    } else return error.MissingCandidate;
+    _ = try store.apply(.{ .delete_extended = .{
+        .path = candidate.path,
+        .expected_czxid = candidate.czxid + 1,
+        .expected_kind = candidate.kind,
+    } }, 7, 1);
+    try testing.expect((try store.exists("/container")) != null);
+    _ = try store.apply(.{ .delete_extended = .{
+        .path = candidate.path,
+        .expected_czxid = candidate.czxid,
+        .expected_kind = candidate.kind,
+    } }, 8, 1);
+    try testing.expect((try store.exists("/container")) == null);
+
+    const snapshot_bytes = try store.snapshot(testing.allocator);
+    defer testing.allocator.free(snapshot_bytes);
+    var restored_directory = std.testing.tmpDir(.{});
+    defer restored_directory.cleanup();
+    const restored_path = try restored_directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(restored_path);
+    var restored = try RocksStore.open(testing.allocator, restored_path);
+    defer restored.deinit();
+    try restored.restore(snapshot_bytes, 8, 1);
+    const restored_candidates = try restored.expiredExtendedNodes(testing.allocator, 16);
+    defer {
+        for (restored_candidates) |value| testing.allocator.free(value.path);
+        testing.allocator.free(restored_candidates);
+    }
+    try testing.expectEqual(@as(usize, 1), restored_candidates.len);
+    try testing.expectEqual(ephemeral.NodeKind.ttl, restored_candidates[0].kind);
 }
 
 test "ACL authorization and snapshot restore preserve digest ownership" {

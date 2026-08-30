@@ -1,8 +1,9 @@
 const std = @import("std");
 const jute = @import("../jute.zig");
 const data_tree = @import("data_tree.zig");
+const ephemeral = @import("ephemeral.zig");
 
-pub const version: i32 = 4;
+pub const version: i32 = 5;
 pub const legacy_version: i32 = 1;
 
 pub const Kind = enum(i32) {
@@ -16,6 +17,7 @@ pub const Kind = enum(i32) {
     expire_session = 103,
     move_session = 104,
     session_tick = 105,
+    delete_extended = 106,
 };
 
 pub const Mutation = union(Kind) {
@@ -29,6 +31,8 @@ pub const Mutation = union(Kind) {
         sequential: bool = false,
         acl: ?[]const u8 = null,
         identities: ?[]const u8 = null,
+        node_kind: ephemeral.NodeKind = .persistent,
+        ttl_ms: i64 = 0,
     },
     delete: struct {
         path: []const u8,
@@ -84,6 +88,12 @@ pub const Mutation = union(Kind) {
     session_tick: struct {
         leader_term: u64,
         elapsed_ms: i64,
+        leader_wall_ms: i64 = 0,
+    },
+    delete_extended: struct {
+        path: []const u8,
+        expected_czxid: i64,
+        expected_kind: ephemeral.NodeKind,
     },
 };
 
@@ -96,7 +106,7 @@ pub const ResultView = struct {
 pub fn resultCapacity(mutation: Mutation) error{SizeOverflow}!usize {
     return switch (mutation) {
         .create => |value| std.math.add(usize, 94, value.path.len) catch error.SizeOverflow,
-        .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => 12,
+        .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => 12,
         .set_acl, .set_data => 80,
     };
 }
@@ -117,6 +127,12 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeBool(value.sequential);
             try writer.writeBuffer(value.acl);
             try writer.writeBuffer(value.identities);
+            const encoded_kind: ephemeral.NodeKind = if (value.node_kind == .persistent and value.ephemeral)
+                .ephemeral
+            else
+                value.node_kind;
+            try writer.writeByte(@bitCast(@intFromEnum(encoded_kind)));
+            try writer.writeLong(value.ttl_ms);
         },
         .delete => |value| {
             try writer.writeString(value.path);
@@ -172,6 +188,12 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
         .session_tick => |value| {
             try writer.writeLong(@bitCast(value.leader_term));
             try writer.writeLong(value.elapsed_ms);
+            try writer.writeLong(value.leader_wall_ms);
+        },
+        .delete_extended => |value| {
+            try writer.writeString(value.path);
+            try writer.writeLong(value.expected_czxid);
+            try writer.writeByte(@bitCast(@intFromEnum(value.expected_kind)));
         },
     }
     return allocator.dupe(u8, writer.bytes());
@@ -190,17 +212,7 @@ pub fn decode(bytes: []const u8) !Mutation {
         return error.UnsupportedCommandVersion;
     }
     const mutation: Mutation = switch (kind) {
-        .create => .{ .create = .{
-            .path = (try reader.readString()) orelse return error.InvalidCommand,
-            .data = (try reader.readBuffer()) orelse return error.InvalidCommand,
-            .time_ms = try reader.readLong(),
-            .ephemeral = if (encoded_version >= 2) try reader.readBool() else false,
-            .session_id = if (encoded_version >= 2) try reader.readLong() else 0,
-            .session_generation = if (encoded_version >= 2) @bitCast(try reader.readLong()) else 0,
-            .sequential = if (encoded_version >= 3) try reader.readBool() else false,
-            .acl = if (encoded_version >= 4) try reader.readBuffer() else null,
-            .identities = if (encoded_version >= 4) try reader.readBuffer() else null,
-        } },
+        .create => try decodeCreate(&reader, encoded_version),
         .delete => .{ .delete = .{
             .path = (try reader.readString()) orelse return error.InvalidCommand,
             .expected_version = try reader.readInt(),
@@ -255,10 +267,52 @@ pub fn decode(bytes: []const u8) !Mutation {
         .session_tick => .{ .session_tick = .{
             .leader_term = @bitCast(try reader.readLong()),
             .elapsed_ms = try reader.readLong(),
+            .leader_wall_ms = if (encoded_version >= 5) try reader.readLong() else 0,
         } },
+        .delete_extended => blk: {
+            if (encoded_version < 5) return error.UnsupportedCommandVersion;
+            break :blk .{ .delete_extended = .{
+                .path = (try reader.readString()) orelse return error.InvalidCommand,
+                .expected_czxid = try reader.readLong(),
+                .expected_kind = checkedEnum(ephemeral.NodeKind, @as(u8, @bitCast(try reader.readByte()))) orelse
+                    return error.InvalidCommand,
+            } };
+        },
     };
     if (reader.remaining() != 0) return error.InvalidCommand;
     return mutation;
+}
+
+fn decodeCreate(reader: *jute.Reader, encoded_version: i32) !Mutation {
+    const path = (try reader.readString()) orelse return error.InvalidCommand;
+    const data = (try reader.readBuffer()) orelse return error.InvalidCommand;
+    const time_ms = try reader.readLong();
+    const old_ephemeral = if (encoded_version >= 2) try reader.readBool() else false;
+    const session_id = if (encoded_version >= 2) try reader.readLong() else 0;
+    const session_generation = if (encoded_version >= 2) @as(u64, @bitCast(try reader.readLong())) else 0;
+    const sequential = if (encoded_version >= 3) try reader.readBool() else false;
+    const acl_blob = if (encoded_version >= 4) try reader.readBuffer() else null;
+    const identities = if (encoded_version >= 4) try reader.readBuffer() else null;
+    const node_kind = if (encoded_version >= 5)
+        checkedEnum(ephemeral.NodeKind, @as(u8, @bitCast(try reader.readByte()))) orelse return error.InvalidCommand
+    else if (old_ephemeral)
+        ephemeral.NodeKind.ephemeral
+    else
+        ephemeral.NodeKind.persistent;
+    const ttl_ms = if (encoded_version >= 5) try reader.readLong() else 0;
+    return .{ .create = .{
+        .path = path,
+        .data = data,
+        .time_ms = time_ms,
+        .ephemeral = node_kind == .ephemeral,
+        .session_id = session_id,
+        .session_generation = session_generation,
+        .sequential = sequential,
+        .acl = acl_blob,
+        .identities = identities,
+        .node_kind = node_kind,
+        .ttl_ms = ttl_ms,
+    } };
 }
 
 pub fn encodeResult(
@@ -346,6 +400,7 @@ test "mutation commands and results round trip" {
     try testing.expect(version_two_create.create.ephemeral);
     try testing.expect(!version_two_create.create.sequential);
     try testing.expectEqual(@as(u64, 7), version_two_create.create.session_generation);
+    try testing.expectEqual(ephemeral.NodeKind.ephemeral, version_two_create.create.node_kind);
 
     var version_three_writer = jute.Writer.init(testing.allocator);
     defer version_three_writer.deinit();
@@ -362,6 +417,20 @@ test "mutation commands and results round trip" {
     try testing.expect(version_three_create.create.sequential);
     try testing.expect(version_three_create.create.acl == null);
     try testing.expect(version_three_create.create.identities == null);
+    try testing.expectEqual(ephemeral.NodeKind.persistent, version_three_create.create.node_kind);
+
+    const ttl_encoded = try encode(testing.allocator, .{ .create = .{
+        .path = "/ttl-",
+        .data = "payload",
+        .time_ms = 1_000,
+        .sequential = true,
+        .node_kind = .ttl,
+        .ttl_ms = 60_000,
+    } });
+    defer testing.allocator.free(ttl_encoded);
+    const ttl_decoded = try decode(ttl_encoded);
+    try testing.expectEqual(ephemeral.NodeKind.ttl, ttl_decoded.create.node_kind);
+    try testing.expectEqual(@as(i64, 60_000), ttl_decoded.create.ttl_ms);
 
     const response = try encodeResult(testing.allocator, .ok, 7, {});
     defer testing.allocator.free(response);
