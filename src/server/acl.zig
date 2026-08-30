@@ -63,9 +63,10 @@ pub fn normalize(
     defer normalized.deinit(allocator);
     for (source) |entry| {
         const scheme = entry.id.scheme orelse return error.InvalidAcl;
-        const id = entry.id.id orelse return error.InvalidAcl;
         if (std.mem.eql(u8, scheme, "auth")) {
-            if (id.len != 0) return error.InvalidAcl;
+            if (entry.id.id) |id| {
+                if (id.len != 0) return error.InvalidAcl;
+            }
             var expanded = false;
             for (identities) |identity| {
                 if (!isAuthenticatedScheme(identity.scheme)) continue;
@@ -81,7 +82,7 @@ pub fn normalize(
             try normalized.append(allocator, .{
                 .perms = entry.perms,
                 .scheme = scheme,
-                .id = id,
+                .id = entry.id.id orelse return error.InvalidAcl,
             });
         }
     }
@@ -277,6 +278,23 @@ test "IPv4 ACL matching supports ZooKeeper CIDR masks" {
         .scheme = "ip",
         .id = "192.168.1_0.1/2_4",
     }));
+}
+
+test "auth ACL with null id expands to a digest identity" {
+    const testing = std.testing;
+    const entries = [_]protocol.data.ACL{.{
+        .perms = all,
+        .id = .{ .scheme = "auth", .id = null },
+    }};
+    const identities = [_]Identity{.{
+        .scheme = "digest",
+        .id = "ben:Zx6hEcF2qP6F4I0RFRKZ+YLTswU=",
+    }};
+    const blob = try normalize(testing.allocator, &entries, &identities);
+    defer testing.allocator.free(blob);
+    const encoded_identities = try encodeIdentities(testing.allocator, &identities);
+    defer testing.allocator.free(encoded_identities);
+    try testing.expect(try allows(blob, all, encoded_identities));
 }
 
 test "auth ACL expansion excludes IP identities" {

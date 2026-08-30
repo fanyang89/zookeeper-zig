@@ -51,6 +51,10 @@ pub const Writer = struct {
         try self.buffer.ensureTotalCapacityPrecise(self.allocator, capacity);
     }
 
+    pub fn toOwnedSlice(self: *Writer) std.mem.Allocator.Error![]u8 {
+        return self.buffer.toOwnedSlice(self.allocator);
+    }
+
     pub fn toOwnedSliceAssert(self: *Writer) []u8 {
         return self.buffer.toOwnedSliceAssert();
     }
@@ -347,6 +351,19 @@ test "binary archive handles strings buffers and null values" {
     const owned = (try allocating_reader.readStringAlloc(testing.allocator)).?;
     defer testing.allocator.free(owned);
     try testing.expectEqualStrings("zig", owned);
+}
+
+test "owned writer slice supports spare capacity" {
+    const testing = std.testing;
+    var writer = Writer.init(testing.allocator);
+    defer writer.deinit();
+
+    try writer.ensureTotalCapacityPrecise(64);
+    try writer.writeInt(42);
+    const owned = try writer.toOwnedSlice();
+    defer testing.allocator.free(owned);
+
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 42 }, owned);
 }
 
 test "binary archive enforces byte and collection limits" {

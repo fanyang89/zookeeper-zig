@@ -104,7 +104,7 @@ pub const TcpServer = struct {
             const request = try wire.requestView(payload);
             const opcode = wire.OpCode.fromInt(request.header.type) orelse {
                 try sendError(&transport, self.allocator, self.io, request.header.xid, -1, .unimplemented);
-                continue;
+                return;
             };
             const keep_open = try self.dispatch(
                 &transport,
