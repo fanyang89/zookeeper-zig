@@ -10,6 +10,7 @@
         "generated",
         "LICENSE",
         "README.md",
+        "src",
         "tests",
         "vendor",
     },

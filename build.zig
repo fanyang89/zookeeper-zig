@@ -45,9 +45,33 @@ pub fn build(b: *std.Build) void {
         .clang_runtime_dir = b.option([]const u8, "clang-runtime-dir", "Clang compiler-rt directory (see: clang --print-runtime-dir)"),
     };
 
-    if (target.result.os.tag != .linux) {
-        @panic("zookeeper-c currently supports Linux targets only");
-    }
+    _ = b.addModule("zookeeper", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    _ = b.addModule("jute", .{
+        .root_source_file = b.path("src/jute.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const jute_test_module = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jute_tests = b.addTest(.{ .root_module = jute_test_module });
+    const jute_check_step = b.step("check-jute", "Compile Zig Jute tests without running them");
+    jute_check_step.dependOn(&jute_tests.step);
+    const run_jute_tests = b.addRunArtifact(jute_tests);
+    const jute_test_step = b.step("test-jute", "Run Zig Jute unit tests");
+    jute_test_step.dependOn(&run_jute_tests.step);
+
+    const test_step = b.step("test", "Run available unit tests");
+    test_step.dependOn(&run_jute_tests.step);
+
+    if (target.result.os.tag != .linux) return;
 
     const config_header = addConfigHeader(b);
 
@@ -75,7 +99,6 @@ pub fn build(b: *std.Build) void {
 
     installHeaders(b);
 
-    const test_step = b.step("test", "Run C client unit tests");
     const unit_mt = addTestExecutable(b, "unit_mt", "tests/unit.c", target, optimize, features, true, mt_static);
     const unit_st = addTestExecutable(b, "unit_st", "tests/unit.c", target, optimize, features, false, st_static);
     test_step.dependOn(&b.addRunArtifact(unit_mt).step);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#MISE description="Run ZooKeeper C client unit tests"
+#MISE description="Run Zig Jute and C client unit tests"
 set -euo pipefail
 
 exec zig build test "$@"
