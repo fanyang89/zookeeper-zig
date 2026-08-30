@@ -135,6 +135,7 @@ pub const RocksStore = struct {
                 request.time_ms,
                 request.ephemeral,
                 request.session_id,
+                request.sequential,
                 index,
                 term,
             ),
@@ -711,32 +712,48 @@ pub const RocksStore = struct {
         time_ms: i64,
         ephemeral: bool,
         session_id: i64,
+        sequential: bool,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
-        if (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/") or
+        const parent_path = if (sequential)
+            sequentialParentPath(path) orelse return .{ .code = .bad_arguments }
+        else
+            data_tree.parentPath(path) orelse return .{ .code = .bad_arguments };
+        if ((!sequential and (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/"))) or
             data.len > std.math.maxInt(i32))
         {
             return .{ .code = .bad_arguments };
-        }
-        if (try self.getNode(path)) |value| {
-            var existing = value;
-            existing.deinit(self.allocator);
-            return .{ .code = .node_exists };
         }
         if (ephemeral) {
             const session = (try self.getSession(session_id)) orelse
                 return .{ .code = .session_expired };
             if (session.expires_at_ms <= self.session_clock_ms) return .{ .code = .session_expired };
         }
-        const parent_path = data_tree.parentPath(path) orelse return .{ .code = .bad_arguments };
         const maybe_parent = try self.getNode(parent_path);
         if (maybe_parent == null) return .{ .code = .no_node };
         var parent = maybe_parent.?;
         defer parent.deinit(self.allocator);
         if (parent.ephemeral_owner != 0) return .{ .code = .no_children_for_ephemerals };
         if (parent.child_count == std.math.maxInt(i32) or
-            parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
+            (!sequential and parent.cversion == std.math.maxInt(i32)))
+        {
+            return .{ .code = .bad_arguments };
+        }
+
+        var owned_path: ?[]u8 = null;
+        var transfer_path = false;
+        defer if (!transfer_path) if (owned_path) |value| self.allocator.free(value);
+        const resolved_path: []const u8 = if (sequential) blk: {
+            owned_path = try sequentialPath(self.allocator, path, parent.cversion);
+            break :blk owned_path.?;
+        } else path;
+        if (!data_tree.isValidPath(resolved_path)) return .{ .code = .bad_arguments };
+        if (try self.getNode(resolved_path)) |value| {
+            var existing = value;
+            existing.deinit(self.allocator);
+            return .{ .code = .node_exists };
+        }
 
         var node = Node{
             .data = try self.allocator.dupe(u8, data),
@@ -751,14 +768,20 @@ pub const RocksStore = struct {
             .ephemeral_owner = if (ephemeral) session_id else 0,
         };
         defer node.deinit(self.allocator);
-        parent.cversion += 1;
+        parent.cversion = if (sequential) parent.cversion +% 1 else parent.cversion + 1;
         parent.pzxid = @intCast(index);
         parent.child_count += 1;
         try self.commitNodes(&.{
-            .{ .path = path, .node = node },
+            .{ .path = resolved_path, .node = node },
             .{ .path = parent_path, .node = parent },
         }, null, .{ .index = index, .term = term });
-        return .{ .code = .ok, .stat = node.stat() };
+        transfer_path = true;
+        return .{
+            .code = .ok,
+            .stat = node.stat(),
+            .created_path = resolved_path,
+            .owned_created_path = owned_path,
+        };
     }
 
     fn delete(
@@ -967,6 +990,35 @@ fn decodeSession(bytes: []const u8) !Session {
     };
 }
 
+fn sequentialParentPath(path: []const u8) ?[]const u8 {
+    if (path.len < 2 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null or
+        std.mem.indexOf(u8, path, "//") != null) return null;
+    if (path[path.len - 1] == '/') {
+        const parent = path[0 .. path.len - 1];
+        return if (data_tree.isValidPath(parent)) parent else null;
+    }
+    return data_tree.parentPath(path);
+}
+
+fn sequentialPath(
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    sequence: i32,
+) ![]u8 {
+    if (sequence < 0) return error.InvalidSequence;
+    const path = try allocator.alloc(u8, std.math.add(usize, prefix.len, 10) catch
+        return error.LengthOverflow);
+    @memcpy(path[0..prefix.len], prefix);
+    var value: u32 = @intCast(sequence);
+    var index: usize = path.len;
+    while (index > prefix.len) {
+        index -= 1;
+        path[index] = '0' + @as(u8, @intCast(value % 10));
+        value /= 10;
+    }
+    return path;
+}
+
 fn renewedExpiry(session_clock_ms: i64, timeout_ms: i32, tick_grace_ms: i32) !i64 {
     const lifetime = std.math.add(i64, timeout_ms, tick_grace_ms) catch
         return error.SessionClockOverflow;
@@ -1076,4 +1128,63 @@ test "snapshot restore rejects a missing root without changing live state" {
     try testing.expectError(error.InvalidSnapshot, store.restore(writer.bytes(), 5, 1));
     try testing.expect((try store.exists("/")) != null);
     try testing.expectEqual(Applied{}, store.durableApplied());
+}
+
+test "sequential creates use persistent parent cversion suffixes" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+
+    {
+        var store = try RocksStore.open(testing.allocator, path);
+        defer store.deinit();
+        var first = try store.apply(.{ .create = .{
+            .path = "/member-",
+            .data = "one",
+            .time_ms = 1,
+            .sequential = true,
+        } }, 1, 1);
+        defer first.deinit(testing.allocator);
+        try testing.expectEqual(ErrorCode.ok, first.code);
+        try testing.expectEqualStrings("/member-0000000000", first.created_path.?);
+
+        var second = try store.apply(.{ .create = .{
+            .path = "/member-",
+            .data = "two",
+            .time_ms = 2,
+            .sequential = true,
+        } }, 2, 1);
+        defer second.deinit(testing.allocator);
+        try testing.expectEqualStrings("/member-0000000001", second.created_path.?);
+
+        var group = try store.apply(.{ .create = .{
+            .path = "/group",
+            .data = "",
+            .time_ms = 3,
+        } }, 3, 1);
+        defer group.deinit(testing.allocator);
+        var slash_prefix = try store.apply(.{ .create = .{
+            .path = "/group/",
+            .data = "child",
+            .time_ms = 4,
+            .sequential = true,
+        } }, 4, 1);
+        defer slash_prefix.deinit(testing.allocator);
+        try testing.expectEqualStrings("/group/0000000000", slash_prefix.created_path.?);
+    }
+
+    {
+        var store = try RocksStore.open(testing.allocator, path);
+        defer store.deinit();
+        var third = try store.apply(.{ .create = .{
+            .path = "/member-",
+            .data = "three",
+            .time_ms = 3,
+            .sequential = true,
+        } }, 5, 1);
+        defer third.deinit(testing.allocator);
+        try testing.expectEqualStrings("/member-0000000003", third.created_path.?);
+    }
 }

@@ -2,7 +2,7 @@ const std = @import("std");
 const jute = @import("../jute.zig");
 const data_tree = @import("data_tree.zig");
 
-pub const version: i32 = 2;
+pub const version: i32 = 3;
 pub const legacy_version: i32 = 1;
 
 pub const Kind = enum(i32) {
@@ -25,6 +25,7 @@ pub const Mutation = union(Kind) {
         ephemeral: bool = false,
         session_id: i64 = 0,
         session_generation: u64 = 0,
+        sequential: bool = false,
     },
     delete: struct {
         path: []const u8,
@@ -81,7 +82,7 @@ pub const ResultView = struct {
 
 pub fn resultCapacity(mutation: Mutation) error{SizeOverflow}!usize {
     return switch (mutation) {
-        .create => |value| std.math.add(usize, 84, value.path.len) catch error.SizeOverflow,
+        .create => |value| std.math.add(usize, 94, value.path.len) catch error.SizeOverflow,
         .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => 12,
         .set_data => 80,
     };
@@ -100,6 +101,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeBool(value.ephemeral);
             try writer.writeLong(value.session_id);
             try writer.writeLong(@bitCast(value.session_generation));
+            try writer.writeBool(value.sequential);
         },
         .delete => |value| {
             try writer.writeString(value.path);
@@ -153,7 +155,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
 pub fn decode(bytes: []const u8) !Mutation {
     var reader = jute.Reader.init(bytes);
     const encoded_version = try reader.readInt();
-    if (encoded_version != legacy_version and encoded_version != version) {
+    if (encoded_version < legacy_version or encoded_version > version) {
         return error.UnsupportedCommandVersion;
     }
     const kind = checkedEnum(Kind, try reader.readInt()) orelse return error.UnknownCommand;
@@ -168,6 +170,7 @@ pub fn decode(bytes: []const u8) !Mutation {
             .ephemeral = if (encoded_version >= 2) try reader.readBool() else false,
             .session_id = if (encoded_version >= 2) try reader.readLong() else 0,
             .session_generation = if (encoded_version >= 2) @bitCast(try reader.readLong()) else 0,
+            .sequential = if (encoded_version >= 3) try reader.readBool() else false,
         } },
         .delete => .{ .delete = .{
             .path = (try reader.readString()) orelse return error.InvalidCommand,
@@ -289,6 +292,21 @@ test "mutation commands and results round trip" {
     try testing.expectEqualStrings("/legacy", legacy_create.create.path);
     try testing.expect(!legacy_create.create.ephemeral);
     try testing.expectEqual(@as(i64, 0), legacy_create.create.session_id);
+
+    var version_two_writer = jute.Writer.init(testing.allocator);
+    defer version_two_writer.deinit();
+    try version_two_writer.writeInt(2);
+    try version_two_writer.writeInt(@intFromEnum(Kind.create));
+    try version_two_writer.writeString("/v2");
+    try version_two_writer.writeBuffer("payload");
+    try version_two_writer.writeLong(456);
+    try version_two_writer.writeBool(true);
+    try version_two_writer.writeLong(42);
+    try version_two_writer.writeLong(7);
+    const version_two_create = try decode(version_two_writer.bytes());
+    try testing.expect(version_two_create.create.ephemeral);
+    try testing.expect(!version_two_create.create.sequential);
+    try testing.expectEqual(@as(u64, 7), version_two_create.create.session_generation);
 
     const response = try encodeResult(testing.allocator, .ok, 7, {});
     defer testing.allocator.free(response);

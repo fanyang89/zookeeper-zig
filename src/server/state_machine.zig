@@ -187,14 +187,15 @@ pub const ZooKeeperStateMachine = struct {
 
         spinLock(&self.mutex);
         defer self.mutex.unlock();
-        const result = self.store.apply(mutation, entry.index, entry.term) catch |err|
+        var result = self.store.apply(mutation, entry.index, entry.term) catch |err|
             return mapStoreError(err);
+        defer result.deinit(self.allocator);
 
         writer.writeInt(@intFromEnum(result.code)) catch unreachable;
         writer.writeLong(zxid) catch unreachable;
         if (result.code == .ok) switch (mutation) {
             .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
-                .path = value.path,
+                .path = result.created_path orelse value.path,
                 .stat = result.stat.?,
             }) catch unreachable,
             .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick => {},

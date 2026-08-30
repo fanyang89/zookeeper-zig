@@ -19,6 +19,13 @@ pub const ErrorCode = enum(i32) {
 pub const MutationResult = struct {
     code: ErrorCode,
     stat: ?protocol.data.Stat = null,
+    created_path: ?[]const u8 = null,
+    owned_created_path: ?[]u8 = null,
+
+    pub fn deinit(self: *MutationResult, allocator: std.mem.Allocator) void {
+        if (self.owned_created_path) |path| allocator.free(path);
+        self.* = undefined;
+    }
 };
 
 pub const Node = struct {

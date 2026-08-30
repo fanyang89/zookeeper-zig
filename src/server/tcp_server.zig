@@ -273,7 +273,7 @@ pub const TcpServer = struct {
             -1,
             .bad_arguments,
         );
-        if (request.flags != 0 and request.flags != 1) return sendError(
+        if (request.flags < 0 or request.flags > 3) return sendError(
             transport,
             self.allocator,
             self.io,
@@ -285,9 +285,10 @@ pub const TcpServer = struct {
             .path = path,
             .data = request.data orelse &.{},
             .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
-            .ephemeral = request.flags == 1,
+            .ephemeral = (request.flags & 1) != 0,
             .session_id = session.id,
             .session_generation = session.generation,
+            .sequential = (request.flags & 2) != 0,
         } }) catch return sendError(
             transport,
             self.allocator,
@@ -815,6 +816,21 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     try testing.expectEqual(@as(usize, 1), children_response.children.?.len);
     try testing.expectEqualStrings("app", children_response.children.?[0].?);
 
+    const sequential_xid = try client.sendRequest(.create2, protocol.proto.CreateRequest{
+        .path = "/member-",
+        .data = "ordered",
+        .acl = null,
+        .flags = 2,
+    });
+    var sequential_reply = try expectResponse(&client, sequential_xid);
+    defer sequential_reply.deinit();
+    const sequential_response = try wire.decodeFrameRecord(
+        protocol.proto.Create2Response,
+        sequential_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqualStrings("/member-0000000003", sequential_response.path.?);
+
     const delete_xid = try client.sendRequest(.delete, protocol.proto.DeleteRequest{
         .path = "/app",
         .version = 1,
@@ -824,13 +840,20 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     try testing.expectEqual(@as(usize, 0), delete_reply.body().len);
 
     const ephemeral_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
-        .path = "/ephemeral",
+        .path = "/ephemeral-",
         .data = "session-owned",
         .acl = null,
-        .flags = 1,
+        .flags = 3,
     });
     var ephemeral_reply = try expectResponse(&client, ephemeral_xid);
     defer ephemeral_reply.deinit();
+    const ephemeral_response = try wire.decodeFrameRecord(
+        protocol.proto.CreateResponse,
+        ephemeral_reply.body(),
+        testing.allocator,
+    );
+    const ephemeral_path = ephemeral_response.path.?;
+    try testing.expect(std.mem.startsWith(u8, ephemeral_path, "/ephemeral-"));
 
     const session_id = client.session.session_id;
     var session_password: [16]u8 = undefined;
@@ -858,11 +881,11 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     client_active = false;
     try server_future.await(testing.io);
     try testing.expect((try quorum.machine.getSession(session_id)) != null);
-    try testing.expect((try quorum.machine.exists("/ephemeral")) != null);
+    try testing.expect((try quorum.machine.exists(ephemeral_path)) != null);
 
     try resumed.close(one_second);
     try resume_future.await(testing.io);
     try testing.expect((try quorum.machine.getSession(session_id)) == null);
-    try testing.expect((try quorum.machine.exists("/ephemeral")) == null);
+    try testing.expect((try quorum.machine.exists(ephemeral_path)) == null);
     try quorum.shutdown();
 }
