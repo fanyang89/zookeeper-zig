@@ -64,6 +64,15 @@ pub fn build(b: *std.Build) void {
             .root_module = server_module,
         });
         b.installArtifact(server);
+
+        const java_interop = b.addSystemCommand(&.{"bash"});
+        java_interop.addFileArg(b.path("tests/interop/java/run.sh"));
+        java_interop.addArtifactArg(server);
+        const test_java_interop = b.step(
+            "test-interop-java",
+            "Test the server with the official Apache ZooKeeper Java client",
+        );
+        test_java_interop.dependOn(&java_interop.step);
     }
 
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");

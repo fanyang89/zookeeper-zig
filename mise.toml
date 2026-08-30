@@ -5,3 +5,9 @@ zig = "0.16.0"
 
 [env]
 ZOOKEEPER_VERSION = "3.9.5"
+
+[tasks.test]
+run = "zig build test --summary all"
+
+[tasks.test-interop-java]
+run = "zig build test-interop-java --summary all"

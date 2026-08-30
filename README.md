@@ -179,15 +179,17 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream `AsyncOpsTest` and
 `ClientTest` methods unchanged. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current selection covers 46
+server starts an isolated Zig server instead. The current selection covers 45
 synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-large-data, sync, and error-code tests; watch and multi tests remain excluded
-until those operations are implemented.
+large-data, sync, and error-code tests; watch, multi, and Java-server-internal
+tests remain excluded.
 
 The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit
-`293c895a8d966a3ecb92872be4a1daf87d725da2`. Git, Maven, Python 3, and a JDK are
-required.
+`293c895a8d966a3ecb92872be4a1daf87d725da2`. Maven Central requests use the
+Aliyun public mirror by default; set `ZOOKEEPER_MAVEN_MIRROR=central` to use
+Central directly or `MAVEN_SETTINGS=/path/to/settings.xml` for custom settings.
+Git, Maven, Python 3, and a JDK are required.
 
 A new cluster can import an Apache ZooKeeper 3.9.5 `dataDir` before its first
 start. The importer restores the newest valid snapshot, replays transaction
