@@ -43,5 +43,10 @@ Jepsen histories and checker output are written under `tests/jepsen/store/`.
 Server data and logs are deleted after successful runs. Failed runs preserve
 server state under `tests/jepsen/target/` and print the tail of each node log.
 
+GitHub Actions runs one 30-second smoke test for matching pushes and pull
+requests. The nightly schedule runs three 120-second tests. Manual runs accept
+workload duration and test-count inputs, and always upload Jepsen reports plus
+preserved failure logs.
+
 This smoke suite injects process failures only. Network partitions, pauses,
 session-expiration workloads, and multi-key workloads belong in later suites.

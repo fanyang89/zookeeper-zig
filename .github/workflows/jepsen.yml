@@ -1,0 +1,82 @@
+name: Jepsen
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/jepsen.yml"
+      - "build.zig"
+      - "build.zig.zon"
+      - "mise.toml"
+      - "src/**"
+      - "tests/jepsen/**"
+  pull_request:
+    paths:
+      - ".github/workflows/jepsen.yml"
+      - "build.zig"
+      - "build.zig.zon"
+      - "mise.toml"
+      - "src/**"
+      - "tests/jepsen/**"
+  schedule:
+    - cron: "17 18 * * *"
+  workflow_dispatch:
+    inputs:
+      time_limit:
+        description: "Workload duration in seconds"
+        required: false
+        default: 30
+        type: number
+      test_count:
+        description: "Number of Jepsen runs"
+        required: false
+        default: 1
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "jepsen-${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  smoke:
+    name: Linearizable register
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || (github.event_name == 'schedule' && '120' || '30') }}
+      JEPSEN_TEST_COUNT: ${{ inputs.test_count || (github.event_name == 'schedule' && '3' || '1') }}
+      JEPSEN_CONCURRENCY: "6"
+      JEPSEN_MAVEN_MIRROR: aliyun
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Cache Leiningen dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zookeeper-zig/jepsen
+          key: jepsen-lein-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/jepsen/project.clj') }}
+          restore-keys: |
+            jepsen-lein-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run Jepsen smoke test
+        run: mise run test-jepsen-smoke
+
+      - name: Upload Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tests/jepsen/store
+            tests/jepsen/target
+          if-no-files-found: warn
+          retention-days: 14
