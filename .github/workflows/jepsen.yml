@@ -60,6 +60,11 @@ jobs:
       - name: Install toolchain
         uses: jdx/mise-action@v4
 
+      - name: Install system RocksDB
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends librocksdb-dev libsnappy-dev pkg-config
+
       - name: Cache Leiningen dependencies
         uses: actions/cache@v4
         with:
@@ -69,7 +74,7 @@ jobs:
             jepsen-lein-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run Jepsen smoke test
-        run: mise run test-jepsen-smoke
+        run: zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
 
       - name: Upload Jepsen results
         if: always()

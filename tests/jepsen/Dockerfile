@@ -9,5 +9,5 @@ RUN if [ "$USE_ALIYUN_MIRRORS" = true ]; then \
             /etc/apt/sources.list.d/ubuntu.sources; \
     fi \
     && apt-get update \
-    && apt-get install -y --no-install-recommends git gnuplot-nox \
+    && apt-get install -y --no-install-recommends git gnuplot-nox librocksdb8.9 \
     && rm -rf /var/lib/apt/lists/*

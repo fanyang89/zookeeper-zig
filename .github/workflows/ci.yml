@@ -26,20 +26,24 @@ jobs:
           - name: Format
             command: mise run fmt-check
             cache-zig: false
+            system-rocksdb: false
             timeout-minutes: 5
           - name: Lint
-            command: mise run lint
+            command: zig build check-zig -Doptimize=ReleaseSafe -Dsystem-rocksdb=true --summary all
             cache-zig: true
+            system-rocksdb: true
             timeout-minutes: 25
           - name: Build
-            command: mise run build -- --summary all
+            command: mise run build -- -Dsystem-rocksdb=true --summary all
             cache-zig: true
+            system-rocksdb: true
             timeout-minutes: 20
           - name: Unit tests
             command: |
-              zig build check-zig --summary all
-              timeout --foreground --kill-after=10s 3m zig build test --summary all
+              zig build check-zig -Dsystem-rocksdb=true --summary all
+              timeout --foreground --kill-after=10s 3m zig build test -Dsystem-rocksdb=true --summary all
             cache-zig: true
+            system-rocksdb: true
             timeout-minutes: 20
 
     steps:
@@ -59,6 +63,12 @@ jobs:
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'build.zig.zon') }}
           restore-keys: |
             zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install system RocksDB
+        if: matrix.system-rocksdb
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends librocksdb-dev libsnappy-dev pkg-config
 
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}

@@ -140,6 +140,17 @@ snapshots under its data directory and stores the applied ZooKeeper tree in
 RocksDB. A synchronous RocksDB write batch atomically commits every mutation
 with its Raft applied index and term.
 
+The default build compiles the pinned RocksDB dependency. Linux distributions
+can instead provide RocksDB through their development package:
+
+```bash
+sudo apt-get install librocksdb-dev libsnappy-dev pkg-config
+zig build -Dsystem-rocksdb=true
+```
+
+The system mode translates the installed `rocksdb/c.h` and dynamically links
+`librocksdb` and `libsnappy`, avoiding the bundled C++ build.
+
 Start a new three-node cluster in three terminals with one shared cluster ID:
 
 ```sh
