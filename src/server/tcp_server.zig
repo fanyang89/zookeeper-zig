@@ -11,6 +11,7 @@ const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
 const quorum_mod = @import("quorum.zig");
+const worker_pool = @import("worker_pool.zig");
 
 const ConnectionSession = struct {
     id: i64,
@@ -97,6 +98,8 @@ const RequestJob = union(enum) {
     dispatch: *DispatchJob,
 };
 
+const RequestPool = worker_pool.WorkerPool(RequestJob, *TcpServer, handleRequestJob);
+
 pub const Options = struct {
     request_worker_count: usize = 0,
     request_queue_capacity: usize = 256,
@@ -107,12 +110,8 @@ pub const TcpServer = struct {
     io: std.Io,
     quorum: *quorum_mod.Quorum,
     address: std.Io.net.IpAddress,
-    request_worker_count: usize,
-    request_queue_buffer: []RequestJob,
-    request_queue: std.Io.Queue(RequestJob),
-    request_workers: std.Io.Group = .init,
+    requests: RequestPool,
     connections: std.Io.Group = .init,
-    started: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -128,23 +127,23 @@ pub const TcpServer = struct {
             @max(std.Thread.getCpuCount() catch 1, 1)
         else
             options.request_worker_count;
-        const request_queue_buffer = try allocator.alloc(RequestJob, options.request_queue_capacity);
         return .{
             .allocator = allocator,
             .io = io,
             .quorum = quorum,
             .address = address,
-            .request_worker_count = request_worker_count,
-            .request_queue_buffer = request_queue_buffer,
-            .request_queue = .init(request_queue_buffer),
+            .requests = try RequestPool.init(
+                allocator,
+                io,
+                request_worker_count,
+                options.request_queue_capacity,
+            ),
         };
     }
 
     pub fn deinit(self: *TcpServer) void {
         self.connections.cancel(self.io);
-        self.request_queue.close(self.io);
-        self.request_workers.await(self.io) catch self.request_workers.cancel(self.io);
-        self.allocator.free(self.request_queue_buffer);
+        self.requests.deinit();
         self.* = undefined;
     }
 
@@ -164,15 +163,7 @@ pub const TcpServer = struct {
     }
 
     fn start(self: *TcpServer) !void {
-        if (self.started) return;
-        errdefer {
-            self.request_queue.close(self.io);
-            self.request_workers.cancel(self.io);
-        }
-        for (0..self.request_worker_count) |_| {
-            try self.request_workers.concurrent(self.io, requestWorkerMain, .{self});
-        }
-        self.started = true;
+        try self.requests.start(self);
     }
 
     fn serveTask(self: *TcpServer, stream: std.Io.net.Stream) std.Io.Cancelable!void {
@@ -236,8 +227,8 @@ pub const TcpServer = struct {
         connect: wire.DecodedConnectRequest,
     ) !?ConnectionSession {
         var job = EstablishJob{ .connect = connect };
-        self.request_queue.putOne(self.io, .{ .establish = &job }) catch |err| switch (err) {
-            error.Closed => return error.ServerStopped,
+        self.requests.submit(.{ .establish = &job }) catch |err| switch (err) {
+            error.Closed, error.WorkerPoolNotStarted => return error.ServerStopped,
             error.Canceled => return error.Canceled,
         };
         job.done.wait(self.io) catch |err| {
@@ -270,8 +261,8 @@ pub const TcpServer = struct {
             .opcode = opcode,
             .body = body,
         };
-        self.request_queue.putOne(self.io, .{ .dispatch = &job }) catch |err| switch (err) {
-            error.Closed => return error.ServerStopped,
+        self.requests.submit(.{ .dispatch = &job }) catch |err| switch (err) {
+            error.Closed, error.WorkerPoolNotStarted => return error.ServerStopped,
             error.Canceled => return error.Canceled,
         };
         job.done.wait(self.io) catch |err| {
@@ -992,16 +983,10 @@ pub const TcpServer = struct {
     }
 };
 
-fn requestWorkerMain(server: *TcpServer) std.Io.Cancelable!void {
-    while (true) {
-        const job = server.request_queue.getOne(server.io) catch |err| switch (err) {
-            error.Closed => return,
-            error.Canceled => return error.Canceled,
-        };
-        switch (job) {
-            .establish => |establish_job| completeEstablishJob(server, establish_job),
-            .dispatch => |dispatch_job| completeDispatchJob(server, dispatch_job),
-        }
+fn handleRequestJob(server: *TcpServer, job: RequestJob) void {
+    switch (job) {
+        .establish => |establish_job| completeEstablishJob(server, establish_job),
+        .dispatch => |dispatch_job| completeDispatchJob(server, dispatch_job),
     }
 }
 
