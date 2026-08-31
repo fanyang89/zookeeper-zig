@@ -2,5 +2,7 @@
 zig-out/
 zig-pkg/
 __pycache__/
+tests/jepsen/store/
+tests/jepsen/target/
 .pi/
 .mise.local.toml

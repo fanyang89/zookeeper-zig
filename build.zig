@@ -74,6 +74,15 @@ pub fn build(b: *std.Build) void {
             "Test the server with the official Apache ZooKeeper Java client",
         );
         test_java_interop.dependOn(&java_interop.step);
+
+        const jepsen_smoke = b.addSystemCommand(&.{"bash"});
+        jepsen_smoke.addFileArg(b.path("tests/jepsen/run.sh"));
+        jepsen_smoke.addArtifactArg(server);
+        const test_jepsen_smoke = b.step(
+            "test-jepsen-smoke",
+            "Run the Jepsen linearizable register smoke test",
+        );
+        test_jepsen_smoke.dependOn(&jepsen_smoke.step);
     }
 
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");

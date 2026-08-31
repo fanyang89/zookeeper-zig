@@ -198,6 +198,21 @@ Aliyun public mirror by default; set `ZOOKEEPER_MAVEN_MIRROR=central` to use
 Central directly or `MAVEN_SETTINGS=/path/to/settings.xml` for custom settings.
 Git, Maven, Python 3, and a JDK are required.
 
+## Jepsen
+
+Run the three-node linearizable-register smoke test with:
+
+```sh
+mise run test-jepsen-smoke
+```
+
+Jepsen uses the official ZooKeeper 3.9.5 Java client while repeatedly killing
+and restarting one quorum member. Concurrent read, write, and versioned CAS
+histories are checked with Knossos. The runner uses Leiningen when installed,
+or Docker/Podman with host networking; it does not require SSH or root. See
+[`tests/jepsen/README.md`](tests/jepsen/README.md) for configuration and
+current scope.
+
 A new cluster can import an Apache ZooKeeper 3.9.5 `dataDir` before its first
 start. The importer restores the newest valid snapshot, replays transaction
 logs, and retains resumable sessions and ephemeral nodes. See
