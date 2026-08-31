@@ -58,8 +58,8 @@ The container runner uses host networking and builds the local
 `zookeeper-zig-jepsen:0.3` image from `Dockerfile`. Its Noble-based
 Clojure/Leiningen base image is digest-pinned, and Git plus gnuplot are
 installed for Jepsen reports. Local runs use Aliyun mirrors for Ubuntu packages
-and Maven Central artifacts by default; Clojars remains the source for Jepsen
-artifacts. GitHub Actions uses the official upstream repositories. Set
+and Maven Central artifacts plus the TUNA Clojars mirror by default. GitHub
+Actions uses the official upstream repositories. Set
 `JEPSEN_MAVEN_MIRROR=central` and `JEPSEN_USE_ALIYUN_MIRRORS=false` to select
 the same behavior locally. Override the runtime or use a prebuilt image with
 `JEPSEN_RUNNER` and `JEPSEN_IMAGE`.

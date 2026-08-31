@@ -12,4 +12,7 @@
   :profiles {:aliyun
              {:mirrors {"central"
                         {:name "aliyun-public"
-                         :url "https://maven.aliyun.com/repository/public"}}}})
+                         :url "https://maven.aliyun.com/repository/public"}
+                        "clojars"
+                        {:name "tuna-clojars"
+                         :url "https://mirrors.tuna.tsinghua.edu.cn/clojars/"}}}})
