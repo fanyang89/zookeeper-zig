@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const jute = @import("../jute.zig");
 const proto = @import("../protocol/proto.zig");
 const wire = @import("../wire.zig");
@@ -9,6 +10,23 @@ const TcpTransport = @import("tcp_transport.zig").TcpTransport;
 pub const Inbound = blocking.Inbound;
 pub const RequestFuture = std.Io.Future(anyerror!Inbound);
 const ReaderFuture = std.Io.Future(std.Io.Cancelable!void);
+
+const TestStage = enum(u8) {
+    idle,
+    close_queued,
+    close_received,
+    close_sent,
+    reply_read,
+    reply_queued,
+    reply_received,
+    close_completed,
+};
+
+var test_stage: std.atomic.Value(TestStage) = .init(.idle);
+
+fn recordTestStage(stage: TestStage) void {
+    if (builtin.is_test) test_stage.store(stage, .release);
+}
 
 pub const Options = struct {
     connection: blocking.Options = .{},
@@ -175,7 +193,19 @@ pub const AsyncClient = struct {
             error.Closed => return self.terminal_error orelse error.ConnectionLoss,
             error.Canceled => return error.Canceled,
         };
+        recordTestStage(.close_queued);
         call.done.waitTimeout(self.io, call.deadline) catch |err| {
+            if (builtin.is_test) {
+                std.debug.print(
+                    "async close timeout: stage={s} pending={} terminated={} terminal={?}\n",
+                    .{
+                        @tagName(test_stage.load(.acquire)),
+                        self.core.session.pendingCount(),
+                        self.terminated.isSet(),
+                        self.terminal_error,
+                    },
+                );
+            }
             self.stopBackgroundTasks();
             return err;
         };
@@ -296,6 +326,7 @@ pub const AsyncClient = struct {
 
     fn stopBackgroundTasks(self: *AsyncClient) void {
         if (!self.tasks_running) return;
+        self.core.transport.shutdown(self.io);
         self.tasks.cancel(self.io);
         self.stopReader();
         self.core.transport.close(self.io);
@@ -411,6 +442,7 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
                 waiters.putAssumeCapacity(xid, call);
             },
             .close => |call| {
+                recordTestStage(.close_received);
                 if (close_call != null) {
                     completeClose(call, .{ .failure = error.ConnectionLoss }, client.io);
                     continue;
@@ -425,8 +457,10 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
                 };
                 call.xid = xid;
                 close_call = call;
+                recordTestStage(.close_sent);
             },
             .inbound => |payload| {
+                recordTestStage(.reply_received);
                 var inbound = acceptPayload(client, payload) catch |err| {
                     terminal = err;
                     return;
@@ -438,6 +472,7 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
                                 inbound.deinit();
                                 client.core.session.markClosed();
                                 completeClose(call, .success, client.io);
+                                recordTestStage(.close_completed);
                                 close_call = null;
                                 terminal = error.Closed;
                                 return;
@@ -520,13 +555,14 @@ fn readerMain(client: *AsyncClient) std.Io.Cancelable!void {
                 .none, .duration => continue,
             },
             else => {
-                client.events.putOne(client.io, .{ .read_failure = err }) catch |put_err| switch (put_err) {
+                client.events.putOne(client.io, .{ .read_failure = error.ConnectionLoss }) catch |put_err| switch (put_err) {
                     error.Canceled => return error.Canceled,
                     error.Closed => return,
                 };
                 return;
             },
         };
+        recordTestStage(.reply_read);
         client.events.putOne(client.io, .{ .inbound = payload }) catch |err| {
             client.allocator.free(payload);
             switch (err) {
@@ -534,6 +570,7 @@ fn readerMain(client: *AsyncClient) std.Io.Cancelable!void {
                 error.Closed => return,
             }
         };
+        recordTestStage(.reply_queued);
     }
 }
 
@@ -561,7 +598,6 @@ fn shutdownEngine(
     client.terminal_error = terminal;
     client.events.close(client.io);
     client.notifications.close(client.io);
-    client.core.transport.shutdown(client.io);
 
     if (client.core.session.state.isConnected()) {
         client.core.session.disconnect(if (terminal == error.SessionExpired) .session_expired else .connection_loss);
@@ -849,12 +885,15 @@ test "async client disconnects instead of blocking on notification overflow" {
         },
         .{},
     );
-    defer client.deinit();
+    var client_live = true;
+    defer if (client_live) client.deinit();
 
     try client.terminated.wait(testing.io);
     var notification = try client.receiveNotification();
     notification.deinit();
     try testing.expectError(error.NotificationQueueFull, client.receiveNotification());
+    client.deinit();
+    client_live = false;
     try server_future.await(testing.io);
 }
 
