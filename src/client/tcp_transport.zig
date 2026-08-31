@@ -67,6 +67,11 @@ pub const TcpTransport = struct {
         return .{ .stream = stream };
     }
 
+    pub fn shutdown(self: *TcpTransport, io: std.Io) void {
+        if (self.closed) return;
+        self.stream.shutdown(io, .both) catch {};
+    }
+
     pub fn close(self: *TcpTransport, io: std.Io) void {
         if (self.closed) return;
         self.stream.close(io);

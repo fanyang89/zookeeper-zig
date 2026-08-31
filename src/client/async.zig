@@ -115,10 +115,7 @@ pub const AsyncClient = struct {
     /// transport, and releases queued notifications.
     pub fn deinit(self: *AsyncClient) void {
         self.beginShutdown();
-        if (self.tasks_running) {
-            self.tasks.cancel(self.io);
-            self.tasks_running = false;
-        }
+        self.stopBackgroundTasks();
         self.waitForOperations();
         self.drainNotifications();
         self.core.deinit();
@@ -179,9 +176,7 @@ pub const AsyncClient = struct {
             error.Canceled => return error.Canceled,
         };
         call.done.waitTimeout(self.io, call.deadline) catch |err| {
-            self.tasks.cancel(self.io);
-            self.tasks_running = false;
-            call.done.waitUncancelable(self.io);
+            self.stopBackgroundTasks();
             return err;
         };
         const result: anyerror!void = switch (call.completion) {
@@ -190,8 +185,7 @@ pub const AsyncClient = struct {
             .failure => |err| err,
         };
         try result;
-        self.tasks.cancel(self.io);
-        self.tasks_running = false;
+        self.stopBackgroundTasks();
     }
 
     fn start(
@@ -222,10 +216,11 @@ pub const AsyncClient = struct {
         self.reader = try io.concurrent(readerMain, .{self});
         self.tasks.concurrent(io, engineMain, .{self}) catch |err| {
             self.stopReader();
+            self.tasks_running = false;
             return err;
         };
         self.tasks.concurrent(io, timerMain, .{self}) catch |err| {
-            self.tasks.cancel(io);
+            self.stopBackgroundTasks();
             return err;
         };
         return self;
@@ -297,6 +292,14 @@ pub const AsyncClient = struct {
         } else |err| switch (err) {
             error.Closed => {},
         }
+    }
+
+    fn stopBackgroundTasks(self: *AsyncClient) void {
+        if (!self.tasks_running) return;
+        self.tasks.cancel(self.io);
+        self.stopReader();
+        self.core.transport.close(self.io);
+        self.tasks_running = false;
     }
 
     fn stopReader(self: *AsyncClient) void {
@@ -433,8 +436,6 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
                         if (close_call) |call| {
                             if (call.xid == inbound.header.xid and response.opcode == .close_session) {
                                 inbound.deinit();
-                                client.stopReader();
-                                client.core.transport.close(client.io);
                                 client.core.session.markClosed();
                                 completeClose(call, .success, client.io);
                                 close_call = null;
@@ -560,9 +561,8 @@ fn shutdownEngine(
     client.terminal_error = terminal;
     client.events.close(client.io);
     client.notifications.close(client.io);
+    client.core.transport.shutdown(client.io);
 
-    client.stopReader();
-    client.core.transport.close(client.io);
     if (client.core.session.state.isConnected()) {
         client.core.session.disconnect(if (terminal == error.SessionExpired) .session_expired else .connection_loss);
     }
@@ -696,7 +696,7 @@ test "async client pipelines requests and delivers notifications" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(asyncServerFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(asyncServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const io_timeout: std.Io.Timeout = .{ .duration = .{
@@ -704,7 +704,7 @@ test "async client pipelines requests and delivers notifications" {
         .clock = .awake,
     } };
     const close_timeout: std.Io.Timeout = .{ .duration = .{
-        .raw = .fromSeconds(10),
+        .raw = .fromSeconds(3),
         .clock = .awake,
     } };
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -828,7 +828,7 @@ test "async client disconnects instead of blocking on notification overflow" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(notificationOverflowServerFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(notificationOverflowServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{
@@ -874,7 +874,7 @@ test "async deinit completes an outstanding request future" {
     const port = std.mem.bigToNative(u16, local_address.port);
 
     var request_received: std.Io.Event = .unset;
-    var server_future = testing.io.async(pendingServerFixture, .{ &server, testing.io, &request_received });
+    var server_future = try testing.io.concurrent(pendingServerFixture, .{ &server, testing.io, &request_received });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{
