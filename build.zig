@@ -108,6 +108,15 @@ pub fn build(b: *std.Build) void {
             "Run the Jepsen linearizable register smoke test",
         );
         test_jepsen_smoke.dependOn(&jepsen_smoke.step);
+
+        const jepsen_suite = b.addSystemCommand(&.{"bash"});
+        jepsen_suite.addFileArg(b.path("tests/jepsen/run-all.sh"));
+        jepsen_suite.addArtifactArg(server);
+        const test_jepsen = b.step(
+            "test-jepsen",
+            "Run the full Jepsen workload and nemesis suite",
+        );
+        test_jepsen.dependOn(&jepsen_suite.step);
     }
 
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");

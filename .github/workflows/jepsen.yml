@@ -29,10 +29,18 @@ on:
         default: 30
         type: number
       test_count:
-        description: "Number of Jepsen runs"
+        description: "Number of runs per Jepsen configuration"
         required: false
         default: 1
         type: number
+      suite:
+        description: "Jepsen coverage"
+        required: false
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
 
 permissions:
   contents: read
@@ -42,13 +50,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  smoke:
-    name: Linearizable register
+  jepsen:
+    name: Jepsen ${{ github.event_name == 'schedule' && 'full suite' || inputs.suite || 'smoke' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || (github.event_name == 'schedule' && '120' || '30') }}
-      JEPSEN_TEST_COUNT: ${{ inputs.test_count || (github.event_name == 'schedule' && '3' || '1') }}
+      JEPSEN_TEST_COUNT: ${{ inputs.test_count || '1' }}
+      JEPSEN_COMMAND: ${{ (github.event_name == 'schedule' || inputs.suite == 'full') && 'test-all' || 'test' }}
       JEPSEN_CONCURRENCY: "6"
       JEPSEN_MAVEN_MIRROR: central
       JEPSEN_USE_ALIYUN_MIRRORS: "false"
@@ -73,8 +82,13 @@ jobs:
           restore-keys: |
             jepsen-lein-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Run Jepsen smoke test
-        run: zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
+      - name: Run Jepsen tests
+        run: |
+          if [[ "$JEPSEN_COMMAND" == test-all ]]; then
+            zig build test-jepsen -Dsystem-rocksdb=true --summary all
+          else
+            zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
+          fi
 
       - name: Upload Jepsen results
         if: always()

@@ -230,18 +230,20 @@ watches, multi operations, or Java server internals remain excluded.
 
 ## Jepsen
 
-Run the three-node linearizable-register smoke test with:
+Run the three-node linearizable-register smoke test or the full suite with:
 
 ```sh
 mise run test-jepsen-smoke
+mise run test-jepsen
 ```
 
-Jepsen uses the official ZooKeeper 3.9.5 Java client while repeatedly killing
-and restarting one quorum member. Concurrent read, write, and versioned CAS
-histories are checked with Knossos. The runner uses Leiningen when installed,
-or Docker/Podman with host networking; it does not require SSH or root. See
-[`tests/jepsen/README.md`](tests/jepsen/README.md) for configuration and
-current scope.
+Jepsen uses the official ZooKeeper 3.9.5 Java client. The full suite checks a
+CAS register, independent multi-key registers, create/delete presence, and
+child-set behavior under repeated server kills. It also pauses and resumes one
+server process while exercising the register. The runner uses Leiningen when
+installed, or Docker/Podman with host networking; it does not require SSH or
+root. See [`tests/jepsen/README.md`](tests/jepsen/README.md) for configuration
+and current scope.
 
 A new cluster can import an Apache ZooKeeper 3.9.5 `dataDir` before its first
 start. The importer restores the newest valid snapshot, replays transaction

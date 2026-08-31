@@ -1,6 +1,7 @@
 (ns zookeeper-zig.client
   (:require [clojure.string :as str]
             [jepsen.client :as client]
+            [jepsen.independent :as independent]
             [zookeeper-zig.cluster :as cluster])
   (:import (java.nio.charset StandardCharsets)
            (org.apache.zookeeper CreateMode KeeperException KeeperException$Code
@@ -9,6 +10,9 @@
            (org.apache.zookeeper.data Stat)))
 
 (def register-path "/jepsen-register")
+(def independent-register-prefix "/jepsen-register-")
+(def set-path "/jepsen-set")
+(def presence-path "/jepsen-presence")
 (def session-timeout-ms 10000)
 (def connect-timeout-ms 30000)
 
@@ -50,46 +54,70 @@
                         {:connect-string connect-string}))))))
 
 (defn- read-value
-  [^ZooKeeper zk]
+  [^ZooKeeper zk path]
   (try
-    (decode-value (.getData zk register-path false nil))
+    (decode-value (.getData zk path false nil))
     (catch org.apache.zookeeper.KeeperException$NoNodeException _
       nil)))
 
 (defn- write-value!
-  [^ZooKeeper zk value]
+  [^ZooKeeper zk path value]
   (let [data (encode-value value)]
     (try
-      (.setData zk register-path data -1)
+      (.setData zk path data -1)
       (catch org.apache.zookeeper.KeeperException$NoNodeException _
         (try
-          (.create zk register-path data ZooDefs$Ids/OPEN_ACL_UNSAFE
+          (.create zk path data ZooDefs$Ids/OPEN_ACL_UNSAFE
                    CreateMode/PERSISTENT)
           (catch org.apache.zookeeper.KeeperException$NodeExistsException _
-            (.setData zk register-path data -1))))))
+            (.setData zk path data -1))))))
   :ok)
 
 (defn- cas-value!
-  [^ZooKeeper zk expected new-value]
+  [^ZooKeeper zk path expected new-value]
   (if (nil? expected)
     (try
-      (.create zk register-path (encode-value new-value)
+      (.create zk path (encode-value new-value)
                ZooDefs$Ids/OPEN_ACL_UNSAFE CreateMode/PERSISTENT)
       :ok
       (catch org.apache.zookeeper.KeeperException$NodeExistsException _
         :fail))
     (try
       (let [stat (Stat.)
-            actual (decode-value (.getData zk register-path false stat))]
+            actual (decode-value (.getData zk path false stat))]
         (if (= expected actual)
           (try
-            (.setData zk register-path (encode-value new-value) (.getVersion stat))
+            (.setData zk path (encode-value new-value) (.getVersion stat))
             :ok
             (catch org.apache.zookeeper.KeeperException$BadVersionException _
               :fail))
           :fail))
       (catch org.apache.zookeeper.KeeperException$NoNodeException _
         :fail))))
+
+(defn register-path-for-key
+  [key]
+  (str independent-register-prefix key))
+
+(defn- invoke-register!
+  [^ZooKeeper zk path op]
+  (case (:f op)
+    :read (assoc op :type :ok :value (read-value zk path))
+    :write (assoc op :type (write-value! zk path (:value op)))
+    :cas (let [[expected new-value] (:value op)]
+           (assoc op :type (cas-value! zk path expected new-value)))))
+
+(defn- invoke-client!
+  [op f]
+  (try
+    (f)
+    (catch KeeperException error
+      (assoc op
+             :type (if (transient-error? error) :info :fail)
+             :error (error-keyword error)))
+    (catch InterruptedException _
+      (.interrupt (Thread/currentThread))
+      (assoc op :type :info :error :interrupted))))
 
 (defrecord RegisterClient [cluster zk]
   client/Client
@@ -100,19 +128,161 @@
     this)
 
   (invoke! [_ _ op]
+    (invoke-client! op #(invoke-register! zk register-path op)))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
+(defrecord IndependentRegisterClient [cluster zk]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(let [[k value] (:value op)
+            path (register-path-for-key k)
+            logical-op (assoc op :value value)
+            result (invoke-register! zk path logical-op)]
+        (assoc result :value (independent/tuple k (:value result))))))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
+(defn- ensure-set-root!
+  [^ZooKeeper zk]
+  (try
+    (.create zk set-path (byte-array 0) ZooDefs$Ids/OPEN_ACL_UNSAFE
+             CreateMode/PERSISTENT)
+    (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+      set-path)))
+
+(defn- add-element!
+  [^ZooKeeper zk element]
+  (ensure-set-root! zk)
+  (try
+    (.create zk (str set-path "/" element) (byte-array 0)
+             ZooDefs$Ids/OPEN_ACL_UNSAFE CreateMode/PERSISTENT)
+    (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+      nil))
+  :ok)
+
+(defn- read-set
+  [^ZooKeeper zk]
+  (try
+    (->> (.getChildren zk set-path false)
+         (map #(Long/parseLong %))
+         set)
+    (catch org.apache.zookeeper.KeeperException$NoNodeException _
+      #{})))
+
+(defrecord SetClient [cluster zk]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    (ensure-set-root! zk)
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(case (:f op)
+        :add (assoc op :type (add-element! zk (:value op)))
+        :read (assoc op :type :ok :value (read-set zk)))))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
+(defn- presence-value
+  [^ZooKeeper zk]
+  (when (.exists zk presence-path false)
+    true))
+
+(defn- create-presence!
+  [^ZooKeeper zk]
+  (try
+    (.create zk presence-path (byte-array 0) ZooDefs$Ids/OPEN_ACL_UNSAFE
+             CreateMode/PERSISTENT)
+    (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+      nil))
+  :ok)
+
+(defn- delete-presence!
+  [^ZooKeeper zk]
+  (try
+    (.delete zk presence-path -1)
+    (catch org.apache.zookeeper.KeeperException$NoNodeException _
+      nil))
+  :ok)
+
+(defn- cas-presence!
+  [^ZooKeeper zk expected new-value]
+  (cond
+    (= expected new-value)
+    (if (= expected (presence-value zk)) :ok :fail)
+
+    (and (nil? expected) (= true new-value))
     (try
-      (case (:f op)
-        :read (assoc op :type :ok :value (read-value zk))
-        :write (assoc op :type (write-value! zk (:value op)))
+      (.create zk presence-path (byte-array 0) ZooDefs$Ids/OPEN_ACL_UNSAFE
+               CreateMode/PERSISTENT)
+      :ok
+      (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+        :fail))
+
+    (and (= true expected) (nil? new-value))
+    (try
+      (let [stat (.exists zk presence-path false)]
+        (if stat
+          (try
+            (.delete zk presence-path (.getVersion ^Stat stat))
+            :ok
+            (catch org.apache.zookeeper.KeeperException$BadVersionException _
+              :fail)
+            (catch org.apache.zookeeper.KeeperException$NoNodeException _
+              :fail))
+          :fail))
+      (catch org.apache.zookeeper.KeeperException$NoNodeException _
+        :fail))
+
+    :else
+    :fail))
+
+(defrecord PresenceClient [cluster zk]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(case (:f op)
+        :read (assoc op :type :ok :value (presence-value zk))
+        :write (assoc op :type (if (:value op)
+                                 (create-presence! zk)
+                                 (delete-presence! zk)))
         :cas (let [[expected new-value] (:value op)]
-               (assoc op :type (cas-value! zk expected new-value))))
-      (catch KeeperException error
-        (assoc op
-               :type (if (transient-error? error) :info :fail)
-               :error (error-keyword error)))
-      (catch InterruptedException _
-        (.interrupt (Thread/currentThread))
-        (assoc op :type :info :error :interrupted))))
+               (assoc op :type (cas-presence! zk expected new-value))))))
 
   (teardown! [this _]
     this)
@@ -124,3 +294,15 @@
 (defn register-client
   [cluster]
   (->RegisterClient cluster nil))
+
+(defn independent-register-client
+  [cluster]
+  (->IndependentRegisterClient cluster nil))
+
+(defn set-client
+  [cluster]
+  (->SetClient cluster nil))
+
+(defn presence-client
+  [cluster]
+  (->PresenceClient cluster nil))

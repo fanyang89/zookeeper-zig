@@ -26,3 +26,6 @@ run = "zig build test-upstream-server --summary all"
 
 [tasks.test-jepsen-smoke]
 run = "zig build test-jepsen-smoke --summary all"
+
+[tasks.test-jepsen]
+run = "zig build test-jepsen --summary all"

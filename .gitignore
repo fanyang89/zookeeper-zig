@@ -4,5 +4,6 @@ zig-pkg/
 __pycache__/
 tests/jepsen/store/
 tests/jepsen/target/
+tests/jepsen/.lein-failures
 .pi/
 .mise.local.toml

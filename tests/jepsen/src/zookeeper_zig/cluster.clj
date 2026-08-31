@@ -117,11 +117,55 @@
                 (swap! (:state cluster) dissoc node)
                 (throw error)))))))))
 
+(defn- signal-process!
+  [^Process process signal]
+  (let [command ["kill" (str "-" signal) (str (.pid process))]
+        signal-process (.start (ProcessBuilder. ^java.util.List command))]
+    (when-not (.waitFor signal-process 10 TimeUnit/SECONDS)
+      (.destroyForcibly signal-process)
+      (throw (ex-info "Timed out signaling ZooKeeper Zig node"
+                      {:pid (.pid process) :signal signal})))
+    (when-not (zero? (.exitValue signal-process))
+      (throw (ex-info "Failed to signal ZooKeeper Zig node"
+                      {:pid (.pid process)
+                       :signal signal
+                       :exit (.exitValue signal-process)})))))
+
+(defn pause-node!
+  [cluster node]
+  (locking (:state cluster)
+    (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
+      (cond
+        paused? :already-paused
+        (not (.isAlive ^Process process)) :already-stopped
+        :else
+        (do
+          (signal-process! process "STOP")
+          (swap! (:state cluster) assoc-in [node :paused?] true)
+          (info "Paused ZooKeeper Zig node" node)
+          :paused))
+      :already-stopped)))
+
+(defn resume-node!
+  [cluster node]
+  (locking (:state cluster)
+    (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
+      (if paused?
+        (do
+          (signal-process! process "CONT")
+          (swap! (:state cluster) assoc-in [node :paused?] false)
+          (info "Resumed ZooKeeper Zig node" node)
+          :resumed)
+        :already-running)
+      :already-stopped)))
+
 (defn- terminate-node!
   [cluster node force?]
   (locking (:state cluster)
-    (if-let [process (get-in @(:state cluster) [node :process])]
+    (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
       (do
+        (when paused?
+          (signal-process! process "CONT"))
         (swap! (:state cluster) dissoc node)
         (if force?
           (.destroyForcibly ^Process process)
