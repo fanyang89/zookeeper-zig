@@ -33,7 +33,7 @@ pub const Quorum = struct {
     io: std.Io,
     options: Options,
     machine: state_machine.ZooKeeperStateMachine,
-    transport: *raft.GrpcLiteTransport,
+    owned_transport: ?*raft.GrpcLiteTransport,
     raftor: *raft.Raftor,
     driver_thread: std.Thread,
     session_reaper_thread: std.Thread,
@@ -42,21 +42,60 @@ pub const Quorum = struct {
     driver_failed: std.atomic.Value(bool) = .init(false),
     running: bool = false,
 
+    fn validateOptions(options: Options) !void {
+        if (options.tick_interval_ms == 0 or options.heartbeat_tick == 0 or
+            options.election_tick <= options.heartbeat_tick or
+            options.session_reap_interval_ms == 0 or
+            options.session_reap_interval_ms > std.math.maxInt(i32)) return error.InvalidConfig;
+    }
+
     pub fn create(
         allocator: std.mem.Allocator,
         io: std.Io,
         config: *const config_mod.ServerConfig,
         options: Options,
     ) !*Quorum {
-        if (options.tick_interval_ms == 0 or options.heartbeat_tick == 0 or
-            options.election_tick <= options.heartbeat_tick or
-            options.session_reap_interval_ms == 0 or
-            options.session_reap_interval_ms > std.math.maxInt(i32)) return error.InvalidConfig;
+        try validateOptions(options);
+        const max_transport_message = state_machine.max_snapshot_bytes + 1024 * 1024;
+        const transport = try raft.GrpcLiteTransport.create(allocator, .{
+            .identity = .{ .cluster_id = config.cluster_id, .node_id = config.node_id },
+            .listen_addr = config.raft_listen,
+            .stream_limits = .{
+                .max_message_size = max_transport_message,
+                .max_inbound_buffer_size = max_transport_message + 5,
+                .max_outbound_buffer_size = max_transport_message + 5,
+            },
+            .mailbox_max_bytes = max_transport_message * 2,
+        });
+        errdefer transport.destroy();
+        return createInternal(allocator, io, config, options, transport.transport(), transport);
+    }
+
+    pub fn createWithTransport(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: *const config_mod.ServerConfig,
+        options: Options,
+        transport: raft.Transport,
+    ) !*Quorum {
+        try validateOptions(options);
+        return createInternal(allocator, io, config, options, transport, null);
+    }
+
+    fn createInternal(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: *const config_mod.ServerConfig,
+        options: Options,
+        transport: raft.Transport,
+        owned_transport: ?*raft.GrpcLiteTransport,
+    ) !*Quorum {
         const self = try allocator.create(Quorum);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.io = io;
         self.options = options;
+        self.owned_transport = owned_transport;
         self.driver_stop = .init(false);
         self.session_reaper_stop = .init(false);
         self.driver_failed = .init(false);
@@ -70,19 +109,6 @@ pub const Quorum = struct {
         defer allocator.free(state_dir);
         self.machine = try state_machine.ZooKeeperStateMachine.init(allocator, state_dir);
         errdefer self.machine.deinit();
-
-        const max_transport_message = state_machine.max_snapshot_bytes + 1024 * 1024;
-        self.transport = try raft.GrpcLiteTransport.create(allocator, .{
-            .identity = .{ .cluster_id = config.cluster_id, .node_id = config.node_id },
-            .listen_addr = config.raft_listen,
-            .stream_limits = .{
-                .max_message_size = max_transport_message,
-                .max_inbound_buffer_size = max_transport_message + 5,
-                .max_outbound_buffer_size = max_transport_message + 5,
-            },
-            .mailbox_max_bytes = max_transport_message * 2,
-        });
-        errdefer self.transport.destroy();
 
         var raft_config: raft.RaftorConfig = .{};
         raft_config.raft.id = config.node_id;
@@ -106,7 +132,7 @@ pub const Quorum = struct {
             allocator,
             raft_config,
             self.machine.stateMachine(),
-            self.transport.transport(),
+            transport,
         );
         errdefer self.raftor.destroy();
 
@@ -139,7 +165,7 @@ pub const Quorum = struct {
     pub fn deinit(self: *Quorum) void {
         std.debug.assert(!self.running);
         self.raftor.destroy();
-        self.transport.destroy();
+        if (self.owned_transport) |transport| transport.destroy();
         self.machine.deinit();
         const allocator = self.allocator;
         allocator.destroy(self);
