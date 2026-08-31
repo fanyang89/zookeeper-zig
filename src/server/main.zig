@@ -10,6 +10,8 @@ const usage =
     \\  --raft-listen IPV4:PORT \\
     \\  --data-dir PATH \\
     \\  [--raft-advertise IPV4:PORT] \\
+    \\  [--client-request-workers COUNT] \\
+    \\  [--client-request-queue-capacity COUNT] \\
     \\  [--import-zookeeper-data-dir PATH] \\
     \\  [--import-zookeeper-log-dir PATH] \\
     \\  [--peer ID=IPV4:PORT ...] [--join]
@@ -58,7 +60,12 @@ pub fn main(init: std.process.Init) !void {
         quorum,
         config.client_host,
         config.client_port,
+        .{
+            .request_worker_count = config.client_request_workers,
+            .request_queue_capacity = config.client_request_queue_capacity,
+        },
     );
+    defer server.deinit();
     raft.log.info(
         @src(),
         "ZooKeeper quorum node {} listening for clients on {s}:{} and Raft on {s}",

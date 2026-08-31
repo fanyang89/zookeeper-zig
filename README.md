@@ -163,8 +163,13 @@ enforcement, Connect, ping, closeSession, create/create2/createContainer/createT
 delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2, and
 sync. Reads use Raft ReadIndex before accessing RocksDB. Session close and
 expiration atomically remove all session-owned ephemeral nodes. ACLs support
-`world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks. IPv6
-ACL identities, SASL, watches, and multi operations are not implemented yet.
+`world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks.
+Connection establishment and client requests pass through a bounded
+`std.Io.Queue` and a fixed worker pool before entering Raft or RocksDB. The
+worker count defaults to the number of logical CPUs and the queue capacity
+defaults to 256; override them with `--client-request-workers` and
+`--client-request-queue-capacity`. IPv6 ACL identities, SASL, watches, and multi
+operations are not implemented yet.
 
 ## Java client interoperability
 

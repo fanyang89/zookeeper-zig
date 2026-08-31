@@ -7,6 +7,8 @@ pub const ServerConfig = struct {
     cluster_id: raft.ClusterId,
     client_host: []u8,
     client_port: u16,
+    client_request_workers: usize,
+    client_request_queue_capacity: usize,
     raft_listen: []u8,
     raft_advertise: []u8,
     data_dir: []u8,
@@ -32,6 +34,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var node_id: ?u64 = null;
     var cluster_id: ?raft.ClusterId = null;
     var client_listen: ?[]const u8 = null;
+    var client_request_workers: usize = 0;
+    var client_request_queue_capacity: usize = 256;
     var raft_listen: ?[]const u8 = null;
     var raft_advertise: ?[]const u8 = null;
     var data_dir: ?[]const u8 = null;
@@ -57,6 +61,12 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             cluster_id = try parseClusterId(value);
         } else if (std.mem.eql(u8, argument, "--client-listen")) {
             client_listen = value;
+        } else if (std.mem.eql(u8, argument, "--client-request-workers")) {
+            client_request_workers = try std.fmt.parseUnsigned(usize, value, 10);
+            if (client_request_workers == 0) return error.InvalidClientRequestWorkers;
+        } else if (std.mem.eql(u8, argument, "--client-request-queue-capacity")) {
+            client_request_queue_capacity = try std.fmt.parseUnsigned(usize, value, 10);
+            if (client_request_queue_capacity == 0) return error.InvalidClientRequestQueueCapacity;
         } else if (std.mem.eql(u8, argument, "--raft-listen")) {
             raft_listen = value;
         } else if (std.mem.eql(u8, argument, "--raft-advertise")) {
@@ -138,6 +148,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .cluster_id = cluster_id orelse return error.ClusterIdRequired,
         .client_host = client_host,
         .client_port = client_endpoint.port,
+        .client_request_workers = client_request_workers,
+        .client_request_queue_capacity = client_request_queue_capacity,
         .raft_listen = owned_raft_listen,
         .raft_advertise = owned_advertise,
         .data_dir = owned_data_dir,
@@ -202,16 +214,18 @@ fn parseClusterId(value: []const u8) !raft.ClusterId {
 
 test "parse a durable three-node quorum configuration" {
     const arguments = [_][]const u8{
-        "--node-id",                   "2",
-        "--cluster-id",                "0198f54d-5c2a-7000-8000-000000000001",
-        "--client-listen",             "127.0.0.1:2182",
-        "--raft-listen",               "127.0.0.1:2882",
-        "--data-dir",                  "/tmp/zookeeper-zig-2",
-        "--import-zookeeper-data-dir", "/srv/zookeeper/data",
-        "--import-zookeeper-log-dir",  "/srv/zookeeper/log",
-        "--peer",                      "1=127.0.0.1:2881",
-        "--peer",                      "2=127.0.0.1:2882",
-        "--peer",                      "3=127.0.0.1:2883",
+        "--node-id",                       "2",
+        "--cluster-id",                    "0198f54d-5c2a-7000-8000-000000000001",
+        "--client-listen",                 "127.0.0.1:2182",
+        "--client-request-workers",        "3",
+        "--client-request-queue-capacity", "32",
+        "--raft-listen",                   "127.0.0.1:2882",
+        "--data-dir",                      "/tmp/zookeeper-zig-2",
+        "--import-zookeeper-data-dir",     "/srv/zookeeper/data",
+        "--import-zookeeper-log-dir",      "/srv/zookeeper/log",
+        "--peer",                          "1=127.0.0.1:2881",
+        "--peer",                          "2=127.0.0.1:2882",
+        "--peer",                          "3=127.0.0.1:2883",
     };
     var parsed = try parse(std.testing.allocator, &arguments);
     defer parsed.deinit();
@@ -219,6 +233,28 @@ test "parse a durable three-node quorum configuration" {
     try std.testing.expectEqual(@as(usize, 3), parsed.peers.len);
     try std.testing.expectEqualStrings("127.0.0.1", parsed.client_host);
     try std.testing.expectEqual(@as(u16, 2182), parsed.client_port);
+    try std.testing.expectEqual(@as(usize, 3), parsed.client_request_workers);
+    try std.testing.expectEqual(@as(usize, 32), parsed.client_request_queue_capacity);
     try std.testing.expectEqualStrings("/srv/zookeeper/data", parsed.import_zookeeper_data_dir.?);
     try std.testing.expectEqualStrings("/srv/zookeeper/log", parsed.import_zookeeper_log_dir.?);
+}
+
+test "reject zero client request limits" {
+    const worker_arguments = [_][]const u8{
+        "--client-request-workers",
+        "0",
+    };
+    try std.testing.expectError(
+        error.InvalidClientRequestWorkers,
+        parse(std.testing.allocator, &worker_arguments),
+    );
+
+    const queue_arguments = [_][]const u8{
+        "--client-request-queue-capacity",
+        "0",
+    };
+    try std.testing.expectError(
+        error.InvalidClientRequestQueueCapacity,
+        parse(std.testing.allocator, &queue_arguments),
+    );
 }

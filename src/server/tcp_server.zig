@@ -35,11 +35,84 @@ const SessionMutationResult = struct {
     zxid: i64,
 };
 
+const ResponseSink = struct {
+    frame: ?[]u8 = null,
+
+    fn deinit(self: *ResponseSink, allocator: std.mem.Allocator) void {
+        if (self.frame) |frame| allocator.free(frame);
+        self.* = undefined;
+    }
+
+    fn capture(self: *ResponseSink, writer: *jute.Writer) !void {
+        if (self.frame != null) return error.MultipleResponses;
+        self.frame = try writer.toOwnedSlice();
+    }
+
+    fn take(self: *ResponseSink) ![]u8 {
+        const frame = self.frame orelse return error.MissingResponse;
+        self.frame = null;
+        return frame;
+    }
+};
+
+const EstablishResult = struct {
+    session: ?ConnectionSession,
+    frame: []u8,
+};
+
+const EstablishCompletion = union(enum) {
+    pending,
+    success: EstablishResult,
+    failure: anyerror,
+};
+
+const EstablishJob = struct {
+    connect: wire.DecodedConnectRequest,
+    done: std.Io.Event = .unset,
+    completion: EstablishCompletion = .pending,
+};
+
+const DispatchResult = struct {
+    keep_open: bool,
+    frame: []u8,
+};
+
+const DispatchCompletion = union(enum) {
+    pending,
+    success: DispatchResult,
+    failure: anyerror,
+};
+
+const DispatchJob = struct {
+    context: *ConnectionContext,
+    xid: i32,
+    opcode: wire.OpCode,
+    body: []const u8,
+    done: std.Io.Event = .unset,
+    completion: DispatchCompletion = .pending,
+};
+
+const RequestJob = union(enum) {
+    establish: *EstablishJob,
+    dispatch: *DispatchJob,
+};
+
+pub const Options = struct {
+    request_worker_count: usize = 0,
+    request_queue_capacity: usize = 256,
+};
+
 pub const TcpServer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     quorum: *quorum_mod.Quorum,
     address: std.Io.net.IpAddress,
+    request_worker_count: usize,
+    request_queue_buffer: []RequestJob,
+    request_queue: std.Io.Queue(RequestJob),
+    request_workers: std.Io.Group = .init,
+    connections: std.Io.Group = .init,
+    started: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -47,30 +120,64 @@ pub const TcpServer = struct {
         quorum: *quorum_mod.Quorum,
         host: []const u8,
         port: u16,
+        options: Options,
     ) !TcpServer {
+        if (options.request_queue_capacity == 0) return error.InvalidRequestQueueCapacity;
+        const address = try std.Io.net.IpAddress.parseIp4(host, port);
+        const request_worker_count = if (options.request_worker_count == 0)
+            @max(std.Thread.getCpuCount() catch 1, 1)
+        else
+            options.request_worker_count;
+        const request_queue_buffer = try allocator.alloc(RequestJob, options.request_queue_capacity);
         return .{
             .allocator = allocator,
             .io = io,
             .quorum = quorum,
-            .address = try std.Io.net.IpAddress.parseIp4(host, port),
+            .address = address,
+            .request_worker_count = request_worker_count,
+            .request_queue_buffer = request_queue_buffer,
+            .request_queue = .init(request_queue_buffer),
         };
     }
 
+    pub fn deinit(self: *TcpServer) void {
+        self.connections.cancel(self.io);
+        self.request_queue.close(self.io);
+        self.request_workers.await(self.io) catch self.request_workers.cancel(self.io);
+        self.allocator.free(self.request_queue_buffer);
+        self.* = undefined;
+    }
+
     pub fn serve(self: *TcpServer) !void {
+        try self.start();
+        defer self.connections.cancel(self.io);
+
         var listener = try self.address.listen(self.io, .{ .reuse_address = true });
         defer listener.deinit(self.io);
         while (true) {
             const stream = try listener.accept(self.io);
-            const thread = std.Thread.spawn(.{}, serveThread, .{ self, stream }) catch |err| {
+            self.connections.concurrent(self.io, serveTask, .{ self, stream }) catch |err| {
                 stream.close(self.io);
                 return err;
             };
-            thread.detach();
         }
     }
 
-    fn serveThread(self: *TcpServer, stream: std.Io.net.Stream) void {
+    fn start(self: *TcpServer) !void {
+        if (self.started) return;
+        errdefer {
+            self.request_queue.close(self.io);
+            self.request_workers.cancel(self.io);
+        }
+        for (0..self.request_worker_count) |_| {
+            try self.request_workers.concurrent(self.io, requestWorkerMain, .{self});
+        }
+        self.started = true;
+    }
+
+    fn serveTask(self: *TcpServer, stream: std.Io.net.Stream) std.Io.Cancelable!void {
         self.serveConnection(stream) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
             std.log.warn("ZooKeeper client connection closed: {s}", .{@errorName(err)});
         };
     }
@@ -86,7 +193,7 @@ pub const TcpServer = struct {
         );
         defer self.allocator.free(connect_payload);
         const connect = try wire.decodeConnectRequest(connect_payload);
-        const session = (try self.establishSession(&transport, connect)) orelse return;
+        const session = (try self.submitEstablish(&transport, connect)) orelse return;
         var context = ConnectionContext{ .session = session };
         defer context.deinit(self.allocator);
         const remote_ip = try peerIpv4Alloc(self.allocator, transport.stream);
@@ -104,10 +211,15 @@ pub const TcpServer = struct {
             defer self.allocator.free(payload);
             const request = try wire.requestView(payload);
             const opcode = wire.OpCode.fromInt(request.header.type) orelse {
-                try sendError(&transport, self.allocator, self.io, request.header.xid, -1, .unimplemented);
+                var sink: ResponseSink = .{};
+                defer sink.deinit(self.allocator);
+                try sendError(&sink, self.allocator, self.io, request.header.xid, -1, .unimplemented);
+                const frame = try sink.take();
+                defer self.allocator.free(frame);
+                try transport.writeFrame(self.io, frame);
                 return;
             };
-            const keep_open = try self.dispatch(
+            const keep_open = try self.submitDispatch(
                 &transport,
                 &context,
                 request.header.xid,
@@ -118,9 +230,69 @@ pub const TcpServer = struct {
         }
     }
 
-    fn establishSession(
+    fn submitEstablish(
         self: *TcpServer,
         transport: *TcpTransport,
+        connect: wire.DecodedConnectRequest,
+    ) !?ConnectionSession {
+        var job = EstablishJob{ .connect = connect };
+        self.request_queue.putOne(self.io, .{ .establish = &job }) catch |err| switch (err) {
+            error.Closed => return error.ServerStopped,
+            error.Canceled => return error.Canceled,
+        };
+        job.done.wait(self.io) catch |err| {
+            job.done.waitUncancelable(self.io);
+            freeEstablishResult(self.allocator, job.completion);
+            return err;
+        };
+        return switch (job.completion) {
+            .pending => unreachable,
+            .success => |result| {
+                defer self.allocator.free(result.frame);
+                try transport.writeFrame(self.io, result.frame);
+                return result.session;
+            },
+            .failure => |err| err,
+        };
+    }
+
+    fn submitDispatch(
+        self: *TcpServer,
+        transport: *TcpTransport,
+        context: *ConnectionContext,
+        xid: i32,
+        opcode: wire.OpCode,
+        body: []const u8,
+    ) !bool {
+        var job = DispatchJob{
+            .context = context,
+            .xid = xid,
+            .opcode = opcode,
+            .body = body,
+        };
+        self.request_queue.putOne(self.io, .{ .dispatch = &job }) catch |err| switch (err) {
+            error.Closed => return error.ServerStopped,
+            error.Canceled => return error.Canceled,
+        };
+        job.done.wait(self.io) catch |err| {
+            job.done.waitUncancelable(self.io);
+            freeDispatchResult(self.allocator, job.completion);
+            return err;
+        };
+        return switch (job.completion) {
+            .pending => unreachable,
+            .success => |result| {
+                defer self.allocator.free(result.frame);
+                try transport.writeFrame(self.io, result.frame);
+                return result.keep_open;
+            },
+            .failure => |err| err,
+        };
+    }
+
+    fn establishSession(
+        self: *TcpServer,
+        transport: *ResponseSink,
         connect: wire.DecodedConnectRequest,
     ) !?ConnectionSession {
         if (connect.value.sessionId == 0) {
@@ -214,7 +386,7 @@ pub const TcpServer = struct {
 
     fn dispatch(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         context: *ConnectionContext,
         xid: i32,
         opcode: wire.OpCode,
@@ -282,7 +454,7 @@ pub const TcpServer = struct {
 
     fn authenticate(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         context: *ConnectionContext,
         bytes: []const u8,
     ) !void {
@@ -326,7 +498,7 @@ pub const TcpServer = struct {
 
     fn create(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -411,7 +583,7 @@ pub const TcpServer = struct {
 
     fn createTtl(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -465,7 +637,7 @@ pub const TcpServer = struct {
 
     fn delete(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -514,7 +686,7 @@ pub const TcpServer = struct {
 
     fn setAcl(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -561,7 +733,7 @@ pub const TcpServer = struct {
 
     fn setData(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -615,7 +787,7 @@ pub const TcpServer = struct {
 
     fn exists(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -654,7 +826,7 @@ pub const TcpServer = struct {
 
     fn getAcl(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -714,7 +886,7 @@ pub const TcpServer = struct {
 
     fn getData(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -753,7 +925,7 @@ pub const TcpServer = struct {
 
     fn getChildren(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         identities: []const acl.Identity,
         xid: i32,
@@ -806,7 +978,7 @@ pub const TcpServer = struct {
 
     fn sync(
         self: *TcpServer,
-        transport: *TcpTransport,
+        transport: *ResponseSink,
         session: ConnectionSession,
         xid: i32,
         bytes: []const u8,
@@ -820,6 +992,73 @@ pub const TcpServer = struct {
     }
 };
 
+fn requestWorkerMain(server: *TcpServer) std.Io.Cancelable!void {
+    while (true) {
+        const job = server.request_queue.getOne(server.io) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
+        };
+        switch (job) {
+            .establish => |establish_job| completeEstablishJob(server, establish_job),
+            .dispatch => |dispatch_job| completeDispatchJob(server, dispatch_job),
+        }
+    }
+}
+
+fn completeEstablishJob(server: *TcpServer, job: *EstablishJob) void {
+    var sink: ResponseSink = .{};
+    defer sink.deinit(server.allocator);
+    const session = server.establishSession(&sink, job.connect) catch |err| {
+        job.completion = .{ .failure = err };
+        job.done.set(server.io);
+        return;
+    };
+    const frame = sink.take() catch |err| {
+        job.completion = .{ .failure = err };
+        job.done.set(server.io);
+        return;
+    };
+    job.completion = .{ .success = .{ .session = session, .frame = frame } };
+    job.done.set(server.io);
+}
+
+fn completeDispatchJob(server: *TcpServer, job: *DispatchJob) void {
+    var sink: ResponseSink = .{};
+    defer sink.deinit(server.allocator);
+    const keep_open = server.dispatch(
+        &sink,
+        job.context,
+        job.xid,
+        job.opcode,
+        job.body,
+    ) catch |err| {
+        job.completion = .{ .failure = err };
+        job.done.set(server.io);
+        return;
+    };
+    const frame = sink.take() catch |err| {
+        job.completion = .{ .failure = err };
+        job.done.set(server.io);
+        return;
+    };
+    job.completion = .{ .success = .{ .keep_open = keep_open, .frame = frame } };
+    job.done.set(server.io);
+}
+
+fn freeEstablishResult(allocator: std.mem.Allocator, completion: EstablishCompletion) void {
+    switch (completion) {
+        .success => |result| allocator.free(result.frame),
+        .pending, .failure => {},
+    }
+}
+
+fn freeDispatchResult(allocator: std.mem.Allocator, completion: DispatchCompletion) void {
+    switch (completion) {
+        .success => |result| allocator.free(result.frame),
+        .pending, .failure => {},
+    }
+}
+
 fn decodeBody(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator) !T {
     var reader = jute.Reader.init(bytes);
     const value = try jute.deserialize(T, &reader, allocator);
@@ -829,7 +1068,7 @@ fn decodeBody(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator)
 }
 
 fn sendFailedConnect(
-    transport: *TcpTransport,
+    transport: *ResponseSink,
     allocator: std.mem.Allocator,
     io: std.Io,
     include_read_only: bool,
@@ -844,33 +1083,35 @@ fn sendFailedConnect(
 }
 
 fn sendConnectResponse(
-    transport: *TcpTransport,
+    transport: *ResponseSink,
     allocator: std.mem.Allocator,
     io: std.Io,
     response: protocol.proto.ConnectResponse,
     include_read_only: bool,
 ) !void {
+    _ = io;
     var writer = jute.Writer.init(allocator);
     defer writer.deinit();
     try wire.encodeConnectResponse(&writer, response, include_read_only);
-    try transport.writeFrame(io, writer.bytes());
+    try transport.capture(&writer);
 }
 
 fn sendReply(
-    transport: *TcpTransport,
+    transport: *ResponseSink,
     allocator: std.mem.Allocator,
     io: std.Io,
     header: protocol.proto.ReplyHeader,
     body: anytype,
 ) !void {
+    _ = io;
     var writer = jute.Writer.init(allocator);
     defer writer.deinit();
     try wire.encodeReply(&writer, header, body);
-    try transport.writeFrame(io, writer.bytes());
+    try transport.capture(&writer);
 }
 
 fn sendMappedSessionError(
-    transport: *TcpTransport,
+    transport: *ResponseSink,
     allocator: std.mem.Allocator,
     io: std.Io,
     xid: i32,
@@ -887,7 +1128,7 @@ fn sendMappedSessionError(
 }
 
 fn sendError(
-    transport: *TcpTransport,
+    transport: *ResponseSink,
     allocator: std.mem.Allocator,
     io: std.Io,
     xid: i32,
@@ -998,7 +1239,10 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         quorum,
         "127.0.0.1",
         client_port,
+        .{ .request_worker_count = 2, .request_queue_capacity = 8 },
     );
+    defer server.deinit();
+    try server.start();
     var server_future = testing.io.async(serveOneConnection, .{ &server, &listener });
     defer server_future.cancel(testing.io) catch {};
 
