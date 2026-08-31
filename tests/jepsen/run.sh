@@ -88,11 +88,12 @@ if [[ -n ${JEPSEN_NEMESIS:-} ]]; then
 fi
 common_args+=("$@")
 
-run_host() {
+run_host() (
+    cd "$test_dir"
     ZOOKEEPER_ZIG_SERVER="$binary" \
     ZOOKEEPER_ZIG_RUN_DIR="$run_root/data" \
         "${lein_args[@]}" run "${common_args[@]}"
-}
+)
 
 run_container() {
     local runtime=$1
