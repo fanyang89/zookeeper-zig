@@ -8,7 +8,6 @@ on:
       - ".github/workflows/jepsen.yml"
       - "build.zig"
       - "build.zig.zon"
-      - "mise.toml"
       - "src/**"
       - "tests/jepsen/**"
   pull_request:
@@ -16,7 +15,6 @@ on:
       - ".github/workflows/jepsen.yml"
       - "build.zig"
       - "build.zig.zon"
-      - "mise.toml"
       - "src/**"
       - "tests/jepsen/**"
   schedule:
@@ -53,34 +51,54 @@ jobs:
   jepsen:
     name: Jepsen ${{ github.event_name == 'schedule' && 'full suite' || inputs.suite || 'smoke' }}
     runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      options: --security-opt seccomp=unconfined
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     env:
       JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || (github.event_name == 'schedule' && '120' || '30') }}
       JEPSEN_TEST_COUNT: ${{ inputs.test_count || '1' }}
       JEPSEN_COMMAND: ${{ (github.event_name == 'schedule' || inputs.suite == 'full') && 'test-all' || 'test' }}
       JEPSEN_CONCURRENCY: "6"
       JEPSEN_MAVEN_MIRROR: central
+      JEPSEN_RUNNER: host
       JEPSEN_USE_ALIYUN_MIRRORS: "false"
+      LEIN_ROOT: "1"
 
     steps:
+      - name: Install Fedora toolchain
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False \
+            binutils cmake curl git gnuplot-minimal java-25-openjdk-headless make ninja-build \
+            pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel zig
+          test "$(zig version)" = "0.16.0"
+          java -version
+
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Install toolchain
-        uses: jdx/mise-action@v4
-
-      - name: Install system RocksDB
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends librocksdb-dev libsnappy-dev pkg-config
 
       - name: Cache Leiningen dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.cache/zookeeper-zig/jepsen
-          key: jepsen-lein-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/jepsen/project.clj') }}
+          path: |
+            ~/.lein
+            ~/.m2/repository
+          key: jepsen-lein-2.13.0-fedora-44-${{ runner.arch }}-${{ hashFiles('tests/jepsen/project.clj') }}
           restore-keys: |
-            jepsen-lein-${{ runner.os }}-${{ runner.arch }}-
+            jepsen-lein-2.13.0-fedora-44-${{ runner.arch }}-
+
+      - name: Install Leiningen
+        run: |
+          curl --fail --location --retry 5 --show-error --silent \
+            https://codeberg.org/leiningen/leiningen/raw/tag/2.13.0/bin/lein \
+            --output /usr/local/bin/lein
+          echo "6990083d62cc2241184660c70d6ead8ffeb3530f3c6fa4e7c3bff47c5c7c2181  /usr/local/bin/lein" \
+            | sha256sum --check --strict
+          chmod 0755 /usr/local/bin/lein
+          lein version
 
       - name: Run Jepsen tests
         run: |

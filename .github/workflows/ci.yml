@@ -18,13 +18,19 @@ jobs:
   checks:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      options: --security-opt seccomp=unconfined
     timeout-minutes: ${{ matrix.timeout-minutes }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Format
-            command: mise run fmt-check
+            command: zig fmt --check build.zig src
             cache-zig: false
             system-rocksdb: false
             timeout-minutes: 5
@@ -34,7 +40,7 @@ jobs:
             system-rocksdb: true
             timeout-minutes: 25
           - name: Build
-            command: mise run build -- -Dsystem-rocksdb=true --summary all
+            command: zig build -Dsystem-rocksdb=true --summary all
             cache-zig: true
             system-rocksdb: true
             timeout-minutes: 20
@@ -47,11 +53,18 @@ jobs:
             timeout-minutes: 20
 
     steps:
+      - name: Install Fedora toolchain
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False \
+            binutils cmake git make ninja-build zig
+          if [[ "${{ matrix.system-rocksdb }}" == true ]]; then
+            dnf install --assumeyes --setopt=install_weak_deps=False \
+              pkgconf-pkg-config rocksdb-devel snappy-devel
+          fi
+          test "$(zig version)" = "0.16.0"
+
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Install toolchain
-        uses: jdx/mise-action@v4
 
       - name: Cache Zig dependencies
         if: matrix.cache-zig
@@ -60,15 +73,9 @@ jobs:
           path: |
             ~/.cache/zig
             zig-pkg
-          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'build.zig.zon') }}
+          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
-            zig-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install system RocksDB
-        if: matrix.system-rocksdb
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends librocksdb-dev libsnappy-dev pkg-config
+            zig-fedora-44-${{ runner.arch }}-
 
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}
