@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Format
+            command: mise run fmt-check
+            cache-zig: false
+          - name: Lint
+            command: mise run lint
+            cache-zig: true
+          - name: Build
+            command: mise run build -- --summary all
+            cache-zig: true
+          - name: Unit tests
+            command: mise run test
+            cache-zig: true
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Cache Zig dependencies
+        if: matrix.cache-zig
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            zig-pkg
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml', 'build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}

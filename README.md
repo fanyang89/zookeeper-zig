@@ -15,9 +15,14 @@ declaration order, so the protocol structs require no generated codec methods.
 
 ```sh
 mise install
+mise run fmt-check
+mise run lint
 mise run build
 mise run test
 ```
+
+The lint task compiles the native test tree in `ReleaseSafe`; formatting is
+checked separately with `zig fmt --check`.
 
 ## Native Zig API
 

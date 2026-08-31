@@ -6,6 +6,15 @@ zig = "0.16.0"
 [env]
 ZOOKEEPER_VERSION = "3.9.5"
 
+[tasks.fmt]
+run = "zig fmt build.zig src"
+
+[tasks.fmt-check]
+run = "zig fmt --check build.zig src"
+
+[tasks.lint]
+run = "zig build check-zig -Doptimize=ReleaseSafe --summary all"
+
 [tasks.test]
 run = "zig build test --summary all"
 
