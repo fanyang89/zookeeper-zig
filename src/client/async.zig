@@ -427,7 +427,11 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
             error.Closed => return,
         };
         if (event_count == 0) {
-            try poll_interval.sleep(client.io);
+            if (close_call != null) {
+                std.atomic.spinLoopHint();
+            } else {
+                try poll_interval.sleep(client.io);
+            }
             continue;
         }
         switch (event_buffer[0]) {
