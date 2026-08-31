@@ -17,6 +17,9 @@ test {
     _ = protocol.proto.ConnectRequest;
     _ = server;
     _ = @import("server/worker_pool.zig");
-    if (builtin.os.tag == .linux) _ = server.zookeeper_import.javaSessionPassword(1);
+    if (builtin.os.tag == .linux) {
+        _ = @import("server/quorum.zig");
+        _ = server.zookeeper_import.javaSessionPassword(1);
+    }
     _ = wire.OpCode;
 }

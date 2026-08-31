@@ -4,6 +4,7 @@ const raft = @import("raftz");
 const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
+const distributed_test = @import("distributed_test.zig");
 const state_machine = @import("state_machine.zig");
 
 pub const Options = struct {
@@ -471,7 +472,7 @@ test "single-node quorum persists committed state through WAL restart" {
         try quorum.linearizableRead();
         var stored = (try quorum.machine.getData(testing.allocator, "/durable")).?;
         defer stored.deinit(testing.allocator);
-        try testing.expectEqualStrings("value", stored.data);
+        try testing.expectEqualStrings("value", stored.data.?);
         try quorum.shutdown();
     }
 
@@ -482,7 +483,7 @@ test "single-node quorum persists committed state through WAL restart" {
         try quorum.linearizableRead();
         var restored = (try quorum.machine.getData(testing.allocator, "/durable")).?;
         defer restored.deinit(testing.allocator);
-        try testing.expectEqualStrings("value", restored.data);
+        try testing.expectEqualStrings("value", restored.data.?);
         try quorum.shutdown();
     }
 }
@@ -511,18 +512,24 @@ fn waitForClusterLeader(nodes: []const ?*Quorum, io: std.Io) !u64 {
     var attempts: usize = 0;
     while (attempts < 1_000) : (attempts += 1) {
         var elected: u64 = 0;
+        var leaders: usize = 0;
         var consistent = true;
         var reports: usize = 0;
         for (nodes) |maybe_node| if (maybe_node) |node| {
-            const leader_id = node.status().leader_id;
-            if (leader_id == 0) {
-                consistent = false;
-                continue;
+            const status = node.status();
+            if (status.role == .leader) {
+                elected = status.id;
+                leaders += 1;
             }
-            if (elected == 0) elected = leader_id else if (elected != leader_id) consistent = false;
+            if (status.leader_id == 0) consistent = false;
             reports += 1;
         };
-        if (consistent and reports >= 2 and elected != 0) return elected;
+        if (leaders == 1) {
+            for (nodes) |maybe_node| if (maybe_node) |node| {
+                if (node.status().leader_id != elected) consistent = false;
+            };
+        }
+        if (consistent and reports >= 2 and leaders == 1) return elected;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.LeaderElectionTimeout;
@@ -612,7 +619,7 @@ test "three-node quorum replicates through follower and survives leader restart"
     const first_leader = try waitForClusterLeader(&nodes, testing.io);
     var follower: *Quorum = undefined;
     for (nodes) |maybe_node| if (maybe_node) |node| {
-        if (node.status().node_id != first_leader) {
+        if (node.status().id != first_leader) {
             follower = node;
             break;
         }
@@ -635,7 +642,7 @@ test "three-node quorum replicates through follower and survives leader restart"
 
     var survivor: *Quorum = undefined;
     for (nodes) |maybe_node| if (maybe_node) |node| {
-        if (node.status().node_id != second_leader) {
+        if (node.status().id != second_leader) {
             survivor = node;
             break;
         }
@@ -661,5 +668,17 @@ test "three-node quorum replicates through follower and survives leader restart"
         "/after-failover",
     )).?;
     defer restored.deinit(testing.allocator);
-    try testing.expectEqualStrings("v2", restored.data);
+    try testing.expectEqualStrings("v2", restored.data.?);
+}
+
+test "deterministic quorum rejects minority writes and stale reads" {
+    try distributed_test.testMinoritySafety();
+}
+
+test "deterministic quorum fences stale sessions across leader failover" {
+    try distributed_test.testSessionFencing();
+}
+
+test "deterministic quorum restores lagging application state from snapshot" {
+    try distributed_test.testSnapshotCatchUp();
 }

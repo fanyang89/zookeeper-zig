@@ -515,7 +515,7 @@ test "RocksDB state machine atomically persists commands and restores snapshots"
     try restored.stateMachine().restoreSnapshot(snapshot.metadata, snapshot_source.snapshotReader());
     var data = (try restored.getData(testing.allocator, "/app")).?;
     defer data.deinit(testing.allocator);
-    try testing.expectEqualStrings("two", data.data);
+    try testing.expectEqualStrings("two", data.data.?);
     try testing.expectEqual(@as(i32, 1), data.stat.version);
     const restored_session = (try restored.getSession(99)).?;
     try testing.expectEqualSlices(u8, &password, &restored_session.password);
