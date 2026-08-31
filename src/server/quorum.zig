@@ -5,6 +5,7 @@ const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
 const distributed_test = @import("distributed_test.zig");
+const real_transport_test = @import("real_transport_test.zig");
 const state_machine = @import("state_machine.zig");
 
 pub const Options = struct {
@@ -707,4 +708,16 @@ test "deterministic quorum fences stale sessions across leader failover" {
 
 test "deterministic quorum restores lagging application state from snapshot" {
     try distributed_test.testSnapshotCatchUp();
+}
+
+test "real grpc quorum survives partition and follower restart" {
+    try real_transport_test.testRealTransportFaults(Quorum, Options{
+        .tick_interval_ms = 10,
+        .election_tick = 10,
+        .heartbeat_tick = 1,
+        .proposal_timeout_ticks = 80,
+        .read_index_timeout_ticks = 80,
+        .snapshot_entries_threshold = 2,
+        .session_reap_interval_ms = 100,
+    });
 }
