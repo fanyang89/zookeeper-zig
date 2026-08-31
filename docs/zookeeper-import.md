@@ -26,19 +26,24 @@ when it is omitted. Each source path may name either the directory containing
 
 1. Stop writes to the Apache ZooKeeper ensemble and copy an immutable snapshot
    of its data and log directories.
-2. Start with empty target data directories. Import refuses to replace an
-   existing non-imported RocksDB state.
+2. Start with completely empty target data directories. Import fails if any
+   file or directory already exists in a target, including stale import staging
+   state.
 3. Pass the same source copy and import arguments to every initial voting
    member. Never import only one member, and do not use import options with
    `--join`.
-4. After successful import, the arguments may remain configured. A durable
-   import marker makes subsequent starts idempotent.
+4. Remove the import arguments after the successful first start. Import is a
+   one-shot operation; every later attempt fails because the activated target
+   data directory is no longer empty.
 
 The importer selects the newest valid snapshot and replays later transaction
 logs. It validates file headers, snapshot seals, log Adler-32 checksums, record
 lengths, `0x42` transaction markers, paths, ACL references, and tree structure.
 The imported RocksDB is built in `state.rocksdb.importing` and activated with a
-single rename only after validation succeeds.
+single rename only after validation succeeds. A handled failure removes staging
+state. A process crash can leave staging state behind; remove or replace the
+entire target directory before retrying so the empty-directory gate remains
+explicit.
 
 Sessions and ordinary ephemeral nodes are retained. Because Apache ZooKeeper
 does not persist remaining lease time, each surviving session receives one

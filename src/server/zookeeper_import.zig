@@ -86,17 +86,24 @@ pub fn importOnFirstStart(
     options: Options,
 ) !void {
     if (options.tick_grace_ms <= 0) return error.InvalidTickGrace;
-    if (try targetImportAlreadyComplete(allocator, io, options.target_data_dir)) return;
-    var state = try loadSource(allocator, io, options.source_data_dir, options.source_log_dir);
-    defer state.deinit();
-    try finalizeState(&state);
-
+    try ensureTargetDataDirectoryEmpty(io, options.target_data_dir);
     const staging_path = try std.fmt.allocPrint(allocator, "{s}/state.rocksdb.importing", .{options.target_data_dir});
     defer allocator.free(staging_path);
     const final_path = try std.fmt.allocPrint(allocator, "{s}/state.rocksdb", .{options.target_data_dir});
     defer allocator.free(final_path);
-    try std.Io.Dir.cwd().deleteTree(io, staging_path);
-    errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
+
+    // Atomically claim the empty target before reading the source. Concurrent
+    // import attempts cannot share or delete another importer's staging state.
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDir(io, staging_path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.TargetDataDirectoryNotEmpty,
+        else => return err,
+    };
+    errdefer cwd.deleteTree(io, staging_path) catch {};
+
+    var state = try loadSource(allocator, io, options.source_data_dir, options.source_log_dir);
+    defer state.deinit();
+    try finalizeState(&state);
 
     var store = try rocks_store.RocksStore.open(allocator, staging_path);
     {
@@ -107,7 +114,6 @@ pub fn importOnFirstStart(
         defer allocator.free(sessions);
         try store.installImported(nodes, sessions, options.tick_grace_ms, state.source_zxid);
     }
-    const cwd = std.Io.Dir.cwd();
     try cwd.rename(staging_path, cwd, final_path, io);
 }
 
@@ -815,35 +821,12 @@ fn openConfiguredDir(io: std.Io, path: []const u8) !std.Io.Dir {
     return std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
 }
 
-fn targetImportAlreadyComplete(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    target_data_dir: []const u8,
-) !bool {
+fn ensureTargetDataDirectoryEmpty(io: std.Io, target_data_dir: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, target_data_dir);
-    const state_path = try std.fmt.allocPrint(allocator, "{s}/state.rocksdb", .{target_data_dir});
-    defer allocator.free(state_path);
-    const state_exists = blk: {
-        std.Io.Dir.cwd().access(io, state_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => break :blk false,
-            else => return err,
-        };
-        break :blk true;
-    };
-    if (state_exists) {
-        var store = try rocks_store.RocksStore.open(allocator, state_path);
-        defer store.deinit();
-        if (try store.importedSourceZxid() != null) return true;
-        return error.TargetStateAlreadyExists;
-    }
     var target_dir = try openConfiguredDir(io, target_data_dir);
     defer target_dir.close(io);
     var iterator = target_dir.iterate();
-    while (try iterator.next(io)) |entry| {
-        if (std.mem.eql(u8, entry.name, "state.rocksdb.importing")) continue;
-        return error.TargetDataDirectoryNotEmpty;
-    }
-    return false;
+    if (try iterator.next(io) != null) return error.TargetDataDirectoryNotEmpty;
 }
 
 fn decompressSnappy(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
@@ -1111,12 +1094,13 @@ test "imports a ZooKeeper snapshot and replays transaction logs" {
         .target_data_dir = target_path,
         .tick_grace_ms = 500,
     });
-    // Keeping the startup flag is idempotent after the import marker is durable.
-    try importOnFirstStart(testing.allocator, testing.io, .{
-        .source_data_dir = source_path,
+    // Import is a one-shot operation. Keeping the startup flag must fail once
+    // the target directory contains the activated state.
+    try testing.expectError(error.TargetDataDirectoryNotEmpty, importOnFirstStart(testing.allocator, testing.io, .{
+        .source_data_dir = target_path,
         .target_data_dir = target_path,
         .tick_grace_ms = 500,
-    });
+    }));
     const state_path = try std.fmt.allocPrint(testing.allocator, "{s}/state.rocksdb", .{target_path});
     defer testing.allocator.free(state_path);
     var store = try rocks_store.RocksStore.open(testing.allocator, state_path);
@@ -1150,7 +1134,7 @@ fn writeTestSeal(writer: *jute.Writer) !void {
     try writer.writeString("/");
 }
 
-test "first-start import rejects an existing Raft data directory" {
+test "first-start import requires an empty target data directory" {
     var temporary = std.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     try temporary.dir.createDirPath(std.testing.io, "target/wal");
@@ -1158,7 +1142,15 @@ test "first-start import rejects an existing Raft data directory" {
     defer std.testing.allocator.free(target_path);
     try std.testing.expectError(
         error.TargetDataDirectoryNotEmpty,
-        targetImportAlreadyComplete(std.testing.allocator, std.testing.io, target_path),
+        ensureTargetDataDirectoryEmpty(std.testing.io, target_path),
+    );
+
+    try temporary.dir.createDirPath(std.testing.io, "stale/state.rocksdb.importing");
+    const stale_path = try temporary.dir.realPathFileAlloc(std.testing.io, "stale", std.testing.allocator);
+    defer std.testing.allocator.free(stale_path);
+    try std.testing.expectError(
+        error.TargetDataDirectoryNotEmpty,
+        ensureTargetDataDirectoryEmpty(std.testing.io, stale_path),
     );
 }
 
