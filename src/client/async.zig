@@ -221,7 +221,7 @@ pub const AsyncClient = struct {
 
         self.reader = try io.concurrent(readerMain, .{self});
         self.tasks.concurrent(io, engineMain, .{self}) catch |err| {
-            stopReader(self);
+            self.stopReader();
             return err;
         };
         self.tasks.concurrent(io, timerMain, .{self}) catch |err| {
@@ -298,6 +298,13 @@ pub const AsyncClient = struct {
             error.Closed => {},
         }
     }
+
+    fn stopReader(self: *AsyncClient) void {
+        if (self.reader) |*reader| {
+            _ = reader.cancel(self.io) catch {};
+            self.reader = null;
+        }
+    }
 };
 
 fn sendEncodedRequest(client: *AsyncClient, opcode: wire.OpCode, body_payload: []const u8) !i32 {
@@ -360,13 +367,6 @@ fn acceptPayload(client: *AsyncClient, payload: []u8) !Inbound {
         .kind = kind,
         .body_offset = @intFromPtr(view.body.ptr) - @intFromPtr(payload.ptr),
     };
-}
-
-fn stopReader(client: *AsyncClient) void {
-    if (client.reader) |*reader| {
-        _ = reader.cancel(client.io) catch {};
-        client.reader = null;
-    }
 }
 
 fn monotonicMs(io: std.Io) i64 {
@@ -433,7 +433,7 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
                         if (close_call) |call| {
                             if (call.xid == inbound.header.xid and response.opcode == .close_session) {
                                 inbound.deinit();
-                                stopReader(client);
+                                client.stopReader();
                                 client.core.transport.close(client.io);
                                 client.core.session.markClosed();
                                 completeClose(call, .success, client.io);
@@ -561,7 +561,7 @@ fn shutdownEngine(
     client.events.close(client.io);
     client.notifications.close(client.io);
 
-    stopReader(client);
+    client.stopReader();
     client.core.transport.close(client.io);
     if (client.core.session.state.isConnected()) {
         client.core.session.disconnect(if (terminal == error.SessionExpired) .session_expired else .connection_loss);
