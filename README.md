@@ -214,6 +214,20 @@ Aliyun public mirror by default; set `ZOOKEEPER_MAVEN_MIRROR=central` to use
 Central directly or `MAVEN_SETTINGS=/path/to/settings.xml` for custom settings.
 Git, Maven, Python 3, and a JDK are required.
 
+Run the compatible subset of Apache ZooKeeper's upstream server behavior tests
+with:
+
+```sh
+mise run test-upstream-server
+```
+
+This suite runs 11 unchanged upstream JUnit cases against isolated Zig server
+processes. It covers create responses, Stat fields, null data, root ACLs,
+request retry, concurrent CRUD, session restoration, and session continuity
+across a server restart. Set `ZOOKEEPER_SERVER_TEST_SELECTOR` to override the
+Surefire selector while evaluating additional upstream cases. Tests requiring
+watches, multi operations, or Java server internals remain excluded.
+
 ## Jepsen
 
 Run the three-node linearizable-register smoke test with:

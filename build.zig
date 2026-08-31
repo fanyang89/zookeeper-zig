@@ -91,6 +91,15 @@ pub fn build(b: *std.Build) void {
         );
         test_java_interop.dependOn(&java_interop.step);
 
+        const upstream_server_suite = b.addSystemCommand(&.{"bash"});
+        upstream_server_suite.addFileArg(b.path("tests/interop/java/run-upstream-server.sh"));
+        upstream_server_suite.addArtifactArg(server);
+        const test_upstream_server = b.step(
+            "test-upstream-server",
+            "Run compatible Apache ZooKeeper server behavior tests",
+        );
+        test_upstream_server.dependOn(&upstream_server_suite.step);
+
         const jepsen_smoke = b.addSystemCommand(&.{"bash"});
         jepsen_smoke.addFileArg(b.path("tests/jepsen/run.sh"));
         jepsen_smoke.addArtifactArg(server);

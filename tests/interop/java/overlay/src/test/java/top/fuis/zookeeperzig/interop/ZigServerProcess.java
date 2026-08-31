@@ -31,7 +31,7 @@ public final class ZigServerProcess implements AutoCloseable {
         long timeoutMillis) throws Exception {
         int raftPort = reservePort();
         File dataDirectory = new File(testDirectory, "zig-data");
-        if (!dataDirectory.mkdirs()) {
+        if (!dataDirectory.isDirectory() && !dataDirectory.mkdirs()) {
             throw new IOException("failed to create Zig data directory: " + dataDirectory);
         }
         File logFile = new File(testDirectory, "zig-server.log");

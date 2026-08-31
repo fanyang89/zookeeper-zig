@@ -21,5 +21,8 @@ run = "zig build test --summary all"
 [tasks.test-interop-java]
 run = "zig build test-interop-java --summary all"
 
+[tasks.test-upstream-server]
+run = "zig build test-upstream-server --summary all"
+
 [tasks.test-jepsen-smoke]
 run = "zig build test-jepsen-smoke --summary all"
