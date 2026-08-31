@@ -50,7 +50,8 @@ jobs:
       JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || (github.event_name == 'schedule' && '120' || '30') }}
       JEPSEN_TEST_COUNT: ${{ inputs.test_count || (github.event_name == 'schedule' && '3' || '1') }}
       JEPSEN_CONCURRENCY: "6"
-      JEPSEN_MAVEN_MIRROR: aliyun
+      JEPSEN_MAVEN_MIRROR: central
+      JEPSEN_USE_ALIYUN_MIRRORS: "false"
 
     steps:
       - name: Check out repository

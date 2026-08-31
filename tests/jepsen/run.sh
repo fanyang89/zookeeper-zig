@@ -35,6 +35,15 @@ concurrency=${JEPSEN_CONCURRENCY:-6}
 test_count=${JEPSEN_TEST_COUNT:-1}
 runner=${JEPSEN_RUNNER:-auto}
 maven_mirror=${JEPSEN_MAVEN_MIRROR:-aliyun}
+use_aliyun_mirrors=${JEPSEN_USE_ALIYUN_MIRRORS:-true}
+case "$use_aliyun_mirrors" in
+    true | false)
+        ;;
+    *)
+        echo "unsupported JEPSEN_USE_ALIYUN_MIRRORS: $use_aliyun_mirrors" >&2
+        exit 2
+        ;;
+esac
 lein_args=(lein)
 case "$maven_mirror" in
     aliyun)
@@ -72,7 +81,11 @@ run_container() {
     local container_run_root=/workspace/${run_root#"$repo/"}
     mkdir -p "$cache_root"
     if [[ -z ${JEPSEN_IMAGE:-} ]]; then
-        "$runtime" build --tag "$image" --file "$test_dir/Dockerfile" "$test_dir"
+        "$runtime" build \
+            --build-arg "USE_ALIYUN_MIRRORS=$use_aliyun_mirrors" \
+            --tag "$image" \
+            --file "$test_dir/Dockerfile" \
+            "$test_dir"
     fi
     "$runtime" run --rm --init --network host \
         --security-opt seccomp=unconfined \
