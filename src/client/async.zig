@@ -416,12 +416,21 @@ fn engineMain(client: *AsyncClient) std.Io.Cancelable!void {
         waiters.deinit(client.allocator);
     }
 
+    const poll_interval: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromMilliseconds(1),
+        .clock = .awake,
+    } };
+    var event_buffer: [1]EngineEvent = undefined;
     while (true) {
-        const event = client.events.getOne(client.io) catch |err| switch (err) {
+        const event_count = client.events.get(client.io, &event_buffer, 0) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Closed => return,
         };
-        switch (event) {
+        if (event_count == 0) {
+            try poll_interval.sleep(client.io);
+            continue;
+        }
+        switch (event_buffer[0]) {
             .request => |call| {
                 if (close_call != null) {
                     completeRequest(call, .{ .failure = error.ConnectionLoss }, client.io);
