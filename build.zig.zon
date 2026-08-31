@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .raftz = .{
-            .url = "https://github.com/fanyang89/raftz/archive/1549cc65f1bd6d74ab09f0557d86cab8a672aa75.tar.gz",
-            .hash = "raftz-0.1.0-dZ8GDgwqxABf5cSUAcotGuD84dHD4X7vCpfqNXG7k6Wm",
+            .url = "https://github.com/fanyang89/raftz/archive/78e6a811b5a965ea92bc5034daf541eb3191a956.tar.gz",
+            .hash = "raftz-0.1.0-dZ8GDpEzxAC6vd-tKJ_gR0AKXx480K9-vcIjDirkfiZh",
         },
         .rocksdb = .{
             .url = "https://github.com/Syndica/rocksdb-zig/archive/20cc086f2702d9ec4aff144c242962ea3b666ee5.tar.gz",
