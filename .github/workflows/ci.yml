@@ -18,7 +18,7 @@ jobs:
   checks:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.timeout-minutes }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,15 +26,21 @@ jobs:
           - name: Format
             command: mise run fmt-check
             cache-zig: false
+            timeout-minutes: 5
           - name: Lint
             command: mise run lint
             cache-zig: true
+            timeout-minutes: 25
           - name: Build
             command: mise run build -- --summary all
             cache-zig: true
+            timeout-minutes: 20
           - name: Unit tests
-            command: mise run test
+            command: |
+              zig build check-zig --summary all
+              timeout --foreground --kill-after=10s 3m zig build test --summary all
             cache-zig: true
+            timeout-minutes: 20
 
     steps:
       - name: Check out repository
