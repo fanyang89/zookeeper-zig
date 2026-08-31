@@ -152,6 +152,9 @@ fn addSystemRocksDB(
         .target = target,
         .optimize = optimize,
     });
+    if (target.result.os.tag == .linux) {
+        translate_c.addSystemIncludePath(.{ .cwd_relative = "/usr/include" });
+    }
     const c_module = b.createModule(.{
         .root_source_file = translate_c.getOutput(),
         .target = target,
