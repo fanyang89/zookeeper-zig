@@ -26,8 +26,11 @@ pub const TcpTransport = struct {
         bounded_options.timeout = .none;
         var results: [2]ConnectRace = undefined;
         var select = std.Io.Select(ConnectRace).init(io, &results);
-        select.async(.connect, connectAddressTask, .{ address, io, bounded_options });
-        select.async(.timer, timeoutTask, .{ deadline, io });
+        try select.concurrent(.connect, connectAddressTask, .{ address, io, bounded_options });
+        select.concurrent(.timer, timeoutTask, .{ deadline, io }) catch |err| {
+            cleanupConnectRace(select.cancel(), io);
+            return err;
+        };
         const result = select.await() catch |err| {
             cleanupConnectRace(select.cancel(), io);
             return err;
@@ -53,8 +56,11 @@ pub const TcpTransport = struct {
         bounded_options.timeout = .none;
         var results: [2]ConnectRace = undefined;
         var select = std.Io.Select(ConnectRace).init(io, &results);
-        select.async(.connect, connectHostTask, .{ host_name, io, port, bounded_options });
-        select.async(.timer, timeoutTask, .{ deadline, io });
+        try select.concurrent(.connect, connectHostTask, .{ host_name, io, port, bounded_options });
+        select.concurrent(.timer, timeoutTask, .{ deadline, io }) catch |err| {
+            cleanupConnectRace(select.cancel(), io);
+            return err;
+        };
         const result = select.await() catch |err| {
             cleanupConnectRace(select.cancel(), io);
             return err;
@@ -97,8 +103,11 @@ pub const TcpTransport = struct {
         };
         var results: [2]Race = undefined;
         var select = std.Io.Select(Race).init(io, &results);
-        select.async(.write, writeFrameTask, .{ self, io, frame });
-        select.async(.timer, timeoutTask, .{ timeout, io });
+        try select.concurrent(.write, writeFrameTask, .{ self, io, frame });
+        select.concurrent(.timer, timeoutTask, .{ timeout, io }) catch |err| {
+            select.cancelDiscard();
+            return err;
+        };
         const result = select.await() catch |err| {
             select.cancelDiscard();
             return err;
@@ -249,6 +258,60 @@ fn serverFixture(server: *std.Io.net.Server, io: std.Io) !void {
 
     const response = [_]u8{ 0, 0, 0, 8 } ++ "response".*;
     try writeFragmented(stream, io, &response);
+}
+
+test "write timeout race does not run its timer synchronously" {
+    const testing = std.testing;
+    var io_instance: std.Io.Threaded = .init(testing.allocator, .{
+        .async_limit = .nothing,
+    });
+    defer io_instance.deinit();
+    const io = io_instance.io();
+
+    const listen_address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_address.listen(io, .{});
+    defer server.deinit(io);
+
+    var local_address: std.posix.sockaddr.in = undefined;
+    var address_length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.errno(std.posix.system.getsockname(
+        server.socket.handle,
+        @ptrCast(&local_address),
+        &address_length,
+    )) != .SUCCESS) return error.AddressQueryFailed;
+    const port = std.mem.bigToNative(u16, local_address.port);
+
+    var server_future = try io.concurrent(serverFixture, .{ &server, io });
+    defer server_future.cancel(io) catch {};
+
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    var transport = try TcpTransport.connectAddress(io, address, .{
+        .mode = .stream,
+        .protocol = .tcp,
+    });
+    defer transport.close(io);
+
+    const request = [_]u8{ 0, 0, 0, 7 } ++ "request".*;
+    const started_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    try transport.writeFrameTimeout(io, &request, .{ .duration = .{
+        .raw = .fromSeconds(1),
+        .clock = .awake,
+    } });
+    const elapsed_ms = std.Io.Clock.awake.now(io).toMilliseconds() - started_ms;
+    try testing.expect(elapsed_ms < 500);
+
+    const response = try transport.readFrameAllocTimeout(
+        testing.allocator,
+        io,
+        wire.default_max_payload,
+        .{ .duration = .{
+            .raw = .fromSeconds(1),
+            .clock = .awake,
+        } },
+    );
+    defer testing.allocator.free(response);
+    try testing.expectEqualStrings("response", response);
+    try server_future.await(io);
 }
 
 test "TCP transport reads fragmented frames and writes complete frames" {
