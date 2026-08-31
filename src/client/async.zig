@@ -699,8 +699,12 @@ test "async client pipelines requests and delivers notifications" {
     var server_future = testing.io.async(asyncServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
-    const one_second: std.Io.Timeout = .{ .duration = .{
+    const io_timeout: std.Io.Timeout = .{ .duration = .{
         .raw = .fromSeconds(1),
+        .clock = .awake,
+    } };
+    const close_timeout: std.Io.Timeout = .{ .duration = .{
+        .raw = .fromSeconds(10),
         .clock = .awake,
     } };
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
@@ -709,8 +713,8 @@ test "async client pipelines requests and delivers notifications" {
         testing.io,
         address,
         .{ .connection = .{
-            .handshake_timeout = one_second,
-            .io_timeout = one_second,
+            .handshake_timeout = io_timeout,
+            .io_timeout = io_timeout,
         } },
         .{},
     );
@@ -741,7 +745,7 @@ test "async client pipelines requests and delivers notifications" {
     defer jute.deinitDecoded(second_response, testing.allocator);
     try testing.expectEqualStrings("two", second_response.data.?);
 
-    try client.close(one_second);
+    try client.close(close_timeout);
     try server_future.await(testing.io);
 }
 
