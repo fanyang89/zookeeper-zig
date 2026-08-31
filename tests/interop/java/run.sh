@@ -40,7 +40,8 @@ cleanup() {
             -type f -name '*.txt' -exec tail -n 120 {} \; 2>/dev/null >&2 || true
         echo "--- Zig server logs ---" >&2
         find "$worktree/zookeeper-server/target" \
-            -type f -name 'zig-server.log' -exec sh -c 'echo "# $1"; cat "$1"' _ {} \; \
+            -type f \( -name 'zig-server.log' -o -name 'node-*.log' \) \
+            -exec sh -c 'echo "# $1"; cat "$1"' _ {} \; \
             2>/dev/null >&2 || true
     fi
     if [[ ${ZOOKEEPER_KEEP_WORKTREE:-false} == true ]]; then
@@ -136,7 +137,7 @@ join_by_plus() {
     local IFS=+
     echo "$*"
 }
-default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest"
+default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest,QuorumFailoverInteropTest"
 test_selector=${ZOOKEEPER_TEST_SELECTOR:-$default_test_selector}
 
 maven_settings_args=()
