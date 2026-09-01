@@ -18,6 +18,22 @@
               [:start :n1] [:start :n2] [:start :n3]]
              @calls)))))
 
+(deftest partition-one-isolates-and-heals-one-running-node
+  (let [calls (atom [])
+        subject (zk-nemesis/partition-one :cluster)]
+    (with-redefs [cluster/running-nodes (fn [_] [:n1])
+                  cluster/partition-node! (fn [_ node]
+                                            (swap! calls conj [:partition node]))
+                  cluster/heal-partition! (fn [_]
+                                            (swap! calls conj [:heal]))]
+      (is (= {:partitioned :n1}
+             (:value (nemesis/invoke! subject {} {:type :info :f :start}))))
+      (is (= {:already-partitioned :n1}
+             (:value (nemesis/invoke! subject {} {:type :info :f :start}))))
+      (is (= {:healed :n1}
+             (:value (nemesis/invoke! subject {} {:type :info :f :stop}))))
+      (is (= [[:partition :n1] [:heal]] @calls)))))
+
 (deftest pause-all-disrupts-and-restores-every-running-node
   (let [calls (atom [])
         subject (zk-nemesis/pause-all :cluster)]

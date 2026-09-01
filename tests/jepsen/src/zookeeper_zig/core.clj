@@ -19,7 +19,8 @@
 (def workload-names
   ["register" "independent-register" "set" "presence" "unique-ids" "counter"
    "total-queue" "linear-queue"])
-(def nemesis-names ["kill-one" "pause-one" "kill-all" "pause-all"])
+(def nemesis-names
+  ["kill-one" "pause-one" "kill-all" "pause-all" "partition-one"])
 (def full-suite-configurations
   [{:workload "register" :nemesis "kill-one"}
    {:workload "presence" :nemesis "kill-one"}
@@ -30,6 +31,7 @@
    {:workload "total-queue" :nemesis "kill-one"}
    {:workload "linear-queue" :nemesis "kill-one"}
    {:workload "register" :nemesis "pause-one"}
+   {:workload "register" :nemesis "partition-one"}
    {:workload "register" :nemesis "kill-all"}
    {:workload "register" :nemesis "pause-all"}])
 (def independent-threads-per-key 3)
@@ -199,7 +201,8 @@
     "kill-one" (zk-nemesis/kill-one cluster)
     "pause-one" (zk-nemesis/pause-one cluster)
     "kill-all" (zk-nemesis/kill-all cluster)
-    "pause-all" (zk-nemesis/pause-all cluster)))
+    "pause-all" (zk-nemesis/pause-all cluster)
+    "partition-one" (zk-nemesis/partition-one cluster)))
 
 (defn- test-name
   [workload-name nemesis-name]
@@ -226,7 +229,8 @@
                                 independent-threads-per-key))))
       (throw (ex-info "Independent register concurrency must be divisible by three"
                       {:concurrency (:concurrency opts)})))
-    (let [cluster (cluster/cluster binary nodes run-root)
+    (let [mode (if (= "partition-one" nemesis-name) :docker :process)
+          cluster (cluster/cluster binary nodes run-root mode)
           workload-spec (workload workload-name (:time-limit opts))]
       (info "ZooKeeper Zig Jepsen data directory:" (str (:root cluster)))
       (merge tests/noop-test

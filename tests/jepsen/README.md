@@ -25,18 +25,21 @@ The full suite adds:
 - `linear-queue`: the same queue operations checked for linearizability with an
   unordered queue model;
 - `pause-one`: repeated `SIGSTOP`/`SIGCONT` of one server process;
+- `partition-one`: isolation of one Docker-backed member from both Raft peers
+  while clients retain access to every node;
 - `kill-all` and `pause-all`: full-cluster crash and suspension followed by
   recovery.
 
-The register and partition test from
-[`jepsen-io/zookeeper`](https://github.com/jepsen-io/zookeeper) is covered by
-the register workload and local process nemeses. The `unique-ids`, `counter`,
-and all-node fault scenarios are clean-room adaptations of the
+The register workload and one-versus-majority partition shape from
+[`jepsen-io/zookeeper`](https://github.com/jepsen-io/zookeeper) are covered by
+the register workload and `partition-one`. The `unique-ids`, `counter`, and
+all-node fault scenarios are clean-room adaptations of the
 [ClickHouse Keeper Jepsen suite](https://github.com/ClickHouse/ClickHouse/tree/master/tests/jepsen.clickhouse/src/jepsen/clickhouse/keeper).
 The queue workloads use the Keeper suite's version-checked write-multi pattern
-to serialize concurrent removals. Network partition nemeses need per-node
-network namespaces rather than the current shared loopback harness. Storage
-corruption and watch scenarios remain excluded.
+to serialize concurrent removals. `partition-one` gives every server its own
+Docker network namespace and uses container-local firewall rules to isolate
+Raft peers without blocking Jepsen clients. Storage corruption and dedicated
+watch workloads remain excluded.
 
 ## Run
 
@@ -63,15 +66,16 @@ mise run test-jepsen-smoke
 
 Supported workloads are `register`, `presence`, `independent-register`, `set`,
 `unique-ids`, `counter`, `total-queue`, and `linear-queue`. Supported nemeses are
-`kill-one`, `pause-one`, `kill-all`, and `pause-all`. The independent register
-requires concurrency to be divisible by three.
+`kill-one`, `pause-one`, `partition-one`, `kill-all`, and `pause-all`. The
+independent register requires concurrency to be divisible by three.
 
 The default runner uses local Leiningen when available, then Docker or Podman.
 The container runner uses host networking and builds the local
-`zookeeper-zig-jepsen:0.3` image from `Dockerfile`. Its Noble-based
-Clojure/Leiningen base image is digest-pinned, and Git plus gnuplot are
-installed for Jepsen reports. Local runs use Aliyun mirrors for Ubuntu packages
-and Maven Central artifacts plus the TUNA Clojars mirror by default. GitHub
+`zookeeper-zig-jepsen:0.4` image from `Dockerfile`. Its Noble-based
+Clojure/Leiningen base image is digest-pinned, and Docker CLI, Git, and gnuplot
+are installed for orchestration and reports. Local runs use Aliyun mirrors for
+Ubuntu packages and Maven Central artifacts plus the TUNA Clojars mirror by
+default. GitHub
 Actions uses the official upstream repositories. Set
 `JEPSEN_MAVEN_MIRROR=central` and `JEPSEN_USE_ALIYUN_MIRRORS=false` to select
 the same behavior locally. Override the runtime or use a prebuilt image with
@@ -97,12 +101,15 @@ mise run test-jepsen
 
 Set `JEPSEN_COMMAND=test-all` when invoking `run.sh` through another build
 entry point. `JEPSEN_NODES` must contain an odd number of at least three logical
-node names. Each run allocates loopback ports dynamically and gives every
-server an independent data directory. No SSH or root privileges are required
-for these process-failure workloads. The container runs with its seccomp filter
-disabled because grpc-lite's libxev backend requires the `io_uring` syscalls
-blocked by Docker's default profile; only trusted test binaries should run in
-this image.
+node names. Process-failure runs allocate loopback ports dynamically and give
+every server an independent data directory without SSH or root privileges.
+`partition-one` builds `Dockerfile.node`, starts one sibling container per
+server on a private bridge, and requires access to the Docker socket. Node
+containers receive only `NET_ADMIN` plus an unconfined seccomp profile; the
+firewall blocks peer container addresses while retaining client access. Docker
+socket access is host-equivalent, so partition tests must run only trusted code.
+The unconfined profile is required because grpc-lite's libxev backend uses
+`io_uring` syscalls blocked by Docker's default profile.
 
 Jepsen histories and checker output are written under `tests/jepsen/store/`.
 Server data and logs are deleted after successful runs. Failed runs preserve
@@ -118,9 +125,11 @@ The report is written to `tests/jepsen/report/index.html` and links to each
 run's timeline, checker result, history, log, and performance graphs.
 
 GitHub Actions runs one 30-second register smoke test for matching pushes and
-pull requests. The nightly schedule runs the full suite with 120 seconds per
-configuration. Manual runs can select smoke or full coverage and configure the
-workload duration and test count. Every run uploads Jepsen reports and preserved
-failure logs. Non-PR runs also deploy the latest HTML report to GitHub Pages and
-show an `Open HTML report` link in the deployment job summary. Set the
-repository's Pages source to **GitHub Actions** once before the first deployment.
+pull requests without exposing the Docker socket. The nightly schedule and
+trusted manual full runs execute the complete suite, including `partition-one`,
+with Docker socket access and 120 seconds per configuration by default. Manual
+runs can configure the workload duration and test count. Every run uploads
+Jepsen reports and preserved failure logs. Non-PR runs also deploy the latest
+HTML report to GitHub Pages and show an `Open HTML report` link in the deployment
+job summary. Set the repository's Pages source to **GitHub Actions** once before
+the first deployment.

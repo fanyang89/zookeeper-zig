@@ -1,0 +1,5 @@
+FROM fedora:44
+
+RUN dnf install --assumeyes --setopt=install_weak_deps=False iptables-nft rocksdb snappy \
+    && dnf clean all \
+    && mkdir -p /opt/zookeeper-zig /var/lib/zookeeper-zig

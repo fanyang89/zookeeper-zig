@@ -7,7 +7,7 @@
   (setup! [_ _ node]
     (cluster/start-node! cluster node))
   (teardown! [_ _ node]
-    (cluster/stop-node! cluster node))
+    (cluster/teardown-node! cluster node))
 
   db/Kill
   (kill! [_ _ node]

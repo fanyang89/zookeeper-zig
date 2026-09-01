@@ -258,10 +258,11 @@ mise run test-jepsen
 
 Jepsen uses the official ZooKeeper 3.9.5 Java client. The full suite checks a
 CAS register, independent multi-key registers, create/delete presence,
-child-set behavior, persistent sequential IDs, and a monotonic counter. Faults
-include killing or pausing one node and crashing or suspending the full
-cluster. The runner uses Leiningen when installed, or Docker/Podman with host
-networking; it does not require SSH or root. See
+child-set behavior, persistent sequential IDs, a monotonic counter, and total
+and linearizable queues. Faults include killing, pausing, or network-isolating
+one node and crashing or suspending the full cluster. Process faults require no
+SSH or root; network partitions use Docker-backed nodes with isolated network
+namespaces and require Docker socket access. See
 [`tests/jepsen/README.md`](tests/jepsen/README.md) for configuration and current
 scope.
 

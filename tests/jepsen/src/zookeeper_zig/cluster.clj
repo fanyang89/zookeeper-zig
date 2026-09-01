@@ -1,6 +1,7 @@
 (ns zookeeper-zig.cluster
   (:require [clojure.string :as str]
-            [clojure.tools.logging :refer [info]])
+            [clojure.tools.logging :refer [info]]
+            [zookeeper-zig.docker-cluster :as docker-cluster])
   (:import (java.io File)
            (java.net InetSocketAddress ServerSocket Socket)
            (java.nio.file Files Path Paths)
@@ -43,36 +44,59 @@
                           {:port port})))))))
 
 (defn cluster
-  [binary nodes run-root]
-  (let [node-count (count nodes)
-        ports (reserve-ports (* 2 node-count))
-        root (.resolve (Paths/get run-root (make-array String 0))
-                       (str (UUID/randomUUID)))
-        configs (into {}
-                      (map-indexed
-                       (fn [index node]
-                         [node {:id (inc index)
-                                :client-port (ports index)
-                                :raft-port (ports (+ node-count index))
-                                :data-dir (.resolve root (str "node-" (inc index)))
-                                :log-file (.toFile
-                                           (.resolve root
-                                                     (str "node-" (inc index)
-                                                          ".log")))}])
-                       nodes))]
-    (Files/createDirectories root (make-array java.nio.file.attribute.FileAttribute 0))
-    {:binary binary
-     :cluster-id (str (UUID/randomUUID))
-     :nodes (vec nodes)
-     :configs configs
-     :root root
-     :state (atom {})}))
+  ([binary nodes run-root]
+   (cluster binary nodes run-root :process))
+  ([binary nodes run-root mode]
+   (let [node-count (count nodes)
+         ports (reserve-ports (* 2 node-count))
+         cluster-id (str (UUID/randomUUID))
+         suffix (subs (str/replace cluster-id "-" "") 0 12)
+         root (.resolve (Paths/get run-root (make-array String 0))
+                        cluster-id)
+         configs (into {}
+                       (map-indexed
+                        (fn [index node]
+                          [node {:id (inc index)
+                                 :client-port (ports index)
+                                 :raft-port (ports (+ node-count index))
+                                 :data-dir (.resolve root (str "node-" (inc index)))
+                                 :log-file (.toFile
+                                            (.resolve root
+                                                      (str "node-" (inc index)
+                                                           ".log")))}])
+                        nodes))
+         container-names (into {}
+                               (map (fn [node]
+                                      [node (str "zkj-" suffix "-"
+                                                 (str/replace (str node)
+                                                              #"[^A-Za-z0-9_.-]"
+                                                              "-"))])
+                                    nodes))]
+     (Files/createDirectories root (make-array java.nio.file.attribute.FileAttribute 0))
+     {:binary binary
+      :cluster-id cluster-id
+      :mode mode
+      :node-image (or (System/getenv "ZOOKEEPER_ZIG_NODE_IMAGE")
+                      "zookeeper-zig-jepsen-node:0.1")
+      :run-id (or (System/getenv "ZOOKEEPER_ZIG_RUN_ID") suffix)
+      :network-name (str "zkj-" suffix)
+      :container-names container-names
+      :nodes (vec nodes)
+      :configs configs
+      :root root
+      :state (atom {})})))
+
+(defn docker-mode?
+  [cluster]
+  (= :docker (:mode cluster)))
 
 (defn connect-string
   [cluster]
-  (->> (:nodes cluster)
-       (map #(str "127.0.0.1:" (get-in cluster [:configs % :client-port])))
-       (str/join ",")))
+  (if (docker-mode? cluster)
+    (docker-cluster/connect-string cluster)
+    (->> (:nodes cluster)
+         (map #(str "127.0.0.1:" (get-in cluster [:configs % :client-port])))
+         (str/join ","))))
 
 (defn- command
   [cluster node]
@@ -90,7 +114,7 @@
            "--data-dir" (str data-dir)]
           peers)))
 
-(defn start-node!
+(defn- start-process-node!
   [cluster node]
   (locking (:state cluster)
     (let [{:keys [client-port data-dir log-file]} (get-in cluster [:configs node])
@@ -131,7 +155,7 @@
                        :signal signal
                        :exit (.exitValue signal-process)})))))
 
-(defn pause-node!
+(defn- pause-process-node!
   [cluster node]
   (locking (:state cluster)
     (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
@@ -146,7 +170,7 @@
           :paused))
       :already-stopped)))
 
-(defn resume-node!
+(defn- resume-process-node!
   [cluster node]
   (locking (:state cluster)
     (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
@@ -159,7 +183,7 @@
         :already-running)
       :already-stopped)))
 
-(defn- terminate-node!
+(defn- terminate-process-node!
   [cluster node force?]
   (locking (:state cluster)
     (if-let [{:keys [process paused?]} (get @(:state cluster) node)]
@@ -178,15 +202,7 @@
         (if force? :killed :stopped))
       :already-stopped)))
 
-(defn stop-node!
-  [cluster node]
-  (terminate-node! cluster node false))
-
-(defn kill-node!
-  [cluster node]
-  (terminate-node! cluster node true))
-
-(defn running-nodes
+(defn- running-process-nodes
   [cluster]
   (locking (:state cluster)
     (->> (:nodes cluster)
@@ -194,3 +210,63 @@
                    (when-let [process (get-in @(:state cluster) [node :process])]
                      (.isAlive ^Process process))))
          vec)))
+
+(defn start-node!
+  [cluster node]
+  (if (docker-mode? cluster)
+    (docker-cluster/start-node! cluster node)
+    (start-process-node! cluster node)))
+
+(defn stop-node!
+  [cluster node]
+  (if (docker-mode? cluster)
+    (docker-cluster/stop-node! cluster node)
+    (terminate-process-node! cluster node false)))
+
+(defn kill-node!
+  [cluster node]
+  (if (docker-mode? cluster)
+    (docker-cluster/kill-node! cluster node)
+    (terminate-process-node! cluster node true)))
+
+(defn pause-node!
+  [cluster node]
+  (if (docker-mode? cluster)
+    (docker-cluster/pause-node! cluster node)
+    (pause-process-node! cluster node)))
+
+(defn resume-node!
+  [cluster node]
+  (if (docker-mode? cluster)
+    (docker-cluster/resume-node! cluster node)
+    (resume-process-node! cluster node)))
+
+(defn running-nodes
+  [cluster]
+  (if (docker-mode? cluster)
+    (docker-cluster/running-nodes cluster)
+    (running-process-nodes cluster)))
+
+(defn partition-node!
+  [cluster node]
+  (when-not (docker-mode? cluster)
+    (throw (ex-info "Network partitions require Docker nodes" {:node node})))
+  (docker-cluster/partition-node! cluster node))
+
+(defn heal-partition!
+  [cluster]
+  (when (docker-mode? cluster)
+    (docker-cluster/heal-partition! cluster)))
+
+(defn teardown-node!
+  [cluster node]
+  (let [result (stop-node! cluster node)]
+    (when (docker-mode? cluster)
+      (let [finished? (locking (:state cluster)
+                        (swap! (:state cluster) update :teardown-nodes
+                               (fnil conj #{}) node)
+                        (= (set (:nodes cluster))
+                           (:teardown-nodes @(:state cluster))))]
+        (when finished?
+          (docker-cluster/cleanup! cluster))))
+    result))

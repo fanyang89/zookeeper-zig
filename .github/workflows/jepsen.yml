@@ -49,7 +49,11 @@ concurrency:
 
 jobs:
   jepsen:
-    name: Jepsen ${{ github.event_name == 'schedule' && 'full suite' || inputs.suite || 'smoke' }}
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite != 'full')
+    name: Jepsen smoke
     runs-on: ubuntu-24.04
     outputs:
       pages_artifact_id: ${{ steps.upload-pages.outputs.artifact_id }}
@@ -61,9 +65,9 @@ jobs:
       run:
         shell: bash
     env:
-      JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || (github.event_name == 'schedule' && '120' || '30') }}
+      JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || '30' }}
       JEPSEN_TEST_COUNT: ${{ inputs.test_count || '1' }}
-      JEPSEN_COMMAND: ${{ (github.event_name == 'schedule' || inputs.suite == 'full') && 'test-all' || 'test' }}
+      JEPSEN_COMMAND: test
       JEPSEN_CONCURRENCY: "6"
       JEPSEN_MAVEN_MIRROR: central
       JEPSEN_RUNNER: host
@@ -103,12 +107,7 @@ jobs:
           lein version
 
       - name: Run Jepsen tests
-        run: |
-          if [[ "$JEPSEN_COMMAND" == test-all ]]; then
-            zig build test-jepsen -Dsystem-rocksdb=true --summary all
-          else
-            zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
-          fi
+        run: zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
 
       - name: Build Jepsen HTML report
         id: report
@@ -136,10 +135,104 @@ jobs:
         with:
           path: tests/jepsen/report
 
+  jepsen-full:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.suite == 'full')
+    name: Jepsen full suite
+    runs-on: ubuntu-24.04
+    outputs:
+      pages_artifact_id: ${{ steps.upload-pages.outputs.artifact_id }}
+    container:
+      image: fedora:44
+      options: --security-opt seccomp=unconfined
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      JEPSEN_TIME_LIMIT: ${{ inputs.time_limit || '120' }}
+      JEPSEN_TEST_COUNT: ${{ inputs.test_count || '1' }}
+      JEPSEN_COMMAND: test-all
+      JEPSEN_CONCURRENCY: "6"
+      JEPSEN_MAVEN_MIRROR: central
+      JEPSEN_RUNNER: host
+      JEPSEN_USE_ALIYUN_MIRRORS: "false"
+      LEIN_ROOT: "1"
+
+    steps:
+      - name: Install Fedora toolchain
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False \
+            binutils cmake curl docker-cli git gnuplot-minimal java-25-openjdk-headless make \
+            ninja-build pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel zig
+          test "$(zig version)" = "0.16.0"
+          java -version
+          docker version
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Leiningen dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.lein
+            ~/.m2/repository
+          key: jepsen-lein-2.13.0-fedora-44-${{ runner.arch }}-${{ hashFiles('tests/jepsen/project.clj') }}
+          restore-keys: |
+            jepsen-lein-2.13.0-fedora-44-${{ runner.arch }}-
+
+      - name: Install Leiningen
+        run: |
+          curl --fail --location --retry 5 --show-error --silent \
+            https://codeberg.org/leiningen/leiningen/raw/tag/2.13.0/bin/lein \
+            --output /usr/local/bin/lein
+          echo "6990083d62cc2241184660c70d6ead8ffeb3530f3c6fa4e7c3bff47c5c7c2181  /usr/local/bin/lein" \
+            | sha256sum --check --strict
+          chmod 0755 /usr/local/bin/lein
+          lein version
+
+      - name: Run Jepsen tests
+        run: zig build test-jepsen -Dsystem-rocksdb=true --summary all
+
+      - name: Build Jepsen HTML report
+        id: report
+        if: always()
+        run: |
+          cd tests/jepsen
+          lein run -m zookeeper-zig.report store report
+
+      - name: Upload Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tests/jepsen/store
+            tests/jepsen/target
+            tests/jepsen/report
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Jepsen Pages artifact
+        id: upload-pages
+        if: always() && steps.report.outcome == 'success'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: tests/jepsen/report
+
   deploy-report:
     name: Publish Jepsen report
-    needs: jepsen
-    if: always() && needs.jepsen.outputs.pages_artifact_id != ''
+    needs:
+      - jepsen
+      - jepsen-full
+    if: >-
+      always() &&
+      (needs.jepsen.outputs.pages_artifact_id != '' ||
+       needs.jepsen-full.outputs.pages_artifact_id != '')
     runs-on: ubuntu-24.04
     permissions:
       contents: read
