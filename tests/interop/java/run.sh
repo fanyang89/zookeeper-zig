@@ -137,7 +137,7 @@ join_by_plus() {
     local IFS=+
     echo "$*"
 }
-default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest,MultiInteropTest,QuorumFailoverInteropTest"
+default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest,MultiInteropTest,WatchInteropTest,QuorumFailoverInteropTest"
 test_selector=${ZOOKEEPER_TEST_SELECTOR:-$default_test_selector}
 
 maven_settings_args=()
@@ -175,4 +175,9 @@ status=$?
 set -e
 kill -TERM -- "-$maven_pid" 2>/dev/null || true
 maven_pid=
+if [[ ${ZOOKEEPER_PRINT_SERVER_LOG:-false} == true ]]; then
+    find "$worktree/zookeeper-server/target" -type f \
+        \( -name zig-server.log -o -name 'zig-server-*.log' \) \
+        -print -exec cat {} \; 2>/dev/null || true
+fi
 exit "$status"

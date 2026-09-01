@@ -12,6 +12,7 @@ const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
 const multi = @import("multi.zig");
 const quorum_mod = @import("quorum.zig");
+const watch = @import("watch.zig");
 const worker_pool = @import("worker_pool.zig");
 
 const ConnectionSession = struct {
@@ -23,6 +24,7 @@ const ConnectionSession = struct {
 
 const ConnectionContext = struct {
     session: ConnectionSession,
+    connection_id: watch.ConnectionId,
     identities: std.ArrayList(acl.Identity) = .empty,
 
     fn deinit(self: *ConnectionContext, allocator: std.mem.Allocator) void {
@@ -39,6 +41,7 @@ const SessionMutationResult = struct {
 
 const ResponseSink = struct {
     frame: ?[]u8 = null,
+    watch_batch: ?watch.BatchId = null,
 
     fn deinit(self: *ResponseSink, allocator: std.mem.Allocator) void {
         if (self.frame) |frame| allocator.free(frame);
@@ -54,6 +57,112 @@ const ResponseSink = struct {
         const frame = self.frame orelse return error.MissingResponse;
         self.frame = null;
         return frame;
+    }
+
+    fn activateWatchesAfterReply(self: *ResponseSink, batch_id: watch.BatchId) !void {
+        if (self.watch_batch != null) return error.MultipleWatchBatches;
+        self.watch_batch = batch_id;
+    }
+};
+
+const ConnectionState = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    transport: *TcpTransport,
+    notifications: std.Io.Queue([]u8),
+    notification_buffer: [][]u8,
+    write_mutex: std.Io.Mutex = .init,
+    failed: std.atomic.Value(bool) = .init(false),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        transport: *TcpTransport,
+        capacity: usize,
+    ) !ConnectionState {
+        const buffer = try allocator.alloc([]u8, capacity);
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .transport = transport,
+            .notifications = .init(buffer),
+            .notification_buffer = buffer,
+        };
+    }
+
+    fn deinit(self: *ConnectionState) void {
+        self.notifications.close(self.io);
+        while (self.notifications.getOneUncancelable(self.io)) |frame| {
+            self.allocator.free(frame);
+        } else |err| switch (err) {
+            error.Closed => {},
+        }
+        self.allocator.free(self.notification_buffer);
+        self.* = undefined;
+    }
+
+    fn sink(self: *ConnectionState) watch.Sink {
+        return .{
+            .context = self,
+            .notifyFn = enqueueWatchEvent,
+            .failFn = failWatchConnection,
+        };
+    }
+
+    fn failWatchConnection(context: *anyopaque) void {
+        const self: *ConnectionState = @ptrCast(@alignCast(context));
+        self.fail();
+    }
+
+    fn enqueueWatchEvent(context: *anyopaque, event: watch.Event) bool {
+        const self: *ConnectionState = @ptrCast(@alignCast(context));
+        if (self.failed.load(.acquire)) return false;
+        var writer = jute.Writer.init(self.allocator);
+        defer writer.deinit();
+        wire.encodeReply(&writer, .{
+            .xid = wire.Xid.notification,
+            .zxid = event.zxid,
+            .err = 0,
+        }, protocol.proto.WatcherEvent{
+            .type = @intFromEnum(event.type),
+            .state = 3,
+            .path = event.path,
+        }) catch {
+            self.fail();
+            return false;
+        };
+        const frame = writer.toOwnedSlice() catch {
+            self.fail();
+            return false;
+        };
+        const queued = self.notifications.putUncancelable(self.io, &.{frame}, 0) catch {
+            self.allocator.free(frame);
+            self.fail();
+            return false;
+        };
+        if (queued == 0) {
+            self.allocator.free(frame);
+            self.fail();
+            return false;
+        }
+        return true;
+    }
+
+    fn writeFrame(self: *ConnectionState, frame: []const u8) !void {
+        if (self.failed.load(.acquire)) return error.ConnectionClosed;
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.failed.load(.acquire)) return error.ConnectionClosed;
+        self.transport.writeFrame(self.io, frame) catch |err| {
+            self.fail();
+            return err;
+        };
+    }
+
+    fn fail(self: *ConnectionState) void {
+        if (self.failed.swap(true, .acq_rel)) return;
+        self.notifications.close(self.io);
+        self.transport.shutdown(self.io);
     }
 };
 
@@ -77,6 +186,7 @@ const EstablishJob = struct {
 const DispatchResult = struct {
     keep_open: bool,
     frame: []u8,
+    watch_batch: ?watch.BatchId,
 };
 
 const DispatchCompletion = union(enum) {
@@ -104,6 +214,7 @@ const RequestPool = worker_pool.WorkerPool(RequestJob, *TcpServer, handleRequest
 pub const Options = struct {
     request_worker_count: usize = 0,
     request_queue_capacity: usize = 256,
+    notification_queue_capacity: usize = 256,
 };
 
 pub const TcpServer = struct {
@@ -112,6 +223,8 @@ pub const TcpServer = struct {
     quorum: *quorum_mod.Quorum,
     address: std.Io.net.IpAddress,
     requests: RequestPool,
+    watch_manager: watch.Manager,
+    notification_queue_capacity: usize,
     connections: std.Io.Group = .init,
 
     pub fn init(
@@ -123,6 +236,7 @@ pub const TcpServer = struct {
         options: Options,
     ) !TcpServer {
         if (options.request_queue_capacity == 0) return error.InvalidRequestQueueCapacity;
+        if (options.notification_queue_capacity == 0) return error.InvalidNotificationQueueCapacity;
         const address = try std.Io.net.IpAddress.parseIp4(host, port);
         const request_worker_count = if (options.request_worker_count == 0)
             @max(std.Thread.getCpuCount() catch 1, 1)
@@ -139,12 +253,16 @@ pub const TcpServer = struct {
                 request_worker_count,
                 options.request_queue_capacity,
             ),
+            .watch_manager = .init(allocator),
+            .notification_queue_capacity = options.notification_queue_capacity,
         };
     }
 
     pub fn deinit(self: *TcpServer) void {
         self.connections.cancel(self.io);
+        self.quorum.machine.detachWatchManager(&self.watch_manager);
         self.requests.deinit();
+        self.watch_manager.deinit();
         self.* = undefined;
     }
 
@@ -164,6 +282,8 @@ pub const TcpServer = struct {
     }
 
     fn start(self: *TcpServer) !void {
+        self.quorum.machine.attachWatchManager(&self.watch_manager);
+        errdefer self.quorum.machine.detachWatchManager(&self.watch_manager);
         try self.requests.start(self);
     }
 
@@ -185,8 +305,37 @@ pub const TcpServer = struct {
         );
         defer self.allocator.free(connect_payload);
         const connect = try wire.decodeConnectRequest(connect_payload);
+        const leader_wait_ms: u64 = @intCast(@min(@max(connect.value.timeOut, 2_000), 40_000));
+        var waited_ms: u64 = 0;
+        while (self.quorum.status().leader_id == 0 and waited_ms < leader_wait_ms) {
+            try self.io.sleep(.fromMilliseconds(10), .awake);
+            waited_ms += 10;
+        }
+        if (self.quorum.status().leader_id == 0) return error.ConnectionLoss;
+        if (connect.value.lastZxidSeen > appliedZxid(self.quorum)) {
+            return error.ClientZxidAhead;
+        }
         const session = (try self.submitEstablish(&transport, connect)) orelse return;
-        var context = ConnectionContext{ .session = session };
+        var connection = try ConnectionState.init(
+            self.allocator,
+            self.io,
+            &transport,
+            self.notification_queue_capacity,
+        );
+        defer connection.deinit();
+        var notification_tasks: std.Io.Group = .init;
+        try notification_tasks.concurrent(self.io, notificationWriterMain, .{&connection});
+        defer notification_tasks.cancel(self.io);
+        const connection_id = try self.watch_manager.addSessionConnection(
+            session.id,
+            session.generation,
+            connection.sink(),
+        );
+        defer self.watch_manager.removeConnection(connection_id);
+        var context = ConnectionContext{
+            .session = session,
+            .connection_id = connection_id,
+        };
         defer context.deinit(self.allocator);
         const remote_ip = try peerIpv4Alloc(self.allocator, transport.stream);
         context.identities.append(self.allocator, .{ .scheme = "ip", .id = remote_ip }) catch |err| {
@@ -208,11 +357,11 @@ pub const TcpServer = struct {
                 try sendError(&sink, self.allocator, self.io, request.header.xid, -1, .unimplemented);
                 const frame = try sink.take();
                 defer self.allocator.free(frame);
-                try transport.writeFrame(self.io, frame);
+                try connection.writeFrame(frame);
                 return;
             };
             const keep_open = try self.submitDispatch(
-                &transport,
+                &connection,
                 &context,
                 request.header.xid,
                 opcode,
@@ -250,7 +399,7 @@ pub const TcpServer = struct {
 
     fn submitDispatch(
         self: *TcpServer,
-        transport: *TcpTransport,
+        connection: *ConnectionState,
         context: *ConnectionContext,
         xid: i32,
         opcode: wire.OpCode,
@@ -275,7 +424,10 @@ pub const TcpServer = struct {
             .pending => unreachable,
             .success => |result| {
                 defer self.allocator.free(result.frame);
-                try transport.writeFrame(self.io, result.frame);
+                try connection.writeFrame(result.frame);
+                if (result.watch_batch) |batch_id| {
+                    self.watch_manager.activateBatch(context.connection_id, batch_id);
+                }
                 return result.keep_open;
             },
             .failure => |err| err,
@@ -329,6 +481,11 @@ pub const TcpServer = struct {
 
         try self.quorum.linearizableRead();
         const stored = (try self.quorum.machine.getSession(connect.value.sessionId)) orelse {
+            raft.log.info(
+                @src(),
+                "ZooKeeper session {d} is unavailable for reconnect",
+                .{connect.value.sessionId},
+            );
             try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
             return null;
         };
@@ -336,6 +493,11 @@ pub const TcpServer = struct {
         if (supplied_password.len != stored.password.len or
             !std.mem.eql(u8, supplied_password, &stored.password))
         {
+            raft.log.info(
+                @src(),
+                "ZooKeeper session {d} supplied an invalid reconnect password",
+                .{connect.value.sessionId},
+            );
             try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
             return null;
         }
@@ -350,6 +512,11 @@ pub const TcpServer = struct {
             .new_generation = new_generation,
         } });
         if (result.code != .ok) {
+            raft.log.info(
+                @src(),
+                "ZooKeeper session {d} reconnect failed: {s}",
+                .{ connect.value.sessionId, @tagName(result.code) },
+            );
             try sendFailedConnect(transport, self.allocator, self.io, connect.read_only_supported);
             return null;
         }
@@ -390,7 +557,12 @@ pub const TcpServer = struct {
                 .session_id = session.id,
                 .password = &session.password,
                 .generation = session.generation,
-            } }) catch {
+            } }) catch |err| {
+                raft.log.err(
+                    @src(),
+                    "failed to touch ZooKeeper session {d} for opcode {s}: {s}",
+                    .{ session.id, @tagName(opcode), @errorName(err) },
+                );
                 try sendError(transport, self.allocator, self.io, xid, -1, .connection_loss);
                 return false;
             };
@@ -409,6 +581,7 @@ pub const TcpServer = struct {
                 return true;
             },
             .close_session => {
+                self.watch_manager.removeConnection(context.connection_id);
                 const closed = self.proposeSession(.{ .close_session = .{
                     .session_id = session.id,
                     .password = &session.password,
@@ -436,10 +609,40 @@ pub const TcpServer = struct {
             .set_data => try self.setData(transport, session, context.identities.items, xid, body),
             .multi => try self.multiRequest(transport, session, context.identities.items, xid, body),
             .multi_read => try self.multiReadRequest(transport, session, context.identities.items, xid, body),
-            .exists => try self.exists(transport, session, context.identities.items, xid, body),
+            .exists => try self.exists(
+                transport,
+                session,
+                context.connection_id,
+                context.identities.items,
+                xid,
+                body,
+            ),
             .get_acl => try self.getAcl(transport, session, context.identities.items, xid, body),
-            .get_data => try self.getData(transport, session, context.identities.items, xid, body),
-            .get_children, .get_children2 => try self.getChildren(transport, session, context.identities.items, xid, opcode, body),
+            .get_data => try self.getData(
+                transport,
+                session,
+                context.connection_id,
+                context.identities.items,
+                xid,
+                body,
+            ),
+            .get_children, .get_children2 => try self.getChildren(
+                transport,
+                session,
+                context.connection_id,
+                context.identities.items,
+                xid,
+                opcode,
+                body,
+            ),
+            .set_watches, .set_watches2 => try self.setWatches(
+                transport,
+                session,
+                context.connection_id,
+                xid,
+                opcode,
+                body,
+            ),
             .sync => try self.sync(transport, session, xid, body),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
@@ -916,6 +1119,7 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *ResponseSink,
         session: ConnectionSession,
+        connection_id: watch.ConnectionId,
         identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
@@ -933,11 +1137,17 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        const maybe_stat = self.quorum.machine.existsAuthorizedForSession(
+        const registration = try self.beginWatchRegistration(
+            transport,
+            connection_id,
+            request.watch,
+        );
+        const maybe_stat = self.quorum.machine.existsAuthorizedWatchingForSession(
             session.id,
             session.generation,
             path,
             identities_blob,
+            registration,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -1015,6 +1225,7 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *ResponseSink,
         session: ConnectionSession,
+        connection_id: watch.ConnectionId,
         identities: []const acl.Identity,
         xid: i32,
         bytes: []const u8,
@@ -1032,12 +1243,18 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        var result = (self.quorum.machine.getDataAuthorizedForSession(
+        const registration = try self.beginWatchRegistration(
+            transport,
+            connection_id,
+            request.watch,
+        );
+        var result = (self.quorum.machine.getDataAuthorizedWatchingForSession(
             self.allocator,
             session.id,
             session.generation,
             path,
             identities_blob,
+            registration,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -1054,23 +1271,25 @@ pub const TcpServer = struct {
         self: *TcpServer,
         transport: *ResponseSink,
         session: ConnectionSession,
+        connection_id: watch.ConnectionId,
         identities: []const acl.Identity,
         xid: i32,
         opcode: wire.OpCode,
         bytes: []const u8,
     ) !void {
-        const path: ?[]const u8 = if (opcode == .get_children) blk: {
+        const RequestInfo = struct { path: ?[]const u8, watch: bool };
+        const request_info: RequestInfo = if (opcode == .get_children) blk: {
             const request = try decodeBody(protocol.proto.GetChildrenRequest, bytes, self.allocator);
-            break :blk request.path;
+            break :blk .{ .path = request.path, .watch = request.watch };
         } else blk: {
             const request = try decodeBody(protocol.proto.GetChildren2Request, bytes, self.allocator);
-            break :blk request.path;
+            break :blk .{ .path = request.path, .watch = request.watch };
         };
         const identities_blob = try acl.encodeIdentities(self.allocator, identities);
         defer self.allocator.free(identities_blob);
         try self.quorum.linearizableRead();
         const zxid = appliedZxid(self.quorum);
-        const resolved_path = path orelse return sendError(
+        const resolved_path = request_info.path orelse return sendError(
             transport,
             self.allocator,
             self.io,
@@ -1078,12 +1297,18 @@ pub const TcpServer = struct {
             zxid,
             .bad_arguments,
         );
-        var result = (self.quorum.machine.getChildrenAuthorizedForSession(
+        const registration = try self.beginWatchRegistration(
+            transport,
+            connection_id,
+            request_info.watch,
+        );
+        var result = (self.quorum.machine.getChildrenAuthorizedWatchingForSession(
             self.allocator,
             session.id,
             session.generation,
             resolved_path,
             identities_blob,
+            registration,
         ) catch |err| return sendMappedSessionError(
             transport,
             self.allocator,
@@ -1103,6 +1328,134 @@ pub const TcpServer = struct {
         }
     }
 
+    fn setWatches(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        connection_id: watch.ConnectionId,
+        xid: i32,
+        opcode: wire.OpCode,
+        bytes: []const u8,
+    ) !void {
+        if (opcode == .set_watches) {
+            const request = try decodeBody(protocol.proto.SetWatches, bytes, self.allocator);
+            defer jute.deinitDecoded(request, self.allocator);
+            return self.restoreWatches(
+                transport,
+                session,
+                connection_id,
+                xid,
+                request.relativeZxid,
+                request.dataWatches,
+                request.existWatches,
+                request.childWatches,
+            );
+        }
+
+        const request = try decodeBody(protocol.proto.SetWatches2, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        if ((request.persistentWatches != null and request.persistentWatches.?.len != 0) or
+            (request.persistentRecursiveWatches != null and
+                request.persistentRecursiveWatches.?.len != 0))
+        {
+            return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .unimplemented,
+            );
+        }
+        return self.restoreWatches(
+            transport,
+            session,
+            connection_id,
+            xid,
+            request.relativeZxid,
+            request.dataWatches,
+            request.existWatches,
+            request.childWatches,
+        );
+    }
+
+    fn restoreWatches(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        connection_id: watch.ConnectionId,
+        xid: i32,
+        relative_zxid: i64,
+        data_watches: ?[]const ?[]const u8,
+        exist_watches: ?[]const ?[]const u8,
+        child_watches: ?[]const ?[]const u8,
+    ) !void {
+        if (!validWatchPathList(data_watches) or
+            !validWatchPathList(exist_watches) or
+            !validWatchPathList(child_watches))
+        {
+            return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .bad_arguments,
+            );
+        }
+        const registration = (try self.beginWatchRegistration(
+            transport,
+            connection_id,
+            true,
+        )).?;
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        self.quorum.machine.restoreWatchesForSession(
+            session.id,
+            session.generation,
+            relative_zxid,
+            data_watches,
+            exist_watches,
+            child_watches,
+            registration,
+        ) catch |err| switch (err) {
+            error.SessionExpired, error.SessionMoved => return sendMappedSessionError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                err,
+            ),
+            error.InvalidWatchPath => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                .bad_arguments,
+            ),
+            else => return err,
+        };
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, {});
+    }
+
+    fn beginWatchRegistration(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        connection_id: watch.ConnectionId,
+        requested: bool,
+    ) !?watch.RegistrationContext {
+        if (!requested) return null;
+        const batch_id = try self.watch_manager.beginBatch(connection_id);
+        try transport.activateWatchesAfterReply(batch_id);
+        return .{ .connection_id = connection_id, .batch_id = batch_id };
+    }
+
     fn sync(
         self: *TcpServer,
         transport: *ResponseSink,
@@ -1118,6 +1471,20 @@ pub const TcpServer = struct {
         try sendReply(transport, self.allocator, self.io, .{ .xid = xid, .zxid = zxid, .err = 0 }, protocol.proto.SyncResponse{ .path = request.path });
     }
 };
+
+fn notificationWriterMain(connection: *ConnectionState) std.Io.Cancelable!void {
+    while (true) {
+        const frame = connection.notifications.getOne(connection.io) catch |err| switch (err) {
+            error.Closed => return,
+            error.Canceled => return error.Canceled,
+        };
+        defer connection.allocator.free(frame);
+        connection.writeFrame(frame) catch {
+            connection.fail();
+            return;
+        };
+    }
+}
 
 fn handleRequestJob(server: *TcpServer, job: RequestJob) void {
     switch (job) {
@@ -1162,7 +1529,11 @@ fn completeDispatchJob(server: *TcpServer, job: *DispatchJob) void {
         job.done.set(server.io);
         return;
     };
-    job.completion = .{ .success = .{ .keep_open = keep_open, .frame = frame } };
+    job.completion = .{ .success = .{
+        .keep_open = keep_open,
+        .frame = frame,
+        .watch_batch = sink.watch_batch,
+    } };
     job.done.set(server.io);
 }
 
@@ -1281,6 +1652,14 @@ fn appliedZxid(quorum: *quorum_mod.Quorum) i64 {
     return quorum.machine.clientZxid();
 }
 
+fn validWatchPathList(paths: ?[]const ?[]const u8) bool {
+    for (paths orelse &.{}) |maybe_path| {
+        const path = maybe_path orelse return false;
+        if (!data_tree.isValidPath(path)) return false;
+    }
+    return true;
+}
+
 fn peerIpv4Alloc(
     allocator: std.mem.Allocator,
     stream: std.Io.net.Stream,
@@ -1359,6 +1738,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         .session_reap_interval_ms = 10,
     });
     defer quorum.deinit();
+    defer if (quorum.running) quorum.shutdown() catch {};
     var attempts: usize = 0;
     while (quorum.status().leader_id == 0 and attempts < 500) : (attempts += 1) {
         try testing.io.sleep(.fromMilliseconds(10), .awake);
@@ -1814,13 +2194,10 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     var authorized_reply = try expectResponse(&resumed, authorized_xid);
     defer authorized_reply.deinit();
 
-    try client.sendPing();
-    var fenced_reply = try client.receive();
-    defer fenced_reply.deinit();
-    try testing.expectEqual(@as(i32, @intFromEnum(data_tree.ErrorCode.session_moved)), fenced_reply.header.err);
+    try testing.expectError(error.EndOfStream, client.receive());
     client.deinit();
     client_active = false;
-    try server_future.await(testing.io);
+    try testing.expectError(error.EndOfStream, server_future.await(testing.io));
     try testing.expect((try quorum.machine.getSession(session_id)) != null);
     try testing.expect((try quorum.machine.exists(ephemeral_path)) != null);
 
@@ -1829,4 +2206,14 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     try testing.expect((try quorum.machine.getSession(session_id)) == null);
     try testing.expect((try quorum.machine.exists(ephemeral_path)) == null);
     try quorum.shutdown();
+}
+
+test "setWatches validates every path before registration" {
+    const testing = std.testing;
+    const valid = [_]?[]const u8{ "/a", "/b" };
+    const null_entry = [_]?[]const u8{ "/a", null };
+    const invalid = [_]?[]const u8{ "/a", "relative" };
+    try testing.expect(validWatchPathList(&valid));
+    try testing.expect(!validWatchPathList(&null_entry));
+    try testing.expect(!validWatchPathList(&invalid));
 }

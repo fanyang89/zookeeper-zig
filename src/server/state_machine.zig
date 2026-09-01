@@ -7,6 +7,7 @@ const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
 const multi = @import("multi.zig");
 const rocks_store = @import("rocks_store.zig");
+const watch = @import("watch.zig");
 
 pub const max_snapshot_bytes = rocks_store.max_snapshot_bytes;
 
@@ -48,6 +49,7 @@ pub const ZooKeeperStateMachine = struct {
     allocator: std.mem.Allocator,
     store: rocks_store.RocksStore,
     mutex: std.atomic.Mutex = .unlocked,
+    watch_manager: ?*watch.Manager = null,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !ZooKeeperStateMachine {
         return .{
@@ -63,6 +65,19 @@ pub const ZooKeeperStateMachine = struct {
 
     pub fn stateMachine(self: *ZooKeeperStateMachine) raft.StateMachine {
         return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    pub fn attachWatchManager(self: *ZooKeeperStateMachine, manager: *watch.Manager) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(self.watch_manager == null);
+        self.watch_manager = manager;
+    }
+
+    pub fn detachWatchManager(self: *ZooKeeperStateMachine, manager: *watch.Manager) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.watch_manager == manager) self.watch_manager = null;
     }
 
     pub fn exists(self: *ZooKeeperStateMachine, path: []const u8) !?protocol.data.Stat {
@@ -110,12 +125,35 @@ pub const ZooKeeperStateMachine = struct {
         path: []const u8,
         identities: ?[]const u8,
     ) !?protocol.data.Stat {
+        return self.existsAuthorizedWatchingForSession(
+            session_id,
+            generation,
+            path,
+            identities,
+            null,
+        );
+    }
+
+    pub fn existsAuthorizedWatchingForSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+        registration: ?watch.RegistrationContext,
+    ) !?protocol.data.Stat {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
         switch (try self.store.authorize(path, acl.read, identities)) {
-            .ok => return self.store.exists(path),
-            .no_node => return null,
+            .ok => {
+                try self.registerWatchLocked(registration, .data, path);
+                return self.store.exists(path);
+            },
+            .no_node => {
+                try self.registerWatchLocked(registration, .data, path);
+                return null;
+            },
             .no_auth => return error.NoAuth,
             else => return error.NoAuth,
         }
@@ -139,6 +177,25 @@ pub const ZooKeeperStateMachine = struct {
         path: []const u8,
         identities: ?[]const u8,
     ) !?DataResult {
+        return self.getDataAuthorizedWatchingForSession(
+            allocator,
+            session_id,
+            generation,
+            path,
+            identities,
+            null,
+        );
+    }
+
+    pub fn getDataAuthorizedWatchingForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+        registration: ?watch.RegistrationContext,
+    ) !?DataResult {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
@@ -149,6 +206,8 @@ pub const ZooKeeperStateMachine = struct {
             else => return error.NoAuth,
         }
         const result = (try self.store.getData(allocator, path)) orelse return null;
+        errdefer if (result.data) |data| allocator.free(data);
+        try self.registerWatchLocked(registration, .data, path);
         return .{ .data = result.data, .stat = result.stat };
     }
 
@@ -170,6 +229,25 @@ pub const ZooKeeperStateMachine = struct {
         path: []const u8,
         identities: ?[]const u8,
     ) !?ChildrenResult {
+        return self.getChildrenAuthorizedWatchingForSession(
+            allocator,
+            session_id,
+            generation,
+            path,
+            identities,
+            null,
+        );
+    }
+
+    pub fn getChildrenAuthorizedWatchingForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        path: []const u8,
+        identities: ?[]const u8,
+        registration: ?watch.RegistrationContext,
+    ) !?ChildrenResult {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         try self.validateSessionLocked(session_id, generation);
@@ -181,6 +259,11 @@ pub const ZooKeeperStateMachine = struct {
         }
         const stat = (try self.store.exists(path)) orelse return null;
         const names = (try self.store.getChildren(allocator, path)).?;
+        errdefer {
+            for (names) |name| allocator.free(name);
+            allocator.free(names);
+        }
+        try self.registerWatchLocked(registration, .children, path);
         return .{ .names = names, .stat = stat };
     }
 
@@ -369,6 +452,105 @@ pub const ZooKeeperStateMachine = struct {
         return self.store.expiredExtendedNodes(allocator, limit);
     }
 
+    pub fn restoreWatchesForSession(
+        self: *ZooKeeperStateMachine,
+        session_id: i64,
+        generation: u64,
+        relative_zxid: i64,
+        data_watches: ?[]const ?[]const u8,
+        exist_watches: ?[]const ?[]const u8,
+        child_watches: ?[]const ?[]const u8,
+        registration: watch.RegistrationContext,
+    ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+        for (data_watches orelse &.{}) |maybe_path| {
+            const path = maybe_path orelse return error.InvalidWatchPath;
+            const stat = try self.store.exists(path);
+            if (stat == null) {
+                try self.registerImmediateWatchLocked(
+                    registration,
+                    .data,
+                    path,
+                    .node_deleted,
+                );
+            } else if (stat.?.mzxid > relative_zxid) {
+                try self.registerImmediateWatchLocked(
+                    registration,
+                    .data,
+                    path,
+                    .node_data_changed,
+                );
+            } else {
+                try self.registerWatchLocked(registration, .data, path);
+            }
+        }
+        for (exist_watches orelse &.{}) |maybe_path| {
+            const path = maybe_path orelse return error.InvalidWatchPath;
+            if (try self.store.exists(path) != null) {
+                try self.registerImmediateWatchLocked(
+                    registration,
+                    .data,
+                    path,
+                    .node_created,
+                );
+            } else {
+                try self.registerWatchLocked(registration, .data, path);
+            }
+        }
+        for (child_watches orelse &.{}) |maybe_path| {
+            const path = maybe_path orelse return error.InvalidWatchPath;
+            const stat = try self.store.exists(path);
+            if (stat == null) {
+                try self.registerImmediateWatchLocked(
+                    registration,
+                    .children,
+                    path,
+                    .node_deleted,
+                );
+            } else if (stat.?.pzxid > relative_zxid) {
+                try self.registerImmediateWatchLocked(
+                    registration,
+                    .children,
+                    path,
+                    .node_children_changed,
+                );
+            } else {
+                try self.registerWatchLocked(registration, .children, path);
+            }
+        }
+    }
+
+    fn registerWatchLocked(
+        self: *ZooKeeperStateMachine,
+        registration: ?watch.RegistrationContext,
+        kind: watch.Kind,
+        path: []const u8,
+    ) !void {
+        const value = registration orelse return;
+        const manager = self.watch_manager orelse return error.WatchManagerUnavailable;
+        try manager.register(value.connection_id, value.batch_id, kind, path);
+    }
+
+    fn registerImmediateWatchLocked(
+        self: *ZooKeeperStateMachine,
+        registration: watch.RegistrationContext,
+        kind: watch.Kind,
+        path: []const u8,
+        event_type: watch.EventType,
+    ) !void {
+        const manager = self.watch_manager orelse return error.WatchManagerUnavailable;
+        try manager.registerImmediate(
+            registration.connection_id,
+            registration.batch_id,
+            kind,
+            path,
+            event_type,
+            -1,
+        );
+    }
+
     fn validateSessionLocked(
         self: *ZooKeeperStateMachine,
         session_id: i64,
@@ -412,27 +594,54 @@ pub const ZooKeeperStateMachine = struct {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         const zxid = self.store.clientZxid(entry.index) catch return error.Fatal;
+        const removed_ephemeral_paths: ?[][]u8 = if (self.watch_manager != null) switch (mutation) {
+            .close_session => |request| self.store.ephemeralPaths(
+                self.allocator,
+                request.session_id,
+            ) catch |err| return mapStoreError(err),
+            .expire_session => |request| self.store.ephemeralPaths(
+                self.allocator,
+                request.session_id,
+            ) catch |err| return mapStoreError(err),
+            else => null,
+        } else null;
+        defer if (removed_ephemeral_paths) |paths| {
+            for (paths) |path| self.allocator.free(path);
+            self.allocator.free(paths);
+        };
         var result = self.store.apply(mutation, entry.index, entry.term) catch |err|
             return mapStoreError(err);
         defer result.deinit(self.allocator);
 
         writer.writeInt(@intFromEnum(result.code)) catch unreachable;
         writer.writeLong(zxid) catch unreachable;
-        if (result.code == .ok) switch (mutation) {
-            .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
-                .path = result.created_path orelse value.path,
-                .stat = result.stat.?,
-            }) catch unreachable,
-            .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => {},
-            .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
-                .stat = result.stat.?,
-            }) catch unreachable,
-            .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
-                .stat = result.stat.?,
-            }) catch unreachable,
-            .multi => writer.writeBytes(result.response_body orelse return error.Fatal) catch
-                return error.OutOfMemory,
-        };
+        if (result.code == .ok) {
+            if (self.watch_manager) |manager| {
+                publishMutationEvents(
+                    manager,
+                    self.allocator,
+                    mutation,
+                    result,
+                    zxid,
+                    removed_ephemeral_paths orelse &.{},
+                ) catch manager.invalidateAll();
+            }
+            switch (mutation) {
+                .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
+                    .path = result.created_path orelse value.path,
+                    .stat = result.stat.?,
+                }) catch unreachable,
+                .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => {},
+                .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
+                    .stat = result.stat.?,
+                }) catch unreachable,
+                .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
+                    .stat = result.stat.?,
+                }) catch unreachable,
+                .multi => writer.writeBytes(result.response_body orelse return error.Fatal) catch
+                    return error.OutOfMemory,
+            }
+        }
         return .{ .response = writer.toOwnedSlice() catch return error.OutOfMemory };
     }
 
@@ -497,6 +706,142 @@ pub const ZooKeeperStateMachine = struct {
         .durable_applied = durableAppliedImpl,
     };
 };
+
+fn publishMutationEvents(
+    manager: *watch.Manager,
+    allocator: std.mem.Allocator,
+    mutation: command.Mutation,
+    result: data_tree.MutationResult,
+    zxid: i64,
+    removed_ephemeral_paths: []const []const u8,
+) !void {
+    switch (mutation) {
+        .create => |request| publishCreated(
+            manager,
+            zxid,
+            result.created_path orelse request.path,
+        ),
+        .delete => |request| publishDeleted(manager, zxid, request.path),
+        .set_data => |request| manager.publish(.{
+            .type = .node_data_changed,
+            .zxid = zxid,
+            .path = request.path,
+        }),
+        .delete_extended => |request| {
+            if (result.changed) publishDeleted(manager, zxid, request.path);
+        },
+        .multi => |request| try publishMultiEvents(
+            manager,
+            allocator,
+            request.body,
+            result.response_body orelse return error.InvalidMultiResponse,
+            zxid,
+        ),
+        .close_session => |request| {
+            if (result.changed) {
+                manager.invalidateSession(request.session_id, request.generation);
+                for (removed_ephemeral_paths) |path| publishDeleted(manager, zxid, path);
+            }
+        },
+        .expire_session => |request| {
+            if (result.changed) {
+                manager.invalidateSession(request.session_id, null);
+                for (removed_ephemeral_paths) |path| publishDeleted(manager, zxid, path);
+            }
+        },
+        .move_session => |request| {
+            if (result.changed) {
+                manager.invalidateSession(request.session_id, request.expected_generation);
+            }
+        },
+        .set_acl,
+        .open_session,
+        .touch_session,
+        .session_tick,
+        => {},
+    }
+}
+
+fn publishMultiEvents(
+    manager: *watch.Manager,
+    allocator: std.mem.Allocator,
+    request_body: []const u8,
+    response_body: []const u8,
+    zxid: i64,
+) !void {
+    var request_iterator = multi.RequestIterator.init(request_body);
+    var response_reader = jute.Reader.init(response_body);
+    while (try request_iterator.next(allocator)) |value| {
+        var operation = value;
+        defer operation.deinit(allocator);
+        const header = try jute.deserialize(
+            protocol.proto.MultiHeader,
+            &response_reader,
+            allocator,
+        );
+        if (header.done) return error.InvalidMultiResponse;
+        if (header.type == -1) return;
+        switch (operation) {
+            .create => {
+                const response = try jute.deserialize(
+                    protocol.proto.CreateResponse,
+                    &response_reader,
+                    allocator,
+                );
+                defer jute.deinitDecoded(response, allocator);
+                publishCreated(manager, zxid, response.path orelse return error.InvalidMultiResponse);
+            },
+            .create2, .create_container, .create_ttl => {
+                const response = try jute.deserialize(
+                    protocol.proto.Create2Response,
+                    &response_reader,
+                    allocator,
+                );
+                defer jute.deinitDecoded(response, allocator);
+                publishCreated(manager, zxid, response.path orelse return error.InvalidMultiResponse);
+            },
+            .delete => |request| publishDeleted(
+                manager,
+                zxid,
+                request.path orelse return error.InvalidMultiResponse,
+            ),
+            .set_data => |request| {
+                _ = try jute.deserialize(
+                    protocol.proto.SetDataResponse,
+                    &response_reader,
+                    allocator,
+                );
+                manager.publish(.{
+                    .type = .node_data_changed,
+                    .zxid = zxid,
+                    .path = request.path orelse return error.InvalidMultiResponse,
+                });
+            },
+            .check => {},
+        }
+    }
+    const terminator = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &response_reader,
+        allocator,
+    );
+    if (!terminator.done or terminator.type != -1 or terminator.err != -1 or
+        response_reader.remaining() != 0) return error.InvalidMultiResponse;
+}
+
+fn publishCreated(manager: *watch.Manager, zxid: i64, path: []const u8) void {
+    manager.publish(.{ .type = .node_created, .zxid = zxid, .path = path });
+    if (data_tree.parentPath(path)) |parent| {
+        manager.publish(.{ .type = .node_children_changed, .zxid = zxid, .path = parent });
+    }
+}
+
+fn publishDeleted(manager: *watch.Manager, zxid: i64, path: []const u8) void {
+    manager.publish(.{ .type = .node_deleted, .zxid = zxid, .path = path });
+    if (data_tree.parentPath(path)) |parent| {
+        manager.publish(.{ .type = .node_children_changed, .zxid = zxid, .path = parent });
+    }
+}
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();

@@ -481,6 +481,34 @@ pub const RocksStore = struct {
         };
     }
 
+    pub fn ephemeralPaths(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+    ) ![][]u8 {
+        var paths: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (paths.items) |path| allocator.free(path);
+            paths.deinit(allocator);
+        }
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            var node = try decodeNode(self.allocator, entry[1].data);
+            defer node.deinit(self.allocator);
+            if (node.kind != .ephemeral or node.ephemeral_owner != session_id) continue;
+            const owned_path = try allocator.dupe(u8, entry[0].data);
+            paths.append(allocator, owned_path) catch |err| {
+                allocator.free(owned_path);
+                return err;
+            };
+        }
+        return paths.toOwnedSlice(allocator);
+    }
+
     pub fn getSession(self: *RocksStore, session_id: i64) !?Session {
         var key_buffer: [session_prefix.len + 8]u8 = undefined;
         const key = sessionKey(session_id, &key_buffer);
@@ -827,7 +855,7 @@ pub const RocksStore = struct {
             session.tick_grace_ms,
         );
         try self.commitSession(session_id, session, .{ .index = index, .term = term });
-        return .{ .code = .ok };
+        return .{ .code = .ok, .changed = true };
     }
 
     fn closeSession(
@@ -845,7 +873,7 @@ pub const RocksStore = struct {
         }
         if (session.generation != generation) return .{ .code = .session_moved };
         try self.commitSessionRemoval(session_id, .{ .index = index, .term = term });
-        return .{ .code = .ok };
+        return .{ .code = .ok, .changed = true };
     }
 
     fn expireSession(
@@ -866,7 +894,7 @@ pub const RocksStore = struct {
             return .{ .code = .ok };
         }
         try self.commitSessionRemoval(session_id, .{ .index = index, .term = term });
-        return .{ .code = .ok };
+        return .{ .code = .ok, .changed = true };
     }
 
     fn sessionTick(
@@ -1583,7 +1611,7 @@ pub const RocksStore = struct {
             path,
             .{ .index = index, .term = term },
         );
-        return .{ .code = .ok };
+        return .{ .code = .ok, .changed = true };
     }
 
     fn setAcl(
@@ -2143,17 +2171,21 @@ test "container and TTL nodes use replicated lifecycle cleanup" {
     const candidate = for (candidates) |value| {
         if (std.mem.eql(u8, value.path, "/container")) break value;
     } else return error.MissingCandidate;
-    _ = try store.apply(.{ .delete_extended = .{
+    var stale_delete = try store.apply(.{ .delete_extended = .{
         .path = candidate.path,
         .expected_czxid = candidate.czxid + 1,
         .expected_kind = candidate.kind,
     } }, 7, 1);
+    defer stale_delete.deinit(testing.allocator);
+    try testing.expect(!stale_delete.changed);
     try testing.expect((try store.exists("/container")) != null);
-    _ = try store.apply(.{ .delete_extended = .{
+    var applied_delete = try store.apply(.{ .delete_extended = .{
         .path = candidate.path,
         .expected_czxid = candidate.czxid,
         .expected_kind = candidate.kind,
     } }, 8, 1);
+    defer applied_delete.deinit(testing.allocator);
+    try testing.expect(applied_delete.changed);
     try testing.expect((try store.exists("/container")) == null);
 
     const snapshot_bytes = try store.snapshot(testing.allocator);
@@ -2339,4 +2371,47 @@ test "multi commits atomically and rolls back on failure" {
     try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.no_node)), failure.err);
     const skipped_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
     try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.runtime_inconsistency)), skipped_header.err);
+}
+
+test "stale session expiration reports no znode change" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+
+    const password = [_]u8{7} ** 16;
+    var opened = try store.apply(.{ .open_session = .{
+        .session_id = 42,
+        .password = &password,
+        .timeout_ms = 1_000,
+        .tick_grace_ms = 100,
+        .generation = 1,
+    } }, 1, 1);
+    defer opened.deinit(testing.allocator);
+    const session = (try store.getSession(42)).?;
+
+    var stale = try store.apply(.{ .expire_session = .{
+        .session_id = 42,
+        .expected_expires_at_ms = session.expires_at_ms + 1,
+    } }, 2, 1);
+    defer stale.deinit(testing.allocator);
+    try testing.expect(!stale.changed);
+    try testing.expect((try store.getSession(42)) != null);
+
+    var tick = try store.apply(.{ .session_tick = .{
+        .leader_term = 1,
+        .elapsed_ms = 1_100,
+        .leader_wall_ms = 1_100,
+    } }, 3, 1);
+    defer tick.deinit(testing.allocator);
+    var expired = try store.apply(.{ .expire_session = .{
+        .session_id = 42,
+        .expected_expires_at_ms = session.expires_at_ms,
+    } }, 4, 1);
+    defer expired.deinit(testing.allocator);
+    try testing.expect(expired.changed);
+    try testing.expect((try store.getSession(42)) == null);
 }

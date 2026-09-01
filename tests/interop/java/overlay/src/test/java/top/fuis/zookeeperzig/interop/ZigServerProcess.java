@@ -52,7 +52,7 @@ public final class ZigServerProcess implements AutoCloseable {
             return server;
         } catch (Exception error) {
             process.destroyForcibly();
-            throw error;
+            throw new IOException("Zig server readiness failed:\n" + server.readLog(), error);
         }
     }
 
@@ -105,6 +105,8 @@ public final class ZigServerProcess implements AutoCloseable {
         if (Boolean.getBoolean("zookeeper.zig.printServerLog")) {
             System.err.println("--- Zig server log: " + logFile + " ---");
             System.err.println(readLog());
+            File preservedLog = new File("target", "zig-server-" + System.nanoTime() + ".log");
+            Files.copy(logFile.toPath(), preservedLog.toPath());
         }
         process.destroy();
         if (!process.waitFor(10, TimeUnit.SECONDS)) {

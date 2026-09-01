@@ -25,6 +25,7 @@ pub const ErrorCode = enum(i32) {
 
 pub const MutationResult = struct {
     code: ErrorCode,
+    changed: bool = false,
     stat: ?protocol.data.Stat = null,
     created_path: ?[]const u8 = null,
     owned_created_path: ?[]u8 = null,
