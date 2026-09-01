@@ -254,6 +254,29 @@ pub fn encodeReply(
     try encodeReplyWithLimit(writer, header, body, default_max_payload);
 }
 
+pub fn encodeReplyPayload(
+    writer: *jute.Writer,
+    header: proto.ReplyHeader,
+    body_payload: []const u8,
+) EncodeError!void {
+    try encodeReplyPayloadWithLimit(writer, header, body_payload, default_max_payload);
+}
+
+pub fn encodeReplyPayloadWithLimit(
+    writer: *jute.Writer,
+    header: proto.ReplyHeader,
+    body_payload: []const u8,
+    max_payload: usize,
+) EncodeError!void {
+    const frame_start = writer.dataSize();
+    errdefer writer.truncate(frame_start);
+
+    try writer.writeInt(0);
+    try jute.serialize(writer, header);
+    try writer.writeBytes(body_payload);
+    try finishFrame(writer, frame_start, max_payload);
+}
+
 pub fn encodeReplyWithLimit(
     writer: *jute.Writer,
     header: proto.ReplyHeader,
@@ -751,6 +774,18 @@ test "typed request and reply packets round trip" {
     defer decoded_reply.deinit(testing.allocator);
     try testing.expectEqual(@as(i64, 9), decoded_reply.header.zxid);
     try testing.expectEqualStrings("value", decoded_reply.body.data.?);
+
+    var raw_reply_writer = jute.Writer.init(testing.allocator);
+    defer raw_reply_writer.deinit();
+    try encodeReplyPayload(
+        &raw_reply_writer,
+        .{ .xid = 43, .zxid = 10, .err = 0 },
+        "raw-body",
+    );
+    const raw_reply_frame = (try parseFrame(raw_reply_writer.bytes(), default_max_payload)).?;
+    const raw_reply = try replyView(raw_reply_frame.payload);
+    try testing.expectEqual(@as(i32, 43), raw_reply.header.xid);
+    try testing.expectEqualStrings("raw-body", raw_reply.body);
 }
 
 test "owned decode survives receive buffer reuse" {

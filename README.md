@@ -176,16 +176,18 @@ zig-out/bin/zookeeper-quorum-server \
 The current server supports replicated sessions, session resume and expiration,
 ephemeral, sequential, container, and TTL nodes, digest authentication, ACL
 enforcement, Connect, ping, closeSession, create/create2/createContainer/createTTL,
-delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2, and
-sync. Reads use Raft ReadIndex before accessing RocksDB. Session close and
+delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2,
+sync, and atomic write multi operations. Multi supports create, create2,
+container/TTL create, delete, setData, and version checks. Reads use Raft
+ReadIndex before accessing RocksDB. Session close and
 expiration atomically remove all session-owned ephemeral nodes. ACLs support
 `world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks.
 Connection establishment and client requests pass through a bounded
 `std.Io.Queue` and a fixed worker pool before entering Raft or RocksDB. The
 worker count defaults to the number of logical CPUs and the queue capacity
 defaults to 256; override them with `--client-request-workers` and
-`--client-request-queue-capacity`. IPv6 ACL identities, SASL, watches, and multi
-operations are not implemented yet.
+`--client-request-queue-capacity`. IPv6 ACL identities, SASL, watches, and
+read-only multi operations are not implemented yet.
 
 ## Java client interoperability
 
@@ -200,12 +202,12 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream `AsyncOpsTest` and
 `ClientTest` methods unchanged. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current selection covers 47
+server starts an isolated Zig server instead. The current selection covers 50
 synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-container, TTL, large-data, sync, lifecycle cleanup, error-code, and three-node
-failover tests. The quorum case verifies official-client session continuity,
+container, TTL, atomic write-multi, large-data, sync, lifecycle cleanup,
+error-code, and three-node failover tests. The quorum case verifies official-client session continuity,
 re-authentication, ephemeral ownership, rolling node restarts, and follower
-catch-up; watch, multi, and Java-server-internal tests remain excluded.
+catch-up; watch, read-only multi, and Java-server-internal tests remain excluded.
 
 The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit
@@ -226,7 +228,7 @@ processes. It covers create responses, Stat fields, null data, root ACLs,
 request retry, concurrent CRUD, session restoration, and session continuity
 across a server restart. Set `ZOOKEEPER_SERVER_TEST_SELECTOR` to override the
 Surefire selector while evaluating additional upstream cases. Tests requiring
-watches, multi operations, or Java server internals remain excluded.
+watches, upstream multi cases, or Java server internals remain excluded.
 
 ## Jepsen
 
@@ -254,6 +256,6 @@ logs, and retains resumable sessions and ephemeral nodes. See
 ## Roadmap
 
 1. Complete reconnect, watches, and high-level client APIs.
-2. Add IPv6/SASL authentication, watches, and multi operations.
+2. Add IPv6/SASL authentication, watches, and read-only multi operations.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.

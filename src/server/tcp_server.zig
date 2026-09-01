@@ -10,6 +10,7 @@ const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
+const multi = @import("multi.zig");
 const quorum_mod = @import("quorum.zig");
 const worker_pool = @import("worker_pool.zig");
 
@@ -433,6 +434,7 @@ pub const TcpServer = struct {
             .delete => try self.delete(transport, session, context.identities.items, xid, body),
             .set_acl => try self.setAcl(transport, session, context.identities.items, xid, body),
             .set_data => try self.setData(transport, session, context.identities.items, xid, body),
+            .multi => try self.multiRequest(transport, session, context.identities.items, xid, body),
             .exists => try self.exists(transport, session, context.identities.items, xid, body),
             .get_acl => try self.getAcl(transport, session, context.identities.items, xid, body),
             .get_data => try self.getData(transport, session, context.identities.items, xid, body),
@@ -776,6 +778,75 @@ pub const TcpServer = struct {
         }, response);
     }
 
+    fn multiRequest(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        var iterator = multi.RequestIterator.init(bytes);
+        while (iterator.next(self.allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.UnsupportedMultiOperation => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .unimplemented,
+            ),
+            else => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .bad_arguments,
+            ),
+        }) |value| {
+            var operation = value;
+            operation.deinit(self.allocator);
+        }
+        const response_body_capacity = multi.responseBodyCapacity(bytes) catch
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        const response_payload_capacity = std.math.add(
+            usize,
+            12,
+            response_body_capacity,
+        ) catch return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        if (response_payload_capacity > wire.default_max_payload) {
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        }
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        var proposal = self.quorum.propose(.{ .multi = .{
+            .body = bytes,
+            .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .session_id = session.id,
+            .session_generation = session.generation,
+            .identities = identities_blob,
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, result.zxid, result.code);
+        }
+        try sendRawReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, result.body);
+    }
+
     fn exists(
         self: *TcpServer,
         transport: *ResponseSink,
@@ -1081,6 +1152,20 @@ fn sendConnectResponse(
     try transport.capture(&writer);
 }
 
+fn sendRawReply(
+    transport: *ResponseSink,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    header: protocol.proto.ReplyHeader,
+    body: []const u8,
+) !void {
+    _ = io;
+    var writer = jute.Writer.init(allocator);
+    defer writer.deinit();
+    try wire.encodeReplyPayload(&writer, header, body);
+    try transport.capture(&writer);
+}
+
 fn sendReply(
     transport: *ResponseSink,
     allocator: std.mem.Allocator,
@@ -1339,7 +1424,68 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         sequential_reply.body(),
         testing.allocator,
     );
-    try testing.expectEqualStrings("/member-0000000003", sequential_response.path.?);
+    try testing.expectEqualStrings("/member-0000000002", sequential_response.path.?);
+
+    var multi_request = jute.Writer.init(testing.allocator);
+    defer multi_request.deinit();
+    try multi.writeHeader(&multi_request, @intFromEnum(multi.Kind.create), false, -1);
+    try jute.serialize(&multi_request, protocol.proto.CreateRequest{
+        .path = "/transaction",
+        .data = "before",
+        .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
+        .flags = 0,
+    });
+    try multi.writeHeader(&multi_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try jute.serialize(&multi_request, protocol.proto.SetDataRequest{
+        .path = "/transaction",
+        .data = "after",
+        .version = 0,
+    });
+    try multi.writeTerminator(&multi_request);
+    const multi_xid = try client.sendEncodedRequest(.multi, multi_request.bytes());
+    var multi_reply = try expectResponse(&client, multi_xid);
+    defer multi_reply.deinit();
+    var multi_response = jute.Reader.init(multi_reply.body());
+    const multi_create_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, @intFromEnum(multi.Kind.create)), multi_create_header.type);
+    const multi_create = try jute.deserialize(
+        protocol.proto.CreateResponse,
+        &multi_response,
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(multi_create, testing.allocator);
+    try testing.expectEqualStrings("/transaction", multi_create.path.?);
+    const multi_set_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, @intFromEnum(multi.Kind.set_data)), multi_set_header.type);
+    const multi_set = try jute.deserialize(
+        protocol.proto.SetDataResponse,
+        &multi_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), multi_set.stat.version);
+    const multi_end = try jute.deserialize(protocol.proto.MultiHeader, &multi_response, testing.allocator);
+    try testing.expect(multi_end.done);
+
+    const transaction_get_xid = try client.sendRequest(.get_data, protocol.proto.GetDataRequest{
+        .path = "/transaction",
+        .watch = false,
+    });
+    var transaction_get_reply = try expectResponse(&client, transaction_get_xid);
+    defer transaction_get_reply.deinit();
+    const transaction_get = try wire.decodeFrameRecord(
+        protocol.proto.GetDataResponse,
+        transaction_get_reply.body(),
+        testing.allocator,
+    );
+    try testing.expectEqualStrings("after", transaction_get.data.?);
 
     const ip_secure_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
         .path = "/ip-secure",

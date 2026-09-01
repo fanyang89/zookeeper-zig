@@ -2,8 +2,9 @@ const std = @import("std");
 const jute = @import("../jute.zig");
 const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
+const multi = @import("multi.zig");
 
-pub const version: i32 = 5;
+pub const version: i32 = 6;
 pub const legacy_version: i32 = 1;
 
 pub const Kind = enum(i32) {
@@ -18,6 +19,7 @@ pub const Kind = enum(i32) {
     move_session = 104,
     session_tick = 105,
     delete_extended = 106,
+    multi = 107,
 };
 
 pub const Mutation = union(Kind) {
@@ -95,6 +97,13 @@ pub const Mutation = union(Kind) {
         expected_czxid: i64,
         expected_kind: ephemeral.NodeKind,
     },
+    multi: struct {
+        body: []const u8,
+        time_ms: i64,
+        session_id: i64,
+        session_generation: u64,
+        identities: ?[]const u8 = null,
+    },
 };
 
 pub const ResultView = struct {
@@ -103,11 +112,16 @@ pub const ResultView = struct {
     body: []const u8,
 };
 
-pub fn resultCapacity(mutation: Mutation) error{SizeOverflow}!usize {
+pub fn resultCapacity(mutation: Mutation) !usize {
     return switch (mutation) {
         .create => |value| std.math.add(usize, 94, value.path.len) catch error.SizeOverflow,
         .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => 12,
         .set_acl, .set_data => 80,
+        .multi => |value| std.math.add(
+            usize,
+            12,
+            try multi.responseBodyCapacity(value.body),
+        ) catch error.SizeOverflow,
     };
 }
 
@@ -195,6 +209,13 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeLong(value.expected_czxid);
             try writer.writeByte(@bitCast(@intFromEnum(value.expected_kind)));
         },
+        .multi => |value| {
+            try writer.writeBuffer(value.body);
+            try writer.writeLong(value.time_ms);
+            try writer.writeLong(value.session_id);
+            try writer.writeLong(@bitCast(value.session_generation));
+            try writer.writeBuffer(value.identities);
+        },
     }
     return allocator.dupe(u8, writer.bytes());
 }
@@ -276,6 +297,16 @@ pub fn decode(bytes: []const u8) !Mutation {
                 .expected_czxid = try reader.readLong(),
                 .expected_kind = checkedEnum(ephemeral.NodeKind, @as(u8, @bitCast(try reader.readByte()))) orelse
                     return error.InvalidCommand,
+            } };
+        },
+        .multi => blk: {
+            if (encoded_version < 6) return error.UnsupportedCommandVersion;
+            break :blk .{ .multi = .{
+                .body = (try reader.readBuffer()) orelse return error.InvalidCommand,
+                .time_ms = try reader.readLong(),
+                .session_id = try reader.readLong(),
+                .session_generation = @bitCast(try reader.readLong()),
+                .identities = try reader.readBuffer(),
             } };
         },
     };
@@ -431,6 +462,21 @@ test "mutation commands and results round trip" {
     const ttl_decoded = try decode(ttl_encoded);
     try testing.expectEqual(ephemeral.NodeKind.ttl, ttl_decoded.create.node_kind);
     try testing.expectEqual(@as(i64, 60_000), ttl_decoded.create.ttl_ms);
+
+    const multi_encoded = try encode(testing.allocator, .{ .multi = .{
+        .body = "multi-body",
+        .time_ms = 2_000,
+        .session_id = 43,
+        .session_generation = 11,
+        .identities = "identities",
+    } });
+    defer testing.allocator.free(multi_encoded);
+    const multi_decoded = try decode(multi_encoded);
+    try testing.expectEqualStrings("multi-body", multi_decoded.multi.body);
+    try testing.expectEqual(@as(i64, 2_000), multi_decoded.multi.time_ms);
+    try testing.expectEqual(@as(i64, 43), multi_decoded.multi.session_id);
+    try testing.expectEqual(@as(u64, 11), multi_decoded.multi.session_generation);
+    try testing.expectEqualStrings("identities", multi_decoded.multi.identities.?);
 
     const response = try encodeResult(testing.allocator, .ok, 7, {});
     defer testing.allocator.free(response);

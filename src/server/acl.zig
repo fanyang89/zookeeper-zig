@@ -89,6 +89,29 @@ pub fn normalize(
     return encode(allocator, normalized.items);
 }
 
+pub fn normalizeEncodedIdentities(
+    allocator: std.mem.Allocator,
+    entries: ?[]const protocol.data.ACL,
+    identities_blob: ?[]const u8,
+) ![]u8 {
+    var identities: std.ArrayList(Identity) = .empty;
+    defer identities.deinit(allocator);
+    if (identities_blob) |encoded| {
+        var reader = jute.Reader.init(encoded);
+        const count = try reader.readInt();
+        if (count < 0) return error.InvalidIdentity;
+        var index: i32 = 0;
+        while (index < count) : (index += 1) {
+            try identities.append(allocator, .{
+                .scheme = (try reader.readString()) orelse return error.InvalidIdentity,
+                .id = (try reader.readString()) orelse return error.InvalidIdentity,
+            });
+        }
+        if (reader.remaining() != 0) return error.InvalidIdentity;
+    }
+    return normalize(allocator, entries, identities.items);
+}
+
 pub fn allows(blob: ?[]const u8, permission: i32, identities_blob: ?[]const u8) !bool {
     if (blob == null) return true;
     var reader = jute.Reader.init(blob.?);

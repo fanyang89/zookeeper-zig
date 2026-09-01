@@ -312,6 +312,8 @@ pub const ZooKeeperStateMachine = struct {
             .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
                 .stat = result.stat.?,
             }) catch unreachable,
+            .multi => writer.writeBytes(result.response_body orelse return error.Fatal) catch
+                return error.OutOfMemory,
         };
         return .{ .response = writer.toOwnedSlice() catch return error.OutOfMemory };
     }

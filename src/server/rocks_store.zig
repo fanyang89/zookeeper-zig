@@ -6,6 +6,7 @@ const protocol = @import("../protocol.zig");
 const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
+const multi = @import("multi.zig");
 const ephemeral = @import("ephemeral.zig");
 
 const Node = data_tree.Node;
@@ -341,6 +342,14 @@ pub const RocksStore = struct {
                 request.path,
                 request.expected_czxid,
                 request.expected_kind,
+                index,
+                term,
+            ),
+            .multi => |request| try self.applyMulti(
+                request.body,
+                request.time_ms,
+                request.session_id,
+                request.identities,
                 index,
                 term,
             ),
@@ -727,6 +736,7 @@ pub const RocksStore = struct {
             .delete => |request| .{ .id = request.session_id, .generation = request.session_generation },
             .set_acl => |request| .{ .id = request.session_id, .generation = request.session_generation },
             .set_data => |request| .{ .id = request.session_id, .generation = request.session_generation },
+            .multi => |request| .{ .id = request.session_id, .generation = request.session_generation },
             else => null,
         };
         const connection = identity orelse return null;
@@ -982,6 +992,411 @@ pub const RocksStore = struct {
         }
         putApplied(&batch, self.default_family, applied);
         try self.writeSync(batch);
+    }
+
+    const MultiState = struct {
+        allocator: std.mem.Allocator,
+        nodes: std.StringHashMap(Node),
+        dirty: std.StringHashMap(void),
+        deleted: std.StringHashMap(void),
+
+        fn load(store: *RocksStore) MultiState {
+            return .{
+                .allocator = store.allocator,
+                .nodes = std.StringHashMap(Node).init(store.allocator),
+                .dirty = std.StringHashMap(void).init(store.allocator),
+                .deleted = std.StringHashMap(void).init(store.allocator),
+            };
+        }
+
+        fn deinit(state: *MultiState) void {
+            var nodes = state.nodes.iterator();
+            while (nodes.next()) |entry| {
+                state.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(state.allocator);
+            }
+            state.nodes.deinit();
+            var dirty = state.dirty.keyIterator();
+            while (dirty.next()) |path| state.allocator.free(path.*);
+            state.dirty.deinit();
+            var deleted = state.deleted.keyIterator();
+            while (deleted.next()) |path| state.allocator.free(path.*);
+            state.deleted.deinit();
+            state.* = undefined;
+        }
+
+        fn getNode(state: *MultiState, store: *RocksStore, path: []const u8) !?*Node {
+            if (state.nodes.getPtr(path)) |node| return node;
+            if (state.deleted.contains(path)) return null;
+            var node = (try store.getNode(path)) orelse return null;
+            errdefer node.deinit(state.allocator);
+            const owned_path = try state.allocator.dupe(u8, path);
+            errdefer state.allocator.free(owned_path);
+            try state.nodes.putNoClobber(owned_path, node);
+            return state.nodes.getPtr(owned_path).?;
+        }
+
+        fn markDirty(state: *MultiState, path: []const u8) !void {
+            if (state.dirty.contains(path)) return;
+            const owned_path = try state.allocator.dupe(u8, path);
+            errdefer state.allocator.free(owned_path);
+            try state.dirty.putNoClobber(owned_path, {});
+        }
+
+        fn clearDirty(state: *MultiState, path: []const u8) void {
+            if (state.dirty.fetchRemove(path)) |removed| state.allocator.free(removed.key);
+        }
+
+        fn markDeleted(state: *MultiState, path: []const u8) !void {
+            state.clearDirty(path);
+            if (state.deleted.contains(path)) return;
+            const owned_path = try state.allocator.dupe(u8, path);
+            errdefer state.allocator.free(owned_path);
+            try state.deleted.putNoClobber(owned_path, {});
+        }
+
+        fn clearDeleted(state: *MultiState, path: []const u8) void {
+            if (state.deleted.fetchRemove(path)) |removed| state.allocator.free(removed.key);
+        }
+
+        fn applyOperation(
+            state: *MultiState,
+            store: *RocksStore,
+            operation: multi.Operation,
+            time_ms: i64,
+            session_id: i64,
+            identities: ?[]const u8,
+            index: u64,
+        ) !data_tree.MutationResult {
+            return switch (operation) {
+                .create, .create2, .create_container => |request| try state.create(
+                    store,
+                    request,
+                    null,
+                    time_ms,
+                    session_id,
+                    identities,
+                    index,
+                ),
+                .create_ttl => |request| try state.create(
+                    store,
+                    .{
+                        .path = request.path,
+                        .data = request.data,
+                        .acl = request.acl,
+                        .flags = request.flags,
+                    },
+                    request.ttl,
+                    time_ms,
+                    session_id,
+                    identities,
+                    index,
+                ),
+                .delete => |request| try state.delete(store, request, identities, index),
+                .set_data => |request| try state.setData(store, request, time_ms, identities, index),
+                .check => |request| try state.check(store, request, identities),
+            };
+        }
+
+        fn create(
+            state: *MultiState,
+            store: *RocksStore,
+            request: protocol.proto.CreateRequest,
+            ttl_ms: ?i64,
+            time_ms: i64,
+            session_id: i64,
+            identities: ?[]const u8,
+            index: u64,
+        ) !data_tree.MutationResult {
+            const path = request.path orelse return .{ .code = .bad_arguments };
+            const kind: ephemeral.NodeKind = if (ttl_ms) |ttl| blk: {
+                if ((request.flags != 5 and request.flags != 6) or !ephemeral.isValidTtl(ttl)) {
+                    return .{ .code = .bad_arguments };
+                }
+                break :blk .ttl;
+            } else blk: {
+                if (request.flags < 0 or request.flags > 4) return .{ .code = .bad_arguments };
+                break :blk if (request.flags == 4)
+                    .container
+                else if ((request.flags & 1) != 0)
+                    .ephemeral
+                else
+                    .persistent;
+            };
+            const sequential = (request.flags & 2) != 0;
+            const parent_path = if (sequential)
+                sequentialParentPath(path) orelse return .{ .code = .bad_arguments }
+            else
+                data_tree.parentPath(path) orelse return .{ .code = .bad_arguments };
+            const node_data = request.data orelse &.{};
+            if ((!sequential and (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/"))) or
+                node_data.len > std.math.maxInt(i32))
+            {
+                return .{ .code = .bad_arguments };
+            }
+            ephemeral.validate(kind, switch (kind) {
+                .persistent => 0,
+                .ephemeral => session_id,
+                .container => ephemeral.container_owner,
+                .ttl => ephemeral.ttlOwner(ttl_ms.?) catch return .{ .code = .bad_arguments },
+            }) catch return .{ .code = .bad_arguments };
+            if (kind == .ephemeral) {
+                const session = (try store.getSession(session_id)) orelse
+                    return .{ .code = .session_expired };
+                if (session.expires_at_ms <= store.session_clock_ms) return .{ .code = .session_expired };
+            }
+            const initial_parent = (try state.getNode(store, parent_path)) orelse
+                return .{ .code = .no_node };
+            if (!try acl.allows(initial_parent.acl, acl.create, identities)) return .{ .code = .no_auth };
+            if (!ephemeral.permitsChildren(initial_parent.kind)) {
+                return .{ .code = .no_children_for_ephemerals };
+            }
+            if (initial_parent.child_count == std.math.maxInt(i32) or
+                initial_parent.cversion == std.math.maxInt(i32) or
+                initial_parent.sequence_counter == std.math.maxInt(i32))
+            {
+                return .{ .code = .bad_arguments };
+            }
+            const owned_path = if (sequential)
+                try sequentialPath(state.allocator, path, initial_parent.sequence_counter)
+            else
+                try state.allocator.dupe(u8, path);
+            errdefer state.allocator.free(owned_path);
+            if (!data_tree.isValidPath(owned_path)) return .{ .code = .bad_arguments };
+            if ((try state.getNode(store, owned_path)) != null) return .{ .code = .node_exists };
+            try state.nodes.ensureUnusedCapacity(1);
+            const normalized_acl = acl.normalizeEncodedIdentities(
+                state.allocator,
+                request.acl,
+                identities,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{ .code = .invalid_acl },
+            };
+            errdefer state.allocator.free(normalized_acl);
+            const owned_data = try state.allocator.dupe(u8, node_data);
+            errdefer state.allocator.free(owned_data);
+            try state.markDirty(parent_path);
+            try state.markDirty(owned_path);
+            state.clearDeleted(owned_path);
+            const zxid = try store.clientZxid(index);
+            const parent = state.nodes.getPtr(parent_path).?;
+            parent.cversion += 1;
+            parent.sequence_counter += 1;
+            parent.pzxid = zxid;
+            parent.child_count += 1;
+            state.nodes.putAssumeCapacityNoClobber(owned_path, .{
+                .data = owned_data,
+                .czxid = zxid,
+                .mzxid = zxid,
+                .ctime = time_ms,
+                .mtime = time_ms,
+                .pzxid = zxid,
+                .ephemeral_owner = switch (kind) {
+                    .persistent => 0,
+                    .ephemeral => session_id,
+                    .container => ephemeral.container_owner,
+                    .ttl => ephemeral.ttlOwner(ttl_ms.?) catch unreachable,
+                },
+                .kind = kind,
+                .acl = normalized_acl,
+            });
+            return .{
+                .code = .ok,
+                .stat = state.nodes.getPtr(owned_path).?.stat(),
+                .created_path = owned_path,
+            };
+        }
+
+        fn delete(
+            state: *MultiState,
+            store: *RocksStore,
+            request: protocol.proto.DeleteRequest,
+            identities: ?[]const u8,
+            index: u64,
+        ) !data_tree.MutationResult {
+            const path = request.path orelse return .{ .code = .bad_arguments };
+            if (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/")) {
+                return .{ .code = .bad_arguments };
+            }
+            const parent_path = data_tree.parentPath(path).?;
+            const initial_parent = (try state.getNode(store, parent_path)) orelse
+                return .{ .code = .no_node };
+            if (!try acl.allows(initial_parent.acl, acl.delete, identities)) return .{ .code = .no_auth };
+            const node = (try state.getNode(store, path)) orelse return .{ .code = .no_node };
+            if (request.version != -1 and request.version != node.version) return .{ .code = .bad_version };
+            if (node.child_count != 0) return .{ .code = .not_empty };
+            const parent = state.nodes.getPtr(parent_path).?;
+            if (parent.cversion == std.math.maxInt(i32)) return .{ .code = .bad_arguments };
+            try state.markDirty(parent_path);
+            try state.markDeleted(path);
+            parent.cversion += 1;
+            parent.pzxid = try store.clientZxid(index);
+            parent.child_count -= 1;
+            const removed = state.nodes.fetchRemove(path).?;
+            state.allocator.free(removed.key);
+            var removed_node = removed.value;
+            removed_node.deinit(state.allocator);
+            return .{ .code = .ok };
+        }
+
+        fn setData(
+            state: *MultiState,
+            store: *RocksStore,
+            request: protocol.proto.SetDataRequest,
+            time_ms: i64,
+            identities: ?[]const u8,
+            index: u64,
+        ) !data_tree.MutationResult {
+            const path = request.path orelse return .{ .code = .bad_arguments };
+            const node = (try state.getNode(store, path)) orelse return .{ .code = .no_node };
+            if (!try acl.allows(node.acl, acl.write, identities)) return .{ .code = .no_auth };
+            if (request.version != -1 and request.version != node.version) return .{ .code = .bad_version };
+            const node_data = request.data orelse &.{};
+            if (node_data.len > std.math.maxInt(i32) or node.version == std.math.maxInt(i32)) {
+                return .{ .code = .bad_arguments };
+            }
+            const replacement = try state.allocator.dupe(u8, node_data);
+            errdefer state.allocator.free(replacement);
+            try state.markDirty(path);
+            state.allocator.free(node.data);
+            node.data = replacement;
+            node.mzxid = try store.clientZxid(index);
+            node.mtime = time_ms;
+            node.version += 1;
+            return .{ .code = .ok, .stat = node.stat() };
+        }
+
+        fn check(
+            state: *MultiState,
+            store: *RocksStore,
+            request: protocol.proto.CheckVersionRequest,
+            identities: ?[]const u8,
+        ) !data_tree.MutationResult {
+            const path = request.path orelse return .{ .code = .bad_arguments };
+            const node = (try state.getNode(store, path)) orelse return .{ .code = .no_node };
+            if (!try acl.allows(node.acl, acl.read, identities)) return .{ .code = .no_auth };
+            if (request.version != -1 and request.version != node.version) return .{ .code = .bad_version };
+            return .{ .code = .ok };
+        }
+
+        fn commit(state: *MultiState, store: *RocksStore, applied: Applied) !void {
+            var batch = rocksdb.WriteBatch.init();
+            defer batch.deinit();
+            var deleted = state.deleted.keyIterator();
+            while (deleted.next()) |path| batch.delete(store.default_family, path.*);
+            var encoded: std.ArrayList([]u8) = .empty;
+            defer {
+                for (encoded.items) |bytes| state.allocator.free(bytes);
+                encoded.deinit(state.allocator);
+            }
+            var dirty = state.dirty.keyIterator();
+            while (dirty.next()) |path| {
+                const node = state.nodes.get(path.*) orelse return error.InvalidMultiState;
+                const bytes = try encodeNode(state.allocator, node);
+                encoded.append(state.allocator, bytes) catch |err| {
+                    state.allocator.free(bytes);
+                    return err;
+                };
+                batch.put(store.default_family, path.*, bytes);
+            }
+            putApplied(&batch, store.default_family, applied);
+            try store.writeSync(batch);
+        }
+    };
+
+    fn applyMulti(
+        self: *RocksStore,
+        body: []const u8,
+        time_ms: i64,
+        session_id: i64,
+        identities: ?[]const u8,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        var operation_count: usize = 0;
+        var validation = multi.RequestIterator.init(body);
+        while (try validation.next(self.allocator)) |value| {
+            var operation = value;
+            operation.deinit(self.allocator);
+            operation_count = try std.math.add(usize, operation_count, 1);
+        }
+
+        var state = MultiState.load(self);
+        defer state.deinit();
+        var response = jute.Writer.init(self.allocator);
+        defer response.deinit();
+        var iterator = multi.RequestIterator.init(body);
+        var operation_index: usize = 0;
+        while (try iterator.next(self.allocator)) |value| : (operation_index += 1) {
+            var operation = value;
+            defer operation.deinit(self.allocator);
+            var result = try state.applyOperation(
+                self,
+                operation,
+                time_ms,
+                session_id,
+                identities,
+                index,
+            );
+            defer result.deinit(self.allocator);
+            if (result.code != .ok) {
+                response.truncate(0);
+                var response_index: usize = 0;
+                while (response_index < operation_count) : (response_index += 1) {
+                    const code: ErrorCode = if (response_index < operation_index)
+                        .ok
+                    else if (response_index == operation_index)
+                        result.code
+                    else
+                        .runtime_inconsistency;
+                    try multi.writeHeader(&response, -1, false, @intFromEnum(code));
+                    try jute.serialize(&response, protocol.proto.ErrorResponse{
+                        .err = @intFromEnum(code),
+                    });
+                }
+                try multi.writeTerminator(&response);
+                const owned = try self.allocator.dupe(u8, response.bytes());
+                errdefer self.allocator.free(owned);
+                try self.advanceApplied(index, term);
+                return .{
+                    .code = .ok,
+                    .response_body = owned,
+                    .owned_response_body = owned,
+                };
+            }
+            const kind: multi.Kind = operation;
+            const response_kind: i32 = switch (operation) {
+                .create2, .create_container, .create_ttl => @intFromEnum(multi.Kind.create2),
+                else => @intFromEnum(kind),
+            };
+            try multi.writeHeader(&response, response_kind, false, 0);
+            switch (operation) {
+                .create => try jute.serialize(&response, protocol.proto.CreateResponse{
+                    .path = result.created_path,
+                }),
+                .create2, .create_container, .create_ttl => try jute.serialize(
+                    &response,
+                    protocol.proto.Create2Response{
+                        .path = result.created_path,
+                        .stat = result.stat.?,
+                    },
+                ),
+                .delete, .check => {},
+                .set_data => try jute.serialize(&response, protocol.proto.SetDataResponse{
+                    .stat = result.stat.?,
+                }),
+            }
+        }
+        try multi.writeTerminator(&response);
+        const owned = try self.allocator.dupe(u8, response.bytes());
+        errdefer self.allocator.free(owned);
+        try state.commit(self, .{ .index = index, .term = term });
+        return .{
+            .code = .ok,
+            .response_body = owned,
+            .owned_response_body = owned,
+        };
     }
 
     fn create(
@@ -1819,4 +2234,109 @@ test "ACL authorization and snapshot restore preserve digest ownership" {
     try target.restore(snapshot, 2, 1);
     try testing.expectEqual(ErrorCode.no_auth, try target.authorize("/secure", acl.read, null));
     try testing.expectEqual(ErrorCode.ok, try target.authorize("/secure", acl.admin, identities_blob));
+}
+
+test "multi commits atomically and rolls back on failure" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+    const open_acl = [_]protocol.data.ACL{.{
+        .perms = acl.all,
+        .id = .{ .scheme = "world", .id = "anyone" },
+    }};
+
+    var success_request = jute.Writer.init(testing.allocator);
+    defer success_request.deinit();
+    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.create), false, -1);
+    try jute.serialize(&success_request, protocol.proto.CreateRequest{
+        .path = "/multi",
+        .data = "first",
+        .acl = &open_acl,
+        .flags = 0,
+    });
+    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try jute.serialize(&success_request, protocol.proto.SetDataRequest{
+        .path = "/multi",
+        .data = "second",
+        .version = 0,
+    });
+    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.check), false, -1);
+    try jute.serialize(&success_request, protocol.proto.CheckVersionRequest{
+        .path = "/multi",
+        .version = 1,
+    });
+    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.create_ttl), false, -1);
+    try jute.serialize(&success_request, protocol.proto.CreateTTLRequest{
+        .path = "/multi-ttl",
+        .data = "ttl",
+        .acl = &open_acl,
+        .flags = 5,
+        .ttl = 100,
+    });
+    try multi.writeTerminator(&success_request);
+    var success = try store.apply(.{ .multi = .{
+        .body = success_request.bytes(),
+        .time_ms = 10,
+        .session_id = 0,
+        .session_generation = 0,
+    } }, 1, 1);
+    defer success.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.ok, success.code);
+    const stored = (try store.getData(testing.allocator, "/multi")).?;
+    defer if (stored.data) |value| testing.allocator.free(value);
+    try testing.expectEqualStrings("second", stored.data.?);
+    try testing.expectEqual(@as(i32, 1), stored.stat.version);
+    var ttl_node = (try store.getNode("/multi-ttl")).?;
+    defer ttl_node.deinit(testing.allocator);
+    try testing.expectEqual(ephemeral.NodeKind.ttl, ttl_node.kind);
+
+    var rollback_request = jute.Writer.init(testing.allocator);
+    defer rollback_request.deinit();
+    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.create), false, -1);
+    try jute.serialize(&rollback_request, protocol.proto.CreateRequest{
+        .path = "/rolled-back",
+        .data = "temporary",
+        .acl = &open_acl,
+        .flags = 0,
+    });
+    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try jute.serialize(&rollback_request, protocol.proto.SetDataRequest{
+        .path = "/missing",
+        .data = "failure",
+        .version = -1,
+    });
+    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try jute.serialize(&rollback_request, protocol.proto.DeleteRequest{
+        .path = "/multi",
+        .version = -1,
+    });
+    try multi.writeTerminator(&rollback_request);
+    var rollback = try store.apply(.{ .multi = .{
+        .body = rollback_request.bytes(),
+        .time_ms = 11,
+        .session_id = 0,
+        .session_generation = 0,
+    } }, 2, 1);
+    defer rollback.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.ok, rollback.code);
+    try testing.expect((try store.exists("/rolled-back")) == null);
+    try testing.expect((try store.exists("/multi")) != null);
+
+    var response = jute.Reader.init(rollback.response_body.?);
+    const create_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
+    try testing.expectEqual(@as(i32, -1), create_header.type);
+    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.ok)), create_header.err);
+    const create_response = try jute.deserialize(protocol.proto.ErrorResponse, &response, testing.allocator);
+    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.ok)), create_response.err);
+    const failure_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
+    try testing.expectEqual(@as(i32, -1), failure_header.type);
+    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.no_node)), failure_header.err);
+    const failure = try jute.deserialize(protocol.proto.ErrorResponse, &response, testing.allocator);
+    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.no_node)), failure.err);
+    const skipped_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
+    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.runtime_inconsistency)), skipped_header.err);
 }

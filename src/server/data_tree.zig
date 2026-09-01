@@ -6,6 +6,7 @@ pub const NodeKind = ephemeral.NodeKind;
 
 pub const ErrorCode = enum(i32) {
     ok = 0,
+    runtime_inconsistency = -2,
     connection_loss = -4,
     unimplemented = -6,
     bad_arguments = -8,
@@ -26,9 +27,12 @@ pub const MutationResult = struct {
     stat: ?protocol.data.Stat = null,
     created_path: ?[]const u8 = null,
     owned_created_path: ?[]u8 = null,
+    response_body: ?[]const u8 = null,
+    owned_response_body: ?[]u8 = null,
 
     pub fn deinit(self: *MutationResult, allocator: std.mem.Allocator) void {
         if (self.owned_created_path) |path| allocator.free(path);
+        if (self.owned_response_body) |body| allocator.free(body);
         self.* = undefined;
     }
 };
