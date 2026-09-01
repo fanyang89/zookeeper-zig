@@ -329,7 +329,7 @@ test "TCP transport reads fragmented frames and writes complete frames" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(serverFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(serverFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);

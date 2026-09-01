@@ -392,7 +392,7 @@ test "blocking client performs handshake request reply and graceful close" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(clientServerFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(clientServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{
@@ -484,7 +484,7 @@ test "blocking receive timeout leaves an idle connection usable" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(idleServerFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(idleServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{
@@ -572,7 +572,7 @@ test "partial frame timeout disconnects and fails outstanding requests" {
     )) != .SUCCESS) return error.AddressQueryFailed;
     const port = std.mem.bigToNative(u16, local_address.port);
 
-    var server_future = testing.io.async(partialFrameServerFixture, .{ &server, testing.io });
+    var server_future = try testing.io.concurrent(partialFrameServerFixture, .{ &server, testing.io });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{

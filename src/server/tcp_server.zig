@@ -1922,7 +1922,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     );
     defer server.deinit();
     try server.start();
-    var server_future = testing.io.async(serveOneConnection, .{ &server, &listener });
+    var server_future = try testing.io.concurrent(serveOneConnection, .{ &server, &listener });
     defer server_future.cancel(testing.io) catch {};
 
     const one_second: std.Io.Timeout = .{ .duration = .{
@@ -2323,7 +2323,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     var session_password: [16]u8 = undefined;
     @memcpy(&session_password, client.session.passwd);
 
-    var resume_future = testing.io.async(serveOneConnection, .{ &server, &listener });
+    var resume_future = try testing.io.concurrent(serveOneConnection, .{ &server, &listener });
     defer resume_future.cancel(testing.io) catch {};
     var resumed = try blocking_client.BlockingClient.connectAddress(
         testing.allocator,
