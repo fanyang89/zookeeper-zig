@@ -12,6 +12,7 @@ test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(realpath "$test_dir/../..")
 run_root="$test_dir/target/run.$(date +%s).$$"
 binary="$run_root/bin/zookeeper-quorum-server"
+docker_log="$run_root/docker-command-failures.log"
 mkdir -p "$(dirname "$binary")"
 cp "$server" "$binary"
 chmod +x "$binary"
@@ -102,10 +103,7 @@ cleanup() {
     if [[ $status -eq 0 ]]; then
         rm -rf "$run_root"
     else
-        echo "Jepsen run data preserved at: $run_root" >&2
-        find "$run_root" -type f -name 'node-*.log' \
-            -exec sh -c 'echo "--- $1 ---"; tail -n 200 "$1"' _ {} \; \
-            2>/dev/null >&2 || true
+        echo "Jepsen failure logs preserved for artifact upload: $run_root" >&2
     fi
     trap - EXIT
     exit "$status"
@@ -224,6 +222,7 @@ run_host() (
     cd "$test_dir"
     ZOOKEEPER_ZIG_SERVER="$binary" \
     ZOOKEEPER_ZIG_RUN_DIR="$run_root/data" \
+    ZOOKEEPER_ZIG_DOCKER_LOG="$docker_log" \
     ZOOKEEPER_ZIG_NODE_IMAGE="$node_image" \
     ZOOKEEPER_ZIG_RUN_ID="$run_id" \
         "${lein_args[@]}" run "${common_args[@]}"
@@ -286,6 +285,7 @@ run_container() {
         -e LEIN_HOME=/tmp/jepsen-home/.lein \
         -e ZOOKEEPER_ZIG_SERVER="$container_binary" \
         -e ZOOKEEPER_ZIG_RUN_DIR="$container_run_root/data" \
+        -e ZOOKEEPER_ZIG_DOCKER_LOG="$container_run_root/docker-command-failures.log" \
         "${docker_node_args[@]}" \
         "${run_proxy_args[@]}" \
         -v "$cache_root:/tmp/jepsen-home" \

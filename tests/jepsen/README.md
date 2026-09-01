@@ -113,8 +113,9 @@ The unconfined profile is required because grpc-lite's libxev backend uses
 
 Jepsen histories and checker output are written under `tests/jepsen/store/`.
 Server data and logs are deleted after successful runs. Failed runs preserve
-server state under `tests/jepsen/target/` and print the tail of each node log.
-Generate a standalone local HTML index with:
+server state, node logs, and Docker command failures under
+`tests/jepsen/target/` for artifact upload without dumping node logs to the
+console. Generate a standalone local HTML index with:
 
 ```sh
 cd tests/jepsen

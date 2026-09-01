@@ -6,6 +6,7 @@
            (java.lang ProcessBuilder ProcessBuilder$Redirect)
            (java.net InetSocketAddress Socket)
            (java.nio.file Files Path)
+           (java.time Instant)
            (java.util.concurrent TimeUnit)))
 
 (def command-timeout-seconds 60)
@@ -13,6 +14,45 @@
 (def client-port 2181)
 (def raft-port 7000)
 (def partition-chain "ZKJ_PARTITION")
+
+(def ^:dynamic *docker-command-log*
+  (System/getenv "ZOOKEEPER_ZIG_DOCKER_LOG"))
+
+(def ^:private docker-command-log-lock (Object.))
+
+(defn- command-failure-message
+  [message logged?]
+  (cond
+    logged?
+    (str message "; details logged to " *docker-command-log*)
+
+    (seq *docker-command-log*)
+    (str message "; unable to write details to " *docker-command-log*)
+
+    :else
+    message))
+
+(defn- log-command-failure!
+  [{:keys [command exit output]}]
+  (if-not (seq *docker-command-log*)
+    false
+    (try
+      (let [log-file (File. *docker-command-log*)
+            parent (.getParentFile log-file)]
+        (when parent
+          (.mkdirs parent))
+        (locking docker-command-log-lock
+          (spit log-file
+                (str "timestamp: " (Instant/now) "\n"
+                     "command: " (pr-str command) "\n"
+                     "exit: " exit "\n"
+                     "output:\n"
+                     (if (str/blank? output) "(empty)" output)
+                     "\n\n")
+                :append true))
+        true)
+      (catch Throwable _
+        false))))
 
 (defn- run-result
   [arguments]
@@ -23,17 +63,27 @@
         output (future (slurp (.getInputStream process)))]
     (when-not (.waitFor process command-timeout-seconds TimeUnit/SECONDS)
       (.destroyForcibly process)
-      (throw (ex-info "Docker command timed out" {:command command})))
+      (.waitFor process 5 TimeUnit/SECONDS)
+      (let [result {:command command
+                    :exit :timeout
+                    :output (str/trim @output)}
+            logged? (log-command-failure! result)]
+        (throw (ex-info (command-failure-message "Docker command timed out"
+                                                 logged?)
+                        (dissoc result :output)))))
     {:exit (.exitValue process)
      :output (str/trim @output)
      :command command}))
 
 (defn- run!
   [& arguments]
-  (let [{:keys [exit output command]} (run-result arguments)]
+  (let [{:keys [exit output command] :as result} (run-result arguments)]
     (when-not (zero? exit)
-      (throw (ex-info "Docker command failed"
-                      {:command command :exit exit :output output})))
+      (let [logged? (log-command-failure! result)]
+        (throw (ex-info (command-failure-message "Docker command failed" logged?)
+                        {:command command
+                         :exit exit
+                         :log-file (when logged? *docker-command-log*)}))))
     output))
 
 (defn- run-ok?
@@ -149,10 +199,12 @@
             image (:node-image cluster)
             label (str "zookeeper-zig.jepsen.run=" (:run-id cluster))
             created (atom [])
+            network-created? (atom false)
             controller (atom nil)]
         (try
           (run! "image" "inspect" image)
           (run! "network" "create" "--label" label network)
+          (reset! network-created? true)
           (reset! controller (attach-controller! network))
           (let [cidr (run! "network" "inspect" "--format"
                            "{{(index .IPAM.Config 0).Subnet}}" network)
@@ -187,7 +239,10 @@
                    :nodes {})
             (info "Created Docker ZooKeeper cluster" network addresses))
           (catch Throwable error
-            (cleanup-resources! @created network @controller false)
+            (cleanup-resources! @created
+                                (when @network-created? network)
+                                @controller
+                                false)
             (throw error)))))))
 
 (defn connect-string
