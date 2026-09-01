@@ -17,7 +17,8 @@
   (:import (java.io File)))
 
 (def workload-names
-  ["register" "independent-register" "set" "presence" "unique-ids" "counter"])
+  ["register" "independent-register" "set" "presence" "unique-ids" "counter"
+   "total-queue" "linear-queue"])
 (def nemesis-names ["kill-one" "pause-one" "kill-all" "pause-all"])
 (def full-suite-configurations
   [{:workload "register" :nemesis "kill-one"}
@@ -26,6 +27,8 @@
    {:workload "set" :nemesis "kill-one"}
    {:workload "unique-ids" :nemesis "kill-one"}
    {:workload "counter" :nemesis "kill-one"}
+   {:workload "total-queue" :nemesis "kill-one"}
+   {:workload "linear-queue" :nemesis "kill-one"}
    {:workload "register" :nemesis "pause-one"}
    {:workload "register" :nemesis "kill-all"}
    {:workload "register" :nemesis "pause-all"}])
@@ -70,6 +73,16 @@
 (defn counter-read-op
   [_ _]
   {:type :invoke :f :read})
+
+(defn- queue-generator
+  []
+  (let [next-value (atom -1)]
+    (fn [_ _]
+      (if (zero? (rand-int 2))
+        {:type :invoke
+         :f :enqueue
+         :value (format "%010d" (swap! next-value inc))}
+        {:type :invoke :f :dequeue :value nil}))))
 
 (defn- nemesis-cycle
   []
@@ -150,6 +163,20 @@
    :checker (counter-checker)
    :client-fn zk-client/counter-client})
 
+(defn- total-queue-workload
+  [time-limit]
+  {:client-generator (queue-generator)
+   :final-generator (gen/once {:type :invoke :f :drain :value nil})
+   :checker (checker/total-queue)
+   :client-fn zk-client/total-queue-client})
+
+(defn- linear-queue-workload
+  [time-limit]
+  {:client-generator (queue-generator)
+   :checker (checker/linearizable {:model (model/unordered-queue)
+                                   :algorithm :linear})
+   :client-fn zk-client/linear-queue-client})
+
 (defn- workload
   [name time-limit]
   (let [spec (case name
@@ -158,7 +185,9 @@
                "set" (set-workload time-limit)
                "presence" (presence-workload time-limit)
                "unique-ids" (unique-ids-workload time-limit)
-               "counter" (counter-workload time-limit))]
+               "counter" (counter-workload time-limit)
+               "total-queue" (total-queue-workload time-limit)
+               "linear-queue" (linear-queue-workload time-limit))]
     (assoc spec
            :generator (fault-workload (:client-generator spec)
                                       (:final-generator spec)

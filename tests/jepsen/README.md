@@ -20,6 +20,10 @@ The full suite adds:
   Jepsen's linearizable full-set checker;
 - `unique-ids`: persistent sequential creates checked for duplicate IDs;
 - `counter`: atomic sequential increments checked against concurrent reads;
+- `total-queue`: unique enqueues and atomic multi-based dequeues, followed by a
+  final drain checked for lost or unexpected values;
+- `linear-queue`: the same queue operations checked for linearizability with an
+  unordered queue model;
 - `pause-one`: repeated `SIGSTOP`/`SIGCONT` of one server process;
 - `kill-all` and `pause-all`: full-cluster crash and suspension followed by
   recovery.
@@ -29,10 +33,10 @@ The register and partition test from
 the register workload and local process nemeses. The `unique-ids`, `counter`,
 and all-node fault scenarios are clean-room adaptations of the
 [ClickHouse Keeper Jepsen suite](https://github.com/ClickHouse/ClickHouse/tree/master/tests/jepsen.clickhouse/src/jepsen/clickhouse/keeper).
-Its `total-queue` and `linear-queue` workloads remain to be ported now that the
-server supports ZooKeeper write multi and multiRead operations. Network partition nemeses need
-per-node network namespaces rather than the current shared loopback harness.
-Storage corruption and watch scenarios remain excluded.
+The queue workloads use the Keeper suite's version-checked write-multi pattern
+to serialize concurrent removals. Network partition nemeses need per-node
+network namespaces rather than the current shared loopback harness. Storage
+corruption and watch scenarios remain excluded.
 
 ## Run
 
@@ -58,9 +62,9 @@ mise run test-jepsen-smoke
 ```
 
 Supported workloads are `register`, `presence`, `independent-register`, `set`,
-`unique-ids`, and `counter`. Supported nemeses are `kill-one`, `pause-one`,
-`kill-all`, and `pause-all`. The independent register requires concurrency to
-be divisible by three.
+`unique-ids`, `counter`, `total-queue`, and `linear-queue`. Supported nemeses are
+`kill-one`, `pause-one`, `kill-all`, and `pause-all`. The independent register
+requires concurrency to be divisible by three.
 
 The default runner uses local Leiningen when available, then Docker or Podman.
 The container runner uses host networking and builds the local

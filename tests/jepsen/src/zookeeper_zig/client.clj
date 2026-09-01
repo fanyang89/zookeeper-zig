@@ -5,9 +5,10 @@
             [zookeeper-zig.cluster :as cluster])
   (:import (java.nio.charset StandardCharsets)
            (org.apache.zookeeper CreateMode KeeperException KeeperException$Code
-                                 Watcher Watcher$Event$KeeperState ZooDefs$Ids
+                                 Op Watcher Watcher$Event$KeeperState ZooDefs$Ids
                                  ZooKeeper)
-           (org.apache.zookeeper.data Stat)))
+           (org.apache.zookeeper.data Stat)
+           (java.util Arrays)))
 
 (def register-path "/jepsen-register")
 (def independent-register-prefix "/jepsen-register-")
@@ -16,6 +17,9 @@
 (def unique-id-prefix "/jepsen-sequence-")
 (def counter-path "/jepsen-counter")
 (def counter-entry-prefix "entry-")
+(def queue-path "/jepsen-queue")
+(def queue-drain-attempts 30)
+(def queue-drain-retry-ms 1000)
 (def session-timeout-ms 10000)
 (def connect-timeout-ms 30000)
 
@@ -343,6 +347,122 @@
     (when zk
       (.close ^ZooKeeper zk))))
 
+(defn queue-child-path
+  [value]
+  (str queue-path "/" value))
+
+(defn- ensure-queue-root!
+  [^ZooKeeper zk]
+  (try
+    (.create zk queue-path (byte-array 0) ZooDefs$Ids/OPEN_ACL_UNSAFE
+             CreateMode/PERSISTENT)
+    (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+      queue-path)))
+
+(defn- enqueue!
+  [^ZooKeeper zk value]
+  (ensure-queue-root! zk)
+  (.create zk (queue-child-path value) (byte-array 0)
+           ZooDefs$Ids/OPEN_ACL_UNSAFE CreateMode/PERSISTENT)
+  :ok)
+
+(defn- first-queue-child
+  [^ZooKeeper zk ^Stat stat]
+  (first (sort (.getChildren zk queue-path false stat))))
+
+(defn- uncertain-dequeue
+  [op uncertain-type child error]
+  (assoc op :type uncertain-type :value child :error error))
+
+(defn- dequeue!
+  [^ZooKeeper zk uncertain-type op]
+  (let [stat (Stat.)
+        child (first-queue-child zk stat)]
+    (if-not child
+      (assoc op :type :fail :value nil)
+      (try
+        (let [operations (Arrays/asList
+                          (into-array
+                           Op
+                           [(Op/check queue-path (.getVersion stat))
+                            (Op/setData queue-path (byte-array 0) -1)
+                            (Op/delete (queue-child-path child) -1)]))]
+          (.multi zk operations)
+          (assoc op :type :ok :value child))
+        (catch org.apache.zookeeper.KeeperException$BadVersionException _
+          (assoc op :type :fail :value nil))
+        (catch KeeperException error
+          (if (transient-error? error)
+            (uncertain-dequeue op uncertain-type child (error-keyword error))
+            (throw error)))
+        (catch InterruptedException _
+          (.interrupt (Thread/currentThread))
+          (uncertain-dequeue op uncertain-type child :interrupted))))))
+
+(defn- drain-queue-once!
+  [^ZooKeeper zk]
+  (ensure-queue-root! zk)
+  (.setData zk queue-path (byte-array 0) -1)
+  (into #{} (.getChildren zk queue-path false)))
+
+(defn- pause-before-drain-retry!
+  []
+  (try
+    (Thread/sleep queue-drain-retry-ms)
+    true
+    (catch InterruptedException _
+      (.interrupt (Thread/currentThread))
+      false)))
+
+(defn- drain-queue!
+  [^ZooKeeper zk op]
+  (loop [attempts-left queue-drain-attempts]
+    (let [result (try
+                   {:value (drain-queue-once! zk)}
+                   (catch KeeperException error
+                     {:error error})
+                   (catch InterruptedException _
+                     (.interrupt (Thread/currentThread))
+                     {:interrupted? true}))]
+      (cond
+        (contains? result :value)
+        (assoc op :type :ok :value (:value result))
+
+        (:interrupted? result)
+        (assoc op :type :fail :error :interrupted)
+
+        (and (< 1 attempts-left)
+             (transient-error? (:error result))
+             (pause-before-drain-retry!))
+        (recur (dec attempts-left))
+
+        :else
+        (assoc op :type :fail :error (error-keyword (:error result)))))))
+
+(defrecord QueueClient [cluster zk uncertain-dequeue-type]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    (ensure-queue-root! zk)
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(case (:f op)
+        :enqueue (assoc op :type (enqueue! zk (:value op)))
+        :dequeue (dequeue! zk uncertain-dequeue-type op)
+        :drain (drain-queue! zk op))))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
 (defrecord PresenceClient [cluster zk]
   client/Client
   (open! [this _ _]
@@ -392,3 +512,11 @@
 (defn counter-client
   [cluster]
   (->CounterClient cluster nil))
+
+(defn total-queue-client
+  [cluster]
+  (->QueueClient cluster nil :ok))
+
+(defn linear-queue-client
+  [cluster]
+  (->QueueClient cluster nil :info))
