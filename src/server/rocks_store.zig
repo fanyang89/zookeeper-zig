@@ -1333,6 +1333,47 @@ pub const RocksStore = struct {
         }
     };
 
+    fn appendMultiCurrentEvent(
+        self: *RocksStore,
+        state: *MultiState,
+        events: *std.ArrayList(data_tree.MutationEvent),
+        event_type: data_tree.MutationEventType,
+        path: []const u8,
+    ) !void {
+        const node = (try state.getNode(self, path)) orelse return error.InvalidMultiState;
+        return appendMultiEvent(self.allocator, events, event_type, path, node.acl);
+    }
+
+    fn appendMultiEvent(
+        allocator: std.mem.Allocator,
+        events: *std.ArrayList(data_tree.MutationEvent),
+        event_type: data_tree.MutationEventType,
+        path: []const u8,
+        acl_blob: ?[]const u8,
+    ) !void {
+        var event = data_tree.MutationEvent{
+            .type = event_type,
+            .path = try allocator.dupe(u8, path),
+            .acl = null,
+        };
+        errdefer event.deinit(allocator);
+        event.acl = if (acl_blob) |value| try allocator.dupe(u8, value) else null;
+        try events.append(allocator, event);
+    }
+
+    fn encodeCommandResponse(
+        self: *RocksStore,
+        zxid: i64,
+        body: []const u8,
+    ) ![]u8 {
+        var writer = jute.Writer.init(self.allocator);
+        defer writer.deinit();
+        try writer.writeInt(@intFromEnum(ErrorCode.ok));
+        try writer.writeLong(zxid);
+        try writer.writeBytes(body);
+        return writer.toOwnedSlice();
+    }
+
     fn applyMulti(
         self: *RocksStore,
         body: []const u8,
@@ -1354,11 +1395,29 @@ pub const RocksStore = struct {
         defer state.deinit();
         var response = jute.Writer.init(self.allocator);
         defer response.deinit();
+        var events: std.ArrayList(data_tree.MutationEvent) = .empty;
+        defer {
+            for (events.items) |*event| event.deinit(self.allocator);
+            events.deinit(self.allocator);
+        }
         var iterator = multi.RequestIterator.init(body);
         var operation_index: usize = 0;
         while (try iterator.next(self.allocator)) |value| : (operation_index += 1) {
             var operation = value;
             defer operation.deinit(self.allocator);
+            var deleted_acl: ?[]u8 = null;
+            defer if (deleted_acl) |value_acl| self.allocator.free(value_acl);
+            switch (operation) {
+                .delete => |request| if (request.path) |path| {
+                    if (try state.getNode(self, path)) |node| {
+                        deleted_acl = if (node.acl) |value_acl|
+                            try self.allocator.dupe(u8, value_acl)
+                        else
+                            null;
+                    }
+                },
+                else => {},
+            }
             var result = try state.applyOperation(
                 self,
                 operation,
@@ -1386,12 +1445,58 @@ pub const RocksStore = struct {
                 try multi.writeTerminator(&response);
                 const owned = try self.allocator.dupe(u8, response.bytes());
                 errdefer self.allocator.free(owned);
+                const command_response = try self.encodeCommandResponse(
+                    try self.clientZxid(index),
+                    owned,
+                );
+                errdefer self.allocator.free(command_response);
                 try self.advanceApplied(index, term);
                 return .{
                     .code = .ok,
                     .response_body = owned,
                     .owned_response_body = owned,
+                    .command_response = command_response,
+                    .owned_command_response = command_response,
                 };
+            }
+            switch (operation) {
+                .create, .create2, .create_container, .create_ttl => {
+                    const path = result.created_path orelse return error.InvalidMultiState;
+                    try self.appendMultiCurrentEvent(&state, &events, .node_created, path);
+                    if (data_tree.parentPath(path)) |parent| {
+                        try self.appendMultiCurrentEvent(
+                            &state,
+                            &events,
+                            .node_children_changed,
+                            parent,
+                        );
+                    }
+                },
+                .delete => |request| {
+                    const path = request.path orelse return error.InvalidMultiState;
+                    try appendMultiEvent(
+                        self.allocator,
+                        &events,
+                        .node_deleted,
+                        path,
+                        deleted_acl,
+                    );
+                    if (data_tree.parentPath(path)) |parent| {
+                        try self.appendMultiCurrentEvent(
+                            &state,
+                            &events,
+                            .node_children_changed,
+                            parent,
+                        );
+                    }
+                },
+                .set_data => |request| try self.appendMultiCurrentEvent(
+                    &state,
+                    &events,
+                    .node_data_changed,
+                    request.path orelse return error.InvalidMultiState,
+                ),
+                .check => {},
             }
             const kind: multi.Kind = operation;
             const response_kind: i32 = switch (operation) {
@@ -1419,11 +1524,24 @@ pub const RocksStore = struct {
         try multi.writeTerminator(&response);
         const owned = try self.allocator.dupe(u8, response.bytes());
         errdefer self.allocator.free(owned);
+        const command_response = try self.encodeCommandResponse(
+            try self.clientZxid(index),
+            owned,
+        );
+        errdefer self.allocator.free(command_response);
+        const owned_events = try events.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_events) |*event| event.deinit(self.allocator);
+            self.allocator.free(owned_events);
+        }
         try state.commit(self, .{ .index = index, .term = term });
         return .{
             .code = .ok,
             .response_body = owned,
             .owned_response_body = owned,
+            .command_response = command_response,
+            .owned_command_response = command_response,
+            .events = owned_events,
         };
     }
 
@@ -2325,6 +2443,15 @@ test "multi commits atomically and rolls back on failure" {
     var ttl_node = (try store.getNode("/multi-ttl")).?;
     defer ttl_node.deinit(testing.allocator);
     try testing.expectEqual(ephemeral.NodeKind.ttl, ttl_node.kind);
+    try testing.expectEqual(@as(usize, 5), success.events.?.len);
+    try testing.expectEqual(data_tree.MutationEventType.node_created, success.events.?[0].type);
+    try testing.expectEqualStrings("/multi", success.events.?[0].path);
+    try testing.expectEqual(data_tree.MutationEventType.node_data_changed, success.events.?[2].type);
+    try testing.expectEqualStrings("/multi", success.events.?[2].path);
+    try testing.expectEqualStrings("/multi-ttl", success.events.?[3].path);
+    const success_command = try command.decodeResult(success.command_response.?);
+    try testing.expectEqual(ErrorCode.ok, success_command.code);
+    try testing.expectEqualSlices(u8, success.response_body.?, success_command.body);
 
     var rollback_request = jute.Writer.init(testing.allocator);
     defer rollback_request.deinit();
@@ -2355,6 +2482,9 @@ test "multi commits atomically and rolls back on failure" {
     } }, 2, 1);
     defer rollback.deinit(testing.allocator);
     try testing.expectEqual(ErrorCode.ok, rollback.code);
+    try testing.expectEqual(@as(?[]data_tree.MutationEvent, null), rollback.events);
+    const rollback_command = try command.decodeResult(rollback.command_response.?);
+    try testing.expectEqualSlices(u8, rollback.response_body.?, rollback_command.body);
     try testing.expect((try store.exists("/rolled-back")) == null);
     try testing.expect((try store.exists("/multi")) != null);
 
@@ -2414,4 +2544,86 @@ test "stale session expiration reports no znode change" {
     defer expired.deinit(testing.allocator);
     try testing.expect(expired.changed);
     try testing.expect((try store.getSession(42)) == null);
+}
+
+test "multi watch events retain intermediate state and deletion ACLs" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+
+    const denied_acl = try acl.encode(testing.allocator, &.{.{
+        .perms = acl.write,
+        .scheme = "world",
+        .id = "anyone",
+    }});
+    defer testing.allocator.free(denied_acl);
+    var created = try store.apply(.{ .create = .{
+        .path = "/secure",
+        .data = "value",
+        .time_ms = 1,
+        .acl = denied_acl,
+    } }, 1, 1);
+    defer created.deinit(testing.allocator);
+
+    var delete_request = jute.Writer.init(testing.allocator);
+    defer delete_request.deinit();
+    try multi.writeHeader(&delete_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try jute.serialize(&delete_request, protocol.proto.DeleteRequest{
+        .path = "/secure",
+        .version = -1,
+    });
+    try multi.writeTerminator(&delete_request);
+    var deleted = try store.apply(.{ .multi = .{
+        .body = delete_request.bytes(),
+        .time_ms = 2,
+        .session_id = 0,
+        .session_generation = 0,
+    } }, 2, 1);
+    defer deleted.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), deleted.events.?.len);
+    try testing.expectEqual(data_tree.MutationEventType.node_deleted, deleted.events.?[0].type);
+    try testing.expectEqualStrings("/secure", deleted.events.?[0].path);
+    try testing.expect(!try acl.allows(deleted.events.?[0].acl, acl.read, null));
+
+    const open_acl = [_]protocol.data.ACL{.{
+        .perms = acl.all,
+        .id = .{ .scheme = "world", .id = "anyone" },
+    }};
+    var transient_request = jute.Writer.init(testing.allocator);
+    defer transient_request.deinit();
+    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.create), false, -1);
+    try jute.serialize(&transient_request, protocol.proto.CreateRequest{
+        .path = "/transient",
+        .data = "one",
+        .acl = &open_acl,
+        .flags = 0,
+    });
+    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try jute.serialize(&transient_request, protocol.proto.SetDataRequest{
+        .path = "/transient",
+        .data = "two",
+        .version = 0,
+    });
+    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try jute.serialize(&transient_request, protocol.proto.DeleteRequest{
+        .path = "/transient",
+        .version = 1,
+    });
+    try multi.writeTerminator(&transient_request);
+    var transient = try store.apply(.{ .multi = .{
+        .body = transient_request.bytes(),
+        .time_ms = 3,
+        .session_id = 0,
+        .session_generation = 0,
+    } }, 3, 1);
+    defer transient.deinit(testing.allocator);
+    try testing.expect((try store.exists("/transient")) == null);
+    try testing.expectEqual(@as(usize, 5), transient.events.?.len);
+    try testing.expectEqual(data_tree.MutationEventType.node_created, transient.events.?[0].type);
+    try testing.expectEqual(data_tree.MutationEventType.node_data_changed, transient.events.?[2].type);
+    try testing.expectEqual(data_tree.MutationEventType.node_deleted, transient.events.?[3].type);
 }

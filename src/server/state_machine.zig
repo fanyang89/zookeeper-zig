@@ -460,6 +460,8 @@ pub const ZooKeeperStateMachine = struct {
         data_watches: ?[]const ?[]const u8,
         exist_watches: ?[]const ?[]const u8,
         child_watches: ?[]const ?[]const u8,
+        persistent_watches: ?[]const ?[]const u8,
+        persistent_recursive_watches: ?[]const ?[]const u8,
         registration: watch.RegistrationContext,
     ) !void {
         spinLock(&self.mutex);
@@ -519,6 +521,14 @@ pub const ZooKeeperStateMachine = struct {
             } else {
                 try self.registerWatchLocked(registration, .children, path);
             }
+        }
+        for (persistent_watches orelse &.{}) |maybe_path| {
+            const path = maybe_path orelse return error.InvalidWatchPath;
+            try self.registerWatchLocked(registration, .persistent, path);
+        }
+        for (persistent_recursive_watches orelse &.{}) |maybe_path| {
+            const path = maybe_path orelse return error.InvalidWatchPath;
+            try self.registerWatchLocked(registration, .persistent_recursive, path);
         }
     }
 
@@ -585,15 +595,33 @@ pub const ZooKeeperStateMachine = struct {
             return .{};
         }
         const mutation = command.decode(entry.data) catch return error.Fatal;
-
-        const success_response_size = command.resultCapacity(mutation) catch return error.Fatal;
-        var writer = jute.Writer.init(self.allocator);
-        defer writer.deinit();
-        writer.ensureTotalCapacityPrecise(success_response_size) catch return error.OutOfMemory;
+        var error_response: ?[]u8 = self.allocator.alloc(u8, 12) catch
+            return error.OutOfMemory;
+        var success_response: ?[]u8 = null;
+        if (mutation != .multi) {
+            const success_size = mutationSuccessResponseSize(mutation) catch {
+                self.allocator.free(error_response.?);
+                return error.Fatal;
+            };
+            success_response = self.allocator.alloc(u8, success_size) catch {
+                self.allocator.free(error_response.?);
+                return error.OutOfMemory;
+            };
+        }
+        defer if (error_response) |response| self.allocator.free(response);
+        defer if (success_response) |response| self.allocator.free(response);
 
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         const zxid = self.store.clientZxid(entry.index) catch return error.Fatal;
+        const deleted_acl: ?rocks_store.AclResult = if (self.watch_manager != null) switch (mutation) {
+            .delete => |request| self.store.getAcl(self.allocator, request.path) catch |err|
+                return mapStoreError(err),
+            .delete_extended => |request| self.store.getAcl(self.allocator, request.path) catch |err|
+                return mapStoreError(err),
+            else => null,
+        } else null;
+        defer if (deleted_acl) |snapshot| if (snapshot.blob) |blob| self.allocator.free(blob);
         const removed_ephemeral_paths: ?[][]u8 = if (self.watch_manager != null) switch (mutation) {
             .close_session => |request| self.store.ephemeralPaths(
                 self.allocator,
@@ -609,40 +637,77 @@ pub const ZooKeeperStateMachine = struct {
             for (paths) |path| self.allocator.free(path);
             self.allocator.free(paths);
         };
+        const removed_ephemeral_acls: ?[]?[]u8 = if (removed_ephemeral_paths) |paths| blk: {
+            const snapshots = self.allocator.alloc(?[]u8, paths.len) catch return error.OutOfMemory;
+            errdefer self.allocator.free(snapshots);
+            var initialized: usize = 0;
+            errdefer for (snapshots[0..initialized]) |blob| if (blob) |value| self.allocator.free(value);
+            for (paths, snapshots) |path, *snapshot| {
+                const current = self.store.getAcl(self.allocator, path) catch |err|
+                    return mapStoreError(err);
+                snapshot.* = if (current) |value| value.blob else null;
+                initialized += 1;
+            }
+            break :blk snapshots;
+        } else null;
+        defer if (removed_ephemeral_acls) |snapshots| {
+            for (snapshots) |blob| if (blob) |value| self.allocator.free(value);
+            self.allocator.free(snapshots);
+        };
         var result = self.store.apply(mutation, entry.index, entry.term) catch |err|
             return mapStoreError(err);
         defer result.deinit(self.allocator);
 
-        writer.writeInt(@intFromEnum(result.code)) catch unreachable;
-        writer.writeLong(zxid) catch unreachable;
         if (result.code == .ok) {
             if (self.watch_manager) |manager| {
                 publishMutationEvents(
                     manager,
+                    &self.store,
                     self.allocator,
                     mutation,
                     result,
                     zxid,
                     removed_ephemeral_paths orelse &.{},
+                    removed_ephemeral_acls orelse &.{},
+                    if (deleted_acl) |snapshot| snapshot.blob else null,
                 ) catch manager.invalidateAll();
             }
-            switch (mutation) {
-                .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
-                    .path = result.created_path orelse value.path,
-                    .stat = result.stat.?,
-                }) catch unreachable,
-                .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => {},
-                .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
-                    .stat = result.stat.?,
-                }) catch unreachable,
-                .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
-                    .stat = result.stat.?,
-                }) catch unreachable,
-                .multi => writer.writeBytes(result.response_body orelse return error.Fatal) catch
-                    return error.OutOfMemory,
-            }
         }
-        return .{ .response = writer.toOwnedSlice() catch return error.OutOfMemory };
+        if (mutation == .multi and result.code == .ok) {
+            const response = result.owned_command_response orelse return error.Fatal;
+            result.command_response = null;
+            result.owned_command_response = null;
+            return .{ .response = response };
+        }
+
+        const response = if (result.code == .ok) blk: {
+            const value = success_response.?;
+            success_response = null;
+            break :blk value;
+        } else blk: {
+            const value = error_response.?;
+            error_response = null;
+            break :blk value;
+        };
+        var writer = jute.Writer.initOwnedBuffer(self.allocator, response);
+        defer writer.deinit();
+        writer.writeInt(@intFromEnum(result.code)) catch unreachable;
+        writer.writeLong(zxid) catch unreachable;
+        if (result.code == .ok) switch (mutation) {
+            .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
+                .path = result.created_path orelse value.path,
+                .stat = result.stat.?,
+            }) catch unreachable,
+            .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => {},
+            .set_acl => jute.serialize(&writer, protocol.proto.SetACLResponse{
+                .stat = result.stat.?,
+            }) catch unreachable,
+            .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
+                .stat = result.stat.?,
+            }) catch unreachable,
+            .multi => unreachable,
+        };
+        return .{ .response = writer.toOwnedSliceAssert() };
     }
 
     fn takeSnapshotImpl(
@@ -709,44 +774,92 @@ pub const ZooKeeperStateMachine = struct {
 
 fn publishMutationEvents(
     manager: *watch.Manager,
+    store: *rocks_store.RocksStore,
     allocator: std.mem.Allocator,
     mutation: command.Mutation,
     result: data_tree.MutationResult,
     zxid: i64,
     removed_ephemeral_paths: []const []const u8,
+    removed_ephemeral_acls: []const ?[]u8,
+    deleted_acl: ?[]const u8,
 ) !void {
     switch (mutation) {
-        .create => |request| publishCreated(
+        .create => |request| try publishCreated(
             manager,
+            store,
+            allocator,
             zxid,
             result.created_path orelse request.path,
         ),
-        .delete => |request| publishDeleted(manager, zxid, request.path),
-        .set_data => |request| manager.publish(.{
-            .type = .node_data_changed,
-            .zxid = zxid,
-            .path = request.path,
-        }),
-        .delete_extended => |request| {
-            if (result.changed) publishDeleted(manager, zxid, request.path);
-        },
-        .multi => |request| try publishMultiEvents(
+        .delete => |request| try publishDeleted(
             manager,
+            store,
             allocator,
-            request.body,
-            result.response_body orelse return error.InvalidMultiResponse,
             zxid,
+            request.path,
+            deleted_acl,
         ),
+        .set_data => |request| try publishCurrentEvent(
+            manager,
+            store,
+            allocator,
+            .node_data_changed,
+            zxid,
+            request.path,
+        ),
+        .delete_extended => |request| {
+            if (result.changed) try publishDeleted(
+                manager,
+                store,
+                allocator,
+                zxid,
+                request.path,
+                deleted_acl,
+            );
+        },
+        .multi => {
+            for (result.events orelse &.{}) |event| {
+                manager.publish(.{
+                    .type = switch (event.type) {
+                        .node_created => .node_created,
+                        .node_deleted => .node_deleted,
+                        .node_data_changed => .node_data_changed,
+                        .node_children_changed => .node_children_changed,
+                    },
+                    .zxid = zxid,
+                    .path = event.path,
+                    .acl = event.acl,
+                });
+            }
+        },
         .close_session => |request| {
             if (result.changed) {
                 manager.invalidateSession(request.session_id, request.generation);
-                for (removed_ephemeral_paths) |path| publishDeleted(manager, zxid, path);
+                for (removed_ephemeral_paths, removed_ephemeral_acls) |path, event_acl| {
+                    try publishDeleted(
+                        manager,
+                        store,
+                        allocator,
+                        zxid,
+                        path,
+                        event_acl,
+                    );
+                }
             }
         },
         .expire_session => |request| {
             if (result.changed) {
                 manager.invalidateSession(request.session_id, null);
-                for (removed_ephemeral_paths) |path| publishDeleted(manager, zxid, path);
+                for (removed_ephemeral_paths, removed_ephemeral_acls) |path, event_acl| {
+                    try publishDeleted(
+                        manager,
+                        store,
+                        allocator,
+                        zxid,
+                        path,
+                        event_acl,
+                    );
+                }
             }
         },
         .move_session => |request| {
@@ -762,85 +875,93 @@ fn publishMutationEvents(
     }
 }
 
-fn publishMultiEvents(
+fn publishCreated(
     manager: *watch.Manager,
+    store: *rocks_store.RocksStore,
     allocator: std.mem.Allocator,
-    request_body: []const u8,
-    response_body: []const u8,
     zxid: i64,
+    path: []const u8,
 ) !void {
-    var request_iterator = multi.RequestIterator.init(request_body);
-    var response_reader = jute.Reader.init(response_body);
-    while (try request_iterator.next(allocator)) |value| {
-        var operation = value;
-        defer operation.deinit(allocator);
-        const header = try jute.deserialize(
-            protocol.proto.MultiHeader,
-            &response_reader,
+    try publishCurrentEvent(manager, store, allocator, .node_created, zxid, path);
+    if (data_tree.parentPath(path)) |parent| {
+        try publishCurrentEvent(
+            manager,
+            store,
             allocator,
+            .node_children_changed,
+            zxid,
+            parent,
         );
-        if (header.done) return error.InvalidMultiResponse;
-        if (header.type == -1) return;
-        switch (operation) {
-            .create => {
-                const response = try jute.deserialize(
-                    protocol.proto.CreateResponse,
-                    &response_reader,
-                    allocator,
-                );
-                defer jute.deinitDecoded(response, allocator);
-                publishCreated(manager, zxid, response.path orelse return error.InvalidMultiResponse);
-            },
-            .create2, .create_container, .create_ttl => {
-                const response = try jute.deserialize(
-                    protocol.proto.Create2Response,
-                    &response_reader,
-                    allocator,
-                );
-                defer jute.deinitDecoded(response, allocator);
-                publishCreated(manager, zxid, response.path orelse return error.InvalidMultiResponse);
-            },
-            .delete => |request| publishDeleted(
-                manager,
-                zxid,
-                request.path orelse return error.InvalidMultiResponse,
-            ),
-            .set_data => |request| {
-                _ = try jute.deserialize(
-                    protocol.proto.SetDataResponse,
-                    &response_reader,
-                    allocator,
-                );
-                manager.publish(.{
-                    .type = .node_data_changed,
-                    .zxid = zxid,
-                    .path = request.path orelse return error.InvalidMultiResponse,
-                });
-            },
-            .check => {},
-        }
-    }
-    const terminator = try jute.deserialize(
-        protocol.proto.MultiHeader,
-        &response_reader,
-        allocator,
-    );
-    if (!terminator.done or terminator.type != -1 or terminator.err != -1 or
-        response_reader.remaining() != 0) return error.InvalidMultiResponse;
-}
-
-fn publishCreated(manager: *watch.Manager, zxid: i64, path: []const u8) void {
-    manager.publish(.{ .type = .node_created, .zxid = zxid, .path = path });
-    if (data_tree.parentPath(path)) |parent| {
-        manager.publish(.{ .type = .node_children_changed, .zxid = zxid, .path = parent });
     }
 }
 
-fn publishDeleted(manager: *watch.Manager, zxid: i64, path: []const u8) void {
-    manager.publish(.{ .type = .node_deleted, .zxid = zxid, .path = path });
+fn publishDeleted(
+    manager: *watch.Manager,
+    store: *rocks_store.RocksStore,
+    allocator: std.mem.Allocator,
+    zxid: i64,
+    path: []const u8,
+    deleted_acl: ?[]const u8,
+) !void {
+    manager.publish(.{
+        .type = .node_deleted,
+        .zxid = zxid,
+        .path = path,
+        .acl = deleted_acl,
+    });
     if (data_tree.parentPath(path)) |parent| {
-        manager.publish(.{ .type = .node_children_changed, .zxid = zxid, .path = parent });
+        try publishCurrentEvent(
+            manager,
+            store,
+            allocator,
+            .node_children_changed,
+            zxid,
+            parent,
+        );
     }
+}
+
+fn publishCurrentEvent(
+    manager: *watch.Manager,
+    store: *rocks_store.RocksStore,
+    allocator: std.mem.Allocator,
+    event_type: watch.EventType,
+    zxid: i64,
+    path: []const u8,
+) !void {
+    const result = (try store.getAcl(allocator, path)) orelse return error.MissingWatchAcl;
+    defer if (result.blob) |blob| allocator.free(blob);
+    manager.publish(.{
+        .type = event_type,
+        .zxid = zxid,
+        .path = path,
+        .acl = result.blob,
+    });
+}
+
+fn mutationSuccessResponseSize(mutation: command.Mutation) !usize {
+    return switch (mutation) {
+        .create => |request| std.math.add(
+            usize,
+            84,
+            std.math.add(
+                usize,
+                request.path.len,
+                if (request.sequential) 10 else 0,
+            ) catch return error.SizeOverflow,
+        ) catch error.SizeOverflow,
+        .set_acl, .set_data => 80,
+        .delete,
+        .open_session,
+        .touch_session,
+        .close_session,
+        .expire_session,
+        .move_session,
+        .session_tick,
+        .delete_extended,
+        => 12,
+        .multi => error.SizeOverflow,
+    };
 }
 
 fn spinLock(mutex: *std.atomic.Mutex) void {
@@ -994,4 +1115,87 @@ test "RocksDB state machine atomically persists commands and restores snapshots"
     } });
     try testing.expectEqual(data_tree.ErrorCode.ok, closed.code);
     try testing.expectEqual(@as(?rocks_store.Session, null), try restored.getSession(99));
+}
+
+test "prepared mutation response sizes are exact" {
+    const testing = std.testing;
+    const stat = std.mem.zeroes(protocol.data.Stat);
+    const plain_create = command.Mutation{ .create = .{
+        .path = "/node",
+        .data = "",
+        .time_ms = 1,
+    } };
+    const plain_response = try command.encodeResult(
+        testing.allocator,
+        .ok,
+        1,
+        protocol.proto.Create2Response{ .path = "/node", .stat = stat },
+    );
+    defer testing.allocator.free(plain_response);
+    try testing.expectEqual(plain_response.len, try mutationSuccessResponseSize(plain_create));
+
+    const sequential_create = command.Mutation{ .create = .{
+        .path = "/node",
+        .data = "",
+        .time_ms = 1,
+        .sequential = true,
+    } };
+    const sequential_response = try command.encodeResult(
+        testing.allocator,
+        .ok,
+        1,
+        protocol.proto.Create2Response{ .path = "/node0000000000", .stat = stat },
+    );
+    defer testing.allocator.free(sequential_response);
+    try testing.expectEqual(
+        sequential_response.len,
+        try mutationSuccessResponseSize(sequential_create),
+    );
+
+    const set_data = command.Mutation{ .set_data = .{
+        .path = "/node",
+        .data = "value",
+        .expected_version = -1,
+        .time_ms = 1,
+    } };
+    const set_response = try command.encodeResult(
+        testing.allocator,
+        .ok,
+        1,
+        protocol.proto.SetDataResponse{ .stat = stat },
+    );
+    defer testing.allocator.free(set_response);
+    try testing.expectEqual(set_response.len, try mutationSuccessResponseSize(set_data));
+}
+
+test "session-rejected multi returns an error after advancing applied state" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var machine = try ZooKeeperStateMachine.init(testing.allocator, path);
+    defer machine.deinit();
+
+    const password = [_]u8{0x3c} ** 16;
+    const opened = try applyMutation(&machine, testing.allocator, 1, .{ .open_session = .{
+        .session_id = 77,
+        .password = &password,
+        .timeout_ms = 3_000,
+        .tick_grace_ms = 100,
+        .generation = 1,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.ok, opened.code);
+
+    var body = jute.Writer.init(testing.allocator);
+    defer body.deinit();
+    try multi.writeTerminator(&body);
+    const rejected = try applyMutation(&machine, testing.allocator, 2, .{ .multi = .{
+        .body = body.bytes(),
+        .time_ms = 1,
+        .session_id = 77,
+        .session_generation = 2,
+    } });
+    try testing.expectEqual(data_tree.ErrorCode.session_moved, rejected.code);
+    try testing.expectEqual(@as(u64, 2), machine.appliedIndex());
 }

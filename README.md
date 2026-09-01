@@ -177,12 +177,15 @@ The current server supports replicated sessions, session resume and expiration,
 ephemeral, sequential, container, and TTL nodes, digest authentication, ACL
 enforcement, Connect, ping, closeSession, create/create2/createContainer/createTTL,
 delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2,
-sync, atomic write multi operations, multiRead, and core one-shot watches.
+sync, atomic write multi operations, multiRead, and ZooKeeper watches.
 Write multi supports create, create2, container/TTL create, delete, setData, and
 version checks. MultiRead supports getData and getChildren with independent
 per-operation results. `exists`, `getData`, and `getChildren/getChildren2`
-support one-shot watches for create, delete, data, and child events. Clients can
-restore these watches after reconnecting with `setWatches` or `setWatches2`.
+support one-shot watches for create, delete, data, and child events. `addWatch`
+supports persistent exact-path and persistent-recursive modes. `checkWatches`
+and `removeWatches` implement every ZooKeeper watcher type, including `Any` and
+`NOWATCHER`. Clients can restore all watch modes after reconnecting with
+`setWatches` or `setWatches2`.
 Reads use Raft ReadIndex before accessing RocksDB. Session close and expiration
 atomically remove all session-owned ephemeral nodes. ACLs support
 `world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks.
@@ -190,11 +193,12 @@ Connection establishment and client requests pass through a bounded
 `std.Io.Queue` and a fixed worker pool before entering Raft or RocksDB. The
 worker count defaults to the number of logical CPUs and the queue capacity
 defaults to 256; override them with `--client-request-workers` and
-`--client-request-queue-capacity`. Watch notifications use a separate bounded
-queue per connection; a slow or failed notification sink is disconnected rather
-than blocking Raft apply. IPv6 ACL identities, SASL, persistent/recursive
-watches, and watch removal/check APIs are not implemented yet. MultiRead watch
-flags are accepted but do not register watches.
+`--client-request-queue-capacity`. Watch notifications and pending persistent
+watch events use bounded queues per connection; a slow, failed, or overflowing
+notification sink is disconnected rather than blocking Raft apply. Watch events
+are filtered using the connection's current READ authorization. IPv6 ACL
+identities and SASL are not implemented yet. MultiRead watch flags are accepted
+but do not register watches.
 
 ## Java client interoperability
 
@@ -209,14 +213,16 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream tests unchanged alongside
 focused interoperability cases. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current 56-test selection
+server starts an isolated Zig server instead. The current 89-test selection
 covers synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-container, TTL, write-multi, multiRead, core watches, large-data, sync, lifecycle
-cleanup, error-code, and three-node failover tests. The quorum case verifies
+container, TTL, write-multi, multiRead, one-shot and persistent watches, large-data,
+sync, lifecycle cleanup, error-code, and three-node failover tests. The watch
+selection includes unchanged upstream persistent, persistent-recursive, ACL,
+disconnect, overlapping-mode, and root-watch tests. The quorum case verifies
 official-client session continuity, re-authentication, ephemeral ownership,
 rolling node restarts, and follower catch-up. Focused watch runs also execute
 unchanged upstream registration, one-shot, disconnect, and auto-reset tests.
-Persistent-watch and Java-server-internal tests remain excluded.
+Tests that directly inspect Java server internals remain excluded.
 
 The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit
@@ -266,7 +272,7 @@ logs, and retains resumable sessions and ephemeral nodes. See
 
 ## Roadmap
 
-1. Complete reconnect, persistent watches, and high-level client APIs.
+1. Complete reconnect and high-level client APIs.
 2. Add IPv6 and SASL authentication.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.

@@ -326,10 +326,11 @@ pub const TcpServer = struct {
         var notification_tasks: std.Io.Group = .init;
         try notification_tasks.concurrent(self.io, notificationWriterMain, .{&connection});
         defer notification_tasks.cancel(self.io);
-        const connection_id = try self.watch_manager.addSessionConnection(
+        const connection_id = try self.watch_manager.addSessionConnectionWithCapacity(
             session.id,
             session.generation,
             connection.sink(),
+            self.notification_queue_capacity,
         );
         defer self.watch_manager.removeConnection(connection_id);
         var context = ConnectionContext{
@@ -342,6 +343,9 @@ pub const TcpServer = struct {
             self.allocator.free(remote_ip);
             return err;
         };
+        const initial_identities = try acl.encodeIdentities(self.allocator, context.identities.items);
+        defer self.allocator.free(initial_identities);
+        try self.watch_manager.setIdentities(connection_id, initial_identities);
 
         while (true) {
             const payload = try transport.readFrameAlloc(
@@ -643,6 +647,19 @@ pub const TcpServer = struct {
                 opcode,
                 body,
             ),
+            .add_watch => try self.addWatch(transport, context.connection_id, xid, body),
+            .check_watches => try self.checkWatches(
+                transport,
+                context.connection_id,
+                xid,
+                body,
+            ),
+            .remove_watches => try self.removeWatches(
+                transport,
+                context.connection_id,
+                xid,
+                body,
+            ),
             .sync => try self.sync(transport, session, xid, body),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
@@ -686,6 +703,9 @@ pub const TcpServer = struct {
             self.allocator.free(identity);
             return err;
         };
+        const identities = try acl.encodeIdentities(self.allocator, context.identities.items);
+        defer self.allocator.free(identities);
+        try self.watch_manager.setIdentities(context.connection_id, identities);
         return sendReply(transport, self.allocator, self.io, .{
             .xid = wire.Xid.auth,
             .zxid = -1,
@@ -1328,6 +1348,153 @@ pub const TcpServer = struct {
         }
     }
 
+    fn addWatch(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        connection_id: watch.ConnectionId,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.AddWatchRequest, bytes, self.allocator);
+        const path = request.path orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        if (!data_tree.isValidPath(path)) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        const kind: watch.Kind = switch (request.mode) {
+            0 => .persistent,
+            1 => .persistent_recursive,
+            else => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .marshalling_error,
+            ),
+        };
+        const registration = (try self.beginWatchRegistration(
+            transport,
+            connection_id,
+            true,
+        )).?;
+        try self.watch_manager.register(connection_id, registration.batch_id, kind, path);
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = appliedZxid(self.quorum),
+            .err = 0,
+        }, protocol.proto.ErrorResponse{ .err = 0 });
+    }
+
+    fn checkWatches(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        connection_id: watch.ConnectionId,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.CheckWatchesRequest, bytes, self.allocator);
+        const path = request.path orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        if (!data_tree.isValidPath(path)) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        const watcher_type = watch.WatcherType.fromInt(request.type) orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .marshalling_error,
+        );
+        if (!self.watch_manager.contains(connection_id, path, watcher_type)) {
+            return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                appliedZxid(self.quorum),
+                .no_watcher,
+            );
+        }
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = appliedZxid(self.quorum),
+            .err = 0,
+        }, {});
+    }
+
+    fn removeWatches(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        connection_id: watch.ConnectionId,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.RemoveWatchesRequest, bytes, self.allocator);
+        const path = request.path orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        if (!data_tree.isValidPath(path)) return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .bad_arguments,
+        );
+        const watcher_type = watch.WatcherType.fromInt(request.type) orelse return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .marshalling_error,
+        );
+        if (!self.watch_manager.remove(connection_id, path, watcher_type)) {
+            return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                appliedZxid(self.quorum),
+                .no_watcher,
+            );
+        }
+        try sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = appliedZxid(self.quorum),
+            .err = 0,
+        }, {});
+    }
+
     fn setWatches(
         self: *TcpServer,
         transport: *ResponseSink,
@@ -1349,24 +1516,13 @@ pub const TcpServer = struct {
                 request.dataWatches,
                 request.existWatches,
                 request.childWatches,
+                null,
+                null,
             );
         }
 
         const request = try decodeBody(protocol.proto.SetWatches2, bytes, self.allocator);
         defer jute.deinitDecoded(request, self.allocator);
-        if ((request.persistentWatches != null and request.persistentWatches.?.len != 0) or
-            (request.persistentRecursiveWatches != null and
-                request.persistentRecursiveWatches.?.len != 0))
-        {
-            return sendError(
-                transport,
-                self.allocator,
-                self.io,
-                xid,
-                -1,
-                .unimplemented,
-            );
-        }
         return self.restoreWatches(
             transport,
             session,
@@ -1376,6 +1532,8 @@ pub const TcpServer = struct {
             request.dataWatches,
             request.existWatches,
             request.childWatches,
+            request.persistentWatches,
+            request.persistentRecursiveWatches,
         );
     }
 
@@ -1389,10 +1547,14 @@ pub const TcpServer = struct {
         data_watches: ?[]const ?[]const u8,
         exist_watches: ?[]const ?[]const u8,
         child_watches: ?[]const ?[]const u8,
+        persistent_watches: ?[]const ?[]const u8,
+        persistent_recursive_watches: ?[]const ?[]const u8,
     ) !void {
         if (!validWatchPathList(data_watches) or
             !validWatchPathList(exist_watches) or
-            !validWatchPathList(child_watches))
+            !validWatchPathList(child_watches) or
+            !validWatchPathList(persistent_watches) or
+            !validWatchPathList(persistent_recursive_watches))
         {
             return sendError(
                 transport,
@@ -1417,6 +1579,8 @@ pub const TcpServer = struct {
             data_watches,
             exist_watches,
             child_watches,
+            persistent_watches,
+            persistent_recursive_watches,
             registration,
         ) catch |err| switch (err) {
             error.SessionExpired, error.SessionMoved => return sendMappedSessionError(

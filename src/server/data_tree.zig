@@ -21,6 +21,26 @@ pub const ErrorCode = enum(i32) {
     invalid_acl = -114,
     auth_failed = -115,
     session_moved = -118,
+    no_watcher = -121,
+};
+
+pub const MutationEventType = enum {
+    node_created,
+    node_deleted,
+    node_data_changed,
+    node_children_changed,
+};
+
+pub const MutationEvent = struct {
+    type: MutationEventType,
+    path: []u8,
+    acl: ?[]u8,
+
+    pub fn deinit(self: *MutationEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.acl) |value| allocator.free(value);
+        self.* = undefined;
+    }
 };
 
 pub const MutationResult = struct {
@@ -31,10 +51,18 @@ pub const MutationResult = struct {
     owned_created_path: ?[]u8 = null,
     response_body: ?[]const u8 = null,
     owned_response_body: ?[]u8 = null,
+    command_response: ?[]const u8 = null,
+    owned_command_response: ?[]u8 = null,
+    events: ?[]MutationEvent = null,
 
     pub fn deinit(self: *MutationResult, allocator: std.mem.Allocator) void {
         if (self.owned_created_path) |path| allocator.free(path);
         if (self.owned_response_body) |body| allocator.free(body);
+        if (self.owned_command_response) |response| allocator.free(response);
+        if (self.events) |events| {
+            for (events) |*event| event.deinit(allocator);
+            allocator.free(events);
+        }
         self.* = undefined;
     }
 };
@@ -355,7 +383,23 @@ pub const DataTree = struct {
 };
 
 pub fn isValidPath(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/") or parentPath(path) != null;
+    if (!std.mem.eql(u8, path, "/") and parentPath(path) == null) return false;
+    var segments = std.mem.splitScalar(u8, path[1..], '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+    }
+    var view = std.unicode.Utf8View.init(path) catch return false;
+    var iterator = view.iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint <= 0x1f or
+            (codepoint >= 0x7f and codepoint <= 0x9f) or
+            (codepoint >= 0xd800 and codepoint <= 0xf8ff) or
+            codepoint >= 0xfff0)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 pub fn parentPath(path: []const u8) ?[]const u8 {
@@ -431,4 +475,18 @@ test "data tree applies CRUD with ZooKeeper versions and child metadata" {
     defer freeChildren(testing.allocator, listed.names);
     try testing.expectEqual(@as(usize, 1), listed.names.len);
     try testing.expectEqualStrings("app", listed.names[0]);
+}
+
+test "ZooKeeper path validation rejects relative and prohibited characters" {
+    const testing = std.testing;
+    try testing.expect(isValidPath("/"));
+    try testing.expect(isValidPath("/valid/path"));
+    try testing.expect(!isValidPath("/a/."));
+    try testing.expect(!isValidPath("/a/../b"));
+    try testing.expect(!isValidPath("/a\x00b"));
+    try testing.expect(!isValidPath("/a\x1fb"));
+    try testing.expect(!isValidPath("/a\x7fb"));
+    try testing.expect(!isValidPath("/a\xef\xbf\xbd"));
+    try testing.expect(!isValidPath("/a\xf0\x9f\x98\x80"));
+    try testing.expect(!isValidPath("/a\xff"));
 }

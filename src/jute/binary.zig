@@ -32,6 +32,16 @@ pub const Writer = struct {
         return .{ .allocator = allocator };
     }
 
+    pub fn initOwnedBuffer(allocator: std.mem.Allocator, buffer: []u8) Writer {
+        return .{
+            .allocator = allocator,
+            .buffer = .{
+                .items = buffer[0..0],
+                .capacity = buffer.len,
+            },
+        };
+    }
+
     pub fn deinit(self: *Writer) void {
         self.buffer.deinit(self.allocator);
         self.* = undefined;

@@ -137,7 +137,7 @@ join_by_plus() {
     local IFS=+
     echo "$*"
 }
-default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest,MultiInteropTest,WatchInteropTest,QuorumFailoverInteropTest"
+default_test_selector="AsyncOpsTest#$(join_by_plus "${async_methods[@]}"),ClientTest#$(join_by_plus "${client_methods[@]}"),ExtendedTypesInteropTest,MultiInteropTest,WatchInteropTest,PersistentWatchInteropTest,PersistentWatcherTest,PersistentRecursiveWatcherTest,PersistentWatcherACLTest,QuorumFailoverInteropTest"
 test_selector=${ZOOKEEPER_TEST_SELECTOR:-$default_test_selector}
 
 maven_settings_args=()
