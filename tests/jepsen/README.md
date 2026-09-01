@@ -94,9 +94,20 @@ this image.
 Jepsen histories and checker output are written under `tests/jepsen/store/`.
 Server data and logs are deleted after successful runs. Failed runs preserve
 server state under `tests/jepsen/target/` and print the tail of each node log.
+Generate a standalone local HTML index with:
+
+```sh
+cd tests/jepsen
+lein run -m zookeeper-zig.report store report
+```
+
+The report is written to `tests/jepsen/report/index.html` and links to each
+run's timeline, checker result, history, log, and performance graphs.
 
 GitHub Actions runs one 30-second register smoke test for matching pushes and
 pull requests. The nightly schedule runs the full suite with 120 seconds per
 configuration. Manual runs can select smoke or full coverage and configure the
 workload duration and test count. Every run uploads Jepsen reports and preserved
-failure logs.
+failure logs. Non-PR runs also deploy the latest HTML report to GitHub Pages and
+show an `Open HTML report` link in the deployment job summary. Set the
+repository's Pages source to **GitHub Actions** once before the first deployment.

@@ -51,6 +51,8 @@ jobs:
   jepsen:
     name: Jepsen ${{ github.event_name == 'schedule' && 'full suite' || inputs.suite || 'smoke' }}
     runs-on: ubuntu-24.04
+    outputs:
+      pages_artifact_id: ${{ steps.upload-pages.outputs.artifact_id }}
     container:
       image: fedora:44
       options: --security-opt seccomp=unconfined
@@ -108,6 +110,13 @@ jobs:
             zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
           fi
 
+      - name: Build Jepsen HTML report
+        id: report
+        if: always()
+        run: |
+          cd tests/jepsen
+          lein run -m zookeeper-zig.report store report
+
       - name: Upload Jepsen results
         if: always()
         uses: actions/upload-artifact@v4
@@ -116,5 +125,37 @@ jobs:
           path: |
             tests/jepsen/store
             tests/jepsen/target
+            tests/jepsen/report
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload Jepsen Pages artifact
+        id: upload-pages
+        if: always() && steps.report.outcome == 'success' && github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: tests/jepsen/report
+
+  deploy-report:
+    name: Publish Jepsen report
+    needs: jepsen
+    if: always() && needs.jepsen.outputs.pages_artifact_id != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Jepsen report
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Add report link
+        env:
+          REPORT_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          printf '## Jepsen report\n\n[Open HTML report](%s)\n' "$REPORT_URL" \
+            >> "$GITHUB_STEP_SUMMARY"
