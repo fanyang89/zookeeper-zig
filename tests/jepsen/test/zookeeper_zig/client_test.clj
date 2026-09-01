@@ -8,3 +8,7 @@
     (is (= "/jepsen-register-42" (client/register-path-for-key 42)))
     (is (not= (client/register-path-for-key 1)
               (client/register-path-for-key 2)))))
+
+(deftest sequential-ids-use-zookeeper-suffix
+  (is (= 0 (client/sequential-id "/jepsen-sequence-0000000000")))
+  (is (= 42 (client/sequential-id "/jepsen-sequence-0000000042"))))

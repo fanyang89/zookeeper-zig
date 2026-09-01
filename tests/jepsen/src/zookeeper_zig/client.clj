@@ -13,6 +13,9 @@
 (def independent-register-prefix "/jepsen-register-")
 (def set-path "/jepsen-set")
 (def presence-path "/jepsen-presence")
+(def unique-id-prefix "/jepsen-sequence-")
+(def counter-path "/jepsen-counter")
+(def counter-entry-prefix "entry-")
 (def session-timeout-ms 10000)
 (def connect-timeout-ms 30000)
 
@@ -98,6 +101,10 @@
 (defn register-path-for-key
   [key]
   (str independent-register-prefix key))
+
+(defn sequential-id
+  [path]
+  (Long/parseLong (subs path (- (count path) 10))))
 
 (defn- invoke-register!
   [^ZooKeeper zk path op]
@@ -265,6 +272,77 @@
     :else
     :fail))
 
+(defrecord UniqueIdsClient [cluster zk]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(let [path (.create zk unique-id-prefix (byte-array 0)
+                          ZooDefs$Ids/OPEN_ACL_UNSAFE
+                          CreateMode/PERSISTENT_SEQUENTIAL)]
+        (assoc op :type :ok :value (sequential-id path)))))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
+(defn- ensure-counter-root!
+  [^ZooKeeper zk]
+  (try
+    (.create zk counter-path (byte-array 0) ZooDefs$Ids/OPEN_ACL_UNSAFE
+             CreateMode/PERSISTENT)
+    (catch org.apache.zookeeper.KeeperException$NodeExistsException _
+      counter-path)))
+
+(defn- add-to-counter!
+  [^ZooKeeper zk value]
+  (ensure-counter-root! zk)
+  (.create zk (str counter-path "/" counter-entry-prefix) (encode-value value)
+           ZooDefs$Ids/OPEN_ACL_UNSAFE CreateMode/PERSISTENT_SEQUENTIAL)
+  :ok)
+
+(defn- read-counter
+  [^ZooKeeper zk]
+  (try
+    (reduce + 0
+            (map #(read-value zk (str counter-path "/" %))
+                 (.getChildren zk counter-path false)))
+    (catch org.apache.zookeeper.KeeperException$NoNodeException _
+      0)))
+
+(defrecord CounterClient [cluster zk]
+  client/Client
+  (open! [this _ _]
+    (assoc this :zk (open-zookeeper! (cluster/connect-string cluster))))
+
+  (setup! [this _]
+    (ensure-counter-root! zk)
+    this)
+
+  (invoke! [_ _ op]
+    (invoke-client!
+     op
+     #(case (:f op)
+        :read (assoc op :type :ok :value (read-counter zk))
+        :final-read (assoc op :type :ok :value (read-counter zk))
+        :add (assoc op :type (add-to-counter! zk (:value op))))))
+
+  (teardown! [this _]
+    this)
+
+  (close! [_ _]
+    (when zk
+      (.close ^ZooKeeper zk))))
+
 (defrecord PresenceClient [cluster zk]
   client/Client
   (open! [this _ _]
@@ -306,3 +384,11 @@
 (defn presence-client
   [cluster]
   (->PresenceClient cluster nil))
+
+(defn unique-ids-client
+  [cluster]
+  (->UniqueIdsClient cluster nil))
+
+(defn counter-client
+  [cluster]
+  (->CounterClient cluster nil))

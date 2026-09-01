@@ -18,13 +18,21 @@ The full suite adds:
   separately with `jepsen.independent`;
 - `set`: concurrent unique child creation and `getChildren` reads, checked by
   Jepsen's linearizable full-set checker;
-- `pause-one`: repeated `SIGSTOP`/`SIGCONT` of one server process while the
-  register workload runs.
+- `unique-ids`: persistent sequential creates checked for duplicate IDs;
+- `counter`: atomic sequential increments checked against concurrent reads;
+- `pause-one`: repeated `SIGSTOP`/`SIGCONT` of one server process;
+- `kill-all` and `pause-all`: full-cluster crash and suspension followed by
+  recovery.
 
-The full suite runs the four workloads with `kill-one`, plus the register with
-`pause-one`. Network partitions, transactions, and watches are excluded because
-the local loopback harness cannot isolate per-node traffic and the server does
-not yet dispatch `multi` or watch operations.
+The register and partition test from
+[`jepsen-io/zookeeper`](https://github.com/jepsen-io/zookeeper) is covered by
+the register workload and local process nemeses. The `unique-ids`, `counter`,
+and all-node fault scenarios are clean-room adaptations of the
+[ClickHouse Keeper Jepsen suite](https://github.com/ClickHouse/ClickHouse/tree/master/tests/jepsen.clickhouse/src/jepsen/clickhouse/keeper).
+Its `total-queue` and `linear-queue` workloads require ZooKeeper
+`multi`, which the server does not yet dispatch. Network partition nemeses need
+per-node network namespaces rather than the current shared loopback harness.
+Storage corruption and watch scenarios remain excluded.
 
 ## Run
 
@@ -49,9 +57,10 @@ JEPSEN_NEMESIS=pause-one \
 mise run test-jepsen-smoke
 ```
 
-Supported workloads are `register`, `presence`, `independent-register`, and
-`set`. Supported nemeses are `kill-one` and `pause-one`. The independent
-register requires concurrency to be divisible by three.
+Supported workloads are `register`, `presence`, `independent-register`, `set`,
+`unique-ids`, and `counter`. Supported nemeses are `kill-one`, `pause-one`,
+`kill-all`, and `pause-all`. The independent register requires concurrency to
+be divisible by three.
 
 The default runner uses local Leiningen when available, then Docker or Podman.
 The container runner uses host networking and builds the local

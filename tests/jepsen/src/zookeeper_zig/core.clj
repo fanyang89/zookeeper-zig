@@ -6,6 +6,7 @@
             [jepsen.checker.timeline :as timeline]
             [jepsen.cli :as cli]
             [jepsen.generator :as gen]
+            [jepsen.history :as history]
             [jepsen.independent :as independent]
             [jepsen.tests :as tests]
             [knossos.model :as model]
@@ -15,14 +16,19 @@
             [zookeeper-zig.nemesis :as zk-nemesis])
   (:import (java.io File)))
 
-(def workload-names ["register" "independent-register" "set" "presence"])
-(def nemesis-names ["kill-one" "pause-one"])
+(def workload-names
+  ["register" "independent-register" "set" "presence" "unique-ids" "counter"])
+(def nemesis-names ["kill-one" "pause-one" "kill-all" "pause-all"])
 (def full-suite-configurations
   [{:workload "register" :nemesis "kill-one"}
    {:workload "presence" :nemesis "kill-one"}
    {:workload "independent-register" :nemesis "kill-one"}
    {:workload "set" :nemesis "kill-one"}
-   {:workload "register" :nemesis "pause-one"}])
+   {:workload "unique-ids" :nemesis "kill-one"}
+   {:workload "counter" :nemesis "kill-one"}
+   {:workload "register" :nemesis "pause-one"}
+   {:workload "register" :nemesis "kill-all"}
+   {:workload "register" :nemesis "pause-all"}])
 (def independent-threads-per-key 3)
 
 (defn read-op
@@ -53,6 +59,18 @@
   [_ _]
   {:type :invoke :f :read :value (independent/tuple 0 nil)})
 
+(defn unique-id-op
+  [_ _]
+  {:type :invoke :f :generate})
+
+(defn counter-add-op
+  [_ _]
+  {:type :invoke :f :add :value (long (rand-int 5))})
+
+(defn counter-read-op
+  [_ _]
+  {:type :invoke :f :read})
+
 (defn- nemesis-cycle
   []
   (cycle [(gen/sleep 5)
@@ -62,15 +80,16 @@
 
 (defn- fault-workload
   [client-generator final-generator time-limit]
-  (gen/phases
-   (->> client-generator
-        (gen/stagger 0.02)
-        (gen/nemesis (nemesis-cycle))
-        (gen/time-limit time-limit))
-   (gen/nemesis (gen/once {:type :info :f :stop}))
-   (gen/log "Waiting for the cluster to stabilize")
-   (gen/sleep 3)
-   (gen/clients final-generator)))
+  (let [main-generator (->> client-generator
+                            (gen/stagger 0.02)
+                            (gen/nemesis (nemesis-cycle))
+                            (gen/time-limit time-limit))
+        recovery-generators [(gen/nemesis (gen/once {:type :info :f :stop}))
+                             (gen/log "Waiting for the cluster to stabilize")
+                             (gen/sleep 3)]]
+    (apply gen/phases
+           (cond-> (into [main-generator] recovery-generators)
+             final-generator (conj (gen/clients final-generator))))))
 
 (defn- register-workload
   [time-limit]
@@ -111,13 +130,35 @@
    :checker (checker/linearizable {:model (model/cas-register)})
    :client-fn zk-client/presence-client})
 
+(defn- unique-ids-workload
+  [time-limit]
+  {:client-generator unique-id-op
+   :checker (checker/unique-ids)
+   :client-fn zk-client/unique-ids-client})
+
+(defn- counter-checker
+  []
+  (let [delegate (checker/counter)]
+    (reify checker/Checker
+      (check [_ test test-history opts]
+        (checker/check delegate test (history/client-ops test-history) opts)))))
+
+(defn- counter-workload
+  [time-limit]
+  {:client-generator (gen/mix [counter-read-op counter-add-op counter-add-op])
+   :final-generator (gen/once {:type :invoke :f :final-read :value nil})
+   :checker (counter-checker)
+   :client-fn zk-client/counter-client})
+
 (defn- workload
   [name time-limit]
   (let [spec (case name
                "register" (register-workload time-limit)
                "independent-register" (independent-register-workload time-limit)
                "set" (set-workload time-limit)
-               "presence" (presence-workload time-limit))]
+               "presence" (presence-workload time-limit)
+               "unique-ids" (unique-ids-workload time-limit)
+               "counter" (counter-workload time-limit))]
     (assoc spec
            :generator (fault-workload (:client-generator spec)
                                       (:final-generator spec)
@@ -127,7 +168,9 @@
   [name cluster]
   (case name
     "kill-one" (zk-nemesis/kill-one cluster)
-    "pause-one" (zk-nemesis/pause-one cluster)))
+    "pause-one" (zk-nemesis/pause-one cluster)
+    "kill-all" (zk-nemesis/kill-all cluster)
+    "pause-all" (zk-nemesis/pause-all cluster)))
 
 (defn- test-name
   [workload-name nemesis-name]

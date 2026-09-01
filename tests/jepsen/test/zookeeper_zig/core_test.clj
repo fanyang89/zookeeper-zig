@@ -11,7 +11,7 @@
            (#'core/test-name "presence" "pause-one")))))
 
 (deftest full-suite-has-bounded-distinct-configurations
-  (is (= 5 (count core/full-suite-configurations)))
+  (is (= 9 (count core/full-suite-configurations)))
   (is (= (count core/full-suite-configurations)
          (count (distinct core/full-suite-configurations))))
   (let [configurations (set core/full-suite-configurations)]
@@ -20,10 +20,18 @@
     (is (contains? configurations
                    {:workload "set" :nemesis "kill-one"}))
     (is (contains? configurations
-                   {:workload "register" :nemesis "pause-one"}))))
+                   {:workload "unique-ids" :nemesis "kill-one"}))
+    (is (contains? configurations
+                   {:workload "counter" :nemesis "kill-one"}))
+    (is (contains? configurations
+                   {:workload "register" :nemesis "pause-one"}))
+    (is (contains? configurations
+                   {:workload "register" :nemesis "kill-all"}))
+    (is (contains? configurations
+                   {:workload "register" :nemesis "pause-all"}))))
 
 (deftest all-tests-expands-test-count
   (with-redefs [core/zookeeper-test identity]
     (let [tests (doall (core/all-tests {:test-count 2}))]
-      (is (= 10 (count tests)))
+      (is (= 18 (count tests)))
       (is (every? #(= 1 (:test-count %)) tests)))))

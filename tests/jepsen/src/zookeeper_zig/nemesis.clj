@@ -80,6 +80,82 @@
   (fs [_]
     #{:start :stop}))
 
+(defrecord KillAllNemesis [cluster disrupted]
+  nemesis/Nemesis
+  (setup! [this _]
+    this)
+
+  (invoke! [_ _ op]
+    (locking disrupted
+      (case (:f op)
+        :start
+        (if @disrupted
+          (assoc op :type :info :value :already-killed)
+          (let [nodes (cluster/running-nodes cluster)]
+            (doseq [node nodes]
+              (cluster/kill-node! cluster node))
+            (reset! disrupted nodes)
+            (assoc op :type :info :value {:killed nodes})))
+
+        :stop
+        (if-let [nodes @disrupted]
+          (do
+            (doseq [node nodes]
+              (cluster/start-node! cluster node))
+            (reset! disrupted nil)
+            (assoc op :type :info :value {:restarted nodes}))
+          (assoc op :type :info :value :nothing-to-restart)))))
+
+  (teardown! [this _]
+    (locking disrupted
+      (when-let [nodes @disrupted]
+        (doseq [node nodes]
+          (cluster/start-node! cluster node))
+        (reset! disrupted nil)))
+    this)
+
+  nemesis/Reflection
+  (fs [_]
+    #{:start :stop}))
+
+(defrecord PauseAllNemesis [cluster disrupted]
+  nemesis/Nemesis
+  (setup! [this _]
+    this)
+
+  (invoke! [_ _ op]
+    (locking disrupted
+      (case (:f op)
+        :start
+        (if @disrupted
+          (assoc op :type :info :value :already-paused)
+          (let [nodes (cluster/running-nodes cluster)]
+            (doseq [node nodes]
+              (cluster/pause-node! cluster node))
+            (reset! disrupted nodes)
+            (assoc op :type :info :value {:paused nodes})))
+
+        :stop
+        (if-let [nodes @disrupted]
+          (do
+            (doseq [node nodes]
+              (cluster/resume-node! cluster node))
+            (reset! disrupted nil)
+            (assoc op :type :info :value {:resumed nodes}))
+          (assoc op :type :info :value :nothing-to-resume)))))
+
+  (teardown! [this _]
+    (locking disrupted
+      (when-let [nodes @disrupted]
+        (doseq [node nodes]
+          (cluster/resume-node! cluster node))
+        (reset! disrupted nil)))
+    this)
+
+  nemesis/Reflection
+  (fs [_]
+    #{:start :stop}))
+
 (defn kill-one
   [cluster]
   (->KillOneNemesis cluster (atom nil)))
@@ -87,3 +163,11 @@
 (defn pause-one
   [cluster]
   (->PauseOneNemesis cluster (atom nil)))
+
+(defn kill-all
+  [cluster]
+  (->KillAllNemesis cluster (atom nil)))
+
+(defn pause-all
+  [cluster]
+  (->PauseAllNemesis cluster (atom nil)))
