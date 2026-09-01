@@ -30,7 +30,7 @@ the register workload and local process nemeses. The `unique-ids`, `counter`,
 and all-node fault scenarios are clean-room adaptations of the
 [ClickHouse Keeper Jepsen suite](https://github.com/ClickHouse/ClickHouse/tree/master/tests/jepsen.clickhouse/src/jepsen/clickhouse/keeper).
 Its `total-queue` and `linear-queue` workloads remain to be ported now that the
-server supports ZooKeeper write multi operations. Network partition nemeses need
+server supports ZooKeeper write multi and multiRead operations. Network partition nemeses need
 per-node network namespaces rather than the current shared loopback harness.
 Storage corruption and watch scenarios remain excluded.
 

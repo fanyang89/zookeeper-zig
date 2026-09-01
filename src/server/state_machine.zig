@@ -5,6 +5,7 @@ const protocol = @import("../protocol.zig");
 const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
+const multi = @import("multi.zig");
 const rocks_store = @import("rocks_store.zig");
 
 pub const max_snapshot_bytes = rocks_store.max_snapshot_bytes;
@@ -181,6 +182,123 @@ pub const ZooKeeperStateMachine = struct {
         const stat = (try self.store.exists(path)) orelse return null;
         const names = (try self.store.getChildren(allocator, path)).?;
         return .{ .names = names, .stat = stat };
+    }
+
+    pub fn multiReadAuthorizedForSession(
+        self: *ZooKeeperStateMachine,
+        allocator: std.mem.Allocator,
+        session_id: i64,
+        generation: u64,
+        identities: ?[]const u8,
+        request_body: []const u8,
+        response_body_limit: usize,
+    ) ![]u8 {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        try self.validateSessionLocked(session_id, generation);
+
+        var response = jute.Writer.init(allocator);
+        defer response.deinit();
+        try multi.ensureReadResponseRoom(0, 0, response_body_limit);
+        var iterator = multi.ReadRequestIterator.init(request_body);
+        while (try iterator.next()) |operation| {
+            const path = operation.path() orelse {
+                try multi.ensureReadResponseRoom(
+                    response.dataSize(),
+                    multi.error_result_size,
+                    response_body_limit,
+                );
+                try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.bad_arguments));
+                continue;
+            };
+            const authorization = try self.store.authorize(path, acl.read, identities);
+            if (authorization != .ok) {
+                try multi.ensureReadResponseRoom(
+                    response.dataSize(),
+                    multi.error_result_size,
+                    response_body_limit,
+                );
+                try multi.writeErrorResult(&response, @intFromEnum(authorization));
+                continue;
+            }
+            switch (operation) {
+                .get_data => {
+                    const result = (try self.store.getData(allocator, path)) orelse {
+                        try multi.ensureReadResponseRoom(
+                            response.dataSize(),
+                            multi.error_result_size,
+                            response_body_limit,
+                        );
+                        try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.no_node));
+                        continue;
+                    };
+                    defer if (result.data) |data| allocator.free(data);
+                    const operation_size = std.math.add(
+                        usize,
+                        multi.get_data_result_base_size,
+                        if (result.data) |data| data.len else 0,
+                    ) catch return error.MultiReadResponseTooLarge;
+                    try multi.ensureReadResponseRoom(
+                        response.dataSize(),
+                        operation_size,
+                        response_body_limit,
+                    );
+                    try multi.writeHeader(
+                        &response,
+                        @intFromEnum(multi.ReadKind.get_data),
+                        false,
+                        0,
+                    );
+                    try jute.serialize(&response, protocol.proto.GetDataResponse{
+                        .data = result.data,
+                        .stat = result.stat,
+                    });
+                },
+                .get_children => {
+                    const maybe_names = try self.store.getChildren(allocator, path);
+                    if (maybe_names == null) {
+                        try multi.ensureReadResponseRoom(
+                            response.dataSize(),
+                            multi.error_result_size,
+                            response_body_limit,
+                        );
+                        try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.no_node));
+                        continue;
+                    }
+                    const names = maybe_names.?;
+                    defer {
+                        for (names) |name| allocator.free(name);
+                        allocator.free(names);
+                    }
+                    var operation_size = multi.get_children_result_base_size;
+                    for (names) |name| {
+                        operation_size = std.math.add(usize, operation_size, 4) catch
+                            return error.MultiReadResponseTooLarge;
+                        operation_size = std.math.add(usize, operation_size, name.len) catch
+                            return error.MultiReadResponseTooLarge;
+                    }
+                    try multi.ensureReadResponseRoom(
+                        response.dataSize(),
+                        operation_size,
+                        response_body_limit,
+                    );
+                    const children = try allocator.alloc(?[]const u8, names.len);
+                    defer allocator.free(children);
+                    for (names, 0..) |name, index| children[index] = name;
+                    try multi.writeHeader(
+                        &response,
+                        @intFromEnum(multi.ReadKind.get_children),
+                        false,
+                        0,
+                    );
+                    try jute.serialize(&response, protocol.proto.GetChildrenResponse{
+                        .children = children,
+                    });
+                },
+            }
+        }
+        try multi.writeTerminator(&response);
+        return response.toOwnedSlice();
     }
 
     pub fn getAclForSession(

@@ -17,6 +17,8 @@ import org.apache.zookeeper.Op;
 import org.apache.zookeeper.OpResult;
 import org.apache.zookeeper.TestableZooKeeper;
 import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.data.ACL;
+import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.test.ClientBase;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -83,6 +85,65 @@ public class MultiInteropTest extends ClientBase {
             ((OpResult.ErrorResult) results.get(2)).getErr());
         assertNull(zk.exists("/rolled-back", false));
         assertNotNull(zk.exists("/kept", false));
+    }
+
+    @Test
+    public void testReadMultiReturnsIndependentResults() throws Exception {
+        zk.create("/read", bytes("parent"), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        zk.create("/read/child", bytes("child"), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+
+        List<OpResult> results = zk.multi(Arrays.asList(
+            Op.getData("/read"),
+            Op.getChildren("/read"),
+            Op.getData("/missing"),
+            Op.getData("/read/child")));
+
+        assertEquals(4, results.size());
+        assertTrue(results.get(0) instanceof OpResult.GetDataResult);
+        assertArrayEquals(bytes("parent"), ((OpResult.GetDataResult) results.get(0)).getData());
+        assertTrue(results.get(1) instanceof OpResult.GetChildrenResult);
+        assertEquals(
+            Arrays.asList("child"),
+            ((OpResult.GetChildrenResult) results.get(1)).getChildren());
+        assertTrue(results.get(2) instanceof OpResult.ErrorResult);
+        assertEquals(
+            KeeperException.Code.NONODE.intValue(),
+            ((OpResult.ErrorResult) results.get(2)).getErr());
+        assertTrue(results.get(3) instanceof OpResult.GetDataResult);
+        assertArrayEquals(bytes("child"), ((OpResult.GetDataResult) results.get(3)).getData());
+    }
+
+    @Test
+    public void testReadMultiContinuesAfterNoAuth() throws Exception {
+        List<ACL> writeOnly = Arrays.asList(
+            new ACL(ZooDefs.Perms.WRITE, new Id("world", "anyone")));
+        zk.create("/write-only", bytes("secret"), writeOnly, CreateMode.PERSISTENT);
+        zk.create("/public", bytes("visible"), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+
+        List<OpResult> results = zk.multi(Arrays.asList(
+            Op.getData("/write-only"),
+            Op.getData("/public")));
+
+        assertTrue(results.get(0) instanceof OpResult.ErrorResult);
+        assertEquals(
+            KeeperException.Code.NOAUTH.intValue(),
+            ((OpResult.ErrorResult) results.get(0)).getErr());
+        assertTrue(results.get(1) instanceof OpResult.GetDataResult);
+        assertArrayEquals(bytes("visible"), ((OpResult.GetDataResult) results.get(1)).getData());
+    }
+
+    @Test
+    public void testReadMultiRejectsOversizedAggregateResponse() throws Exception {
+        byte[] data = new byte[400 * 1024];
+        zk.create("/large", data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+
+        KeeperException failure = assertThrows(KeeperException.class, () -> zk.multi(Arrays.asList(
+            Op.getData("/large"),
+            Op.getData("/large"),
+            Op.getData("/large"))));
+
+        assertEquals(KeeperException.Code.MARSHALLINGERROR, failure.code());
+        assertNotNull(zk.exists("/large", false));
     }
 
     @Test

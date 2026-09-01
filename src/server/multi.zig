@@ -12,6 +12,22 @@ pub const Kind = enum(i32) {
     create_ttl = 21,
 };
 
+pub const ReadKind = enum(i32) {
+    get_data = 4,
+    get_children = 8,
+};
+
+pub const ReadOperation = union(ReadKind) {
+    get_data: protocol.proto.GetDataRequest,
+    get_children: protocol.proto.GetChildrenRequest,
+
+    pub fn path(self: ReadOperation) ?[]const u8 {
+        return switch (self) {
+            inline else => |request| request.path,
+        };
+    }
+};
+
 pub const Operation = union(Kind) {
     create: protocol.proto.CreateRequest,
     delete: protocol.proto.DeleteRequest,
@@ -94,6 +110,71 @@ pub const RequestIterator = struct {
         };
     }
 };
+
+pub const ReadRequestIterator = struct {
+    reader: jute.Reader,
+    finished: bool = false,
+
+    pub fn init(bytes: []const u8) ReadRequestIterator {
+        return .{ .reader = jute.Reader.init(bytes) };
+    }
+
+    pub fn next(self: *ReadRequestIterator) !?ReadOperation {
+        if (self.finished) return null;
+        const header_type = try self.reader.readInt();
+        const done = try self.reader.readBool();
+        const header_error = try self.reader.readInt();
+        if (done) {
+            if (header_type != -1 or header_error != -1 or self.reader.remaining() != 0) {
+                return error.InvalidMultiRequest;
+            }
+            self.finished = true;
+            return null;
+        }
+        if (header_error != -1) return error.InvalidMultiRequest;
+        return switch (header_type) {
+            @intFromEnum(ReadKind.get_data) => .{ .get_data = .{
+                .path = try self.reader.readString(),
+                .watch = try self.reader.readBool(),
+            } },
+            @intFromEnum(ReadKind.get_children) => .{ .get_children = .{
+                .path = try self.reader.readString(),
+                .watch = try self.reader.readBool(),
+            } },
+            else => error.UnsupportedMultiOperation,
+        };
+    }
+};
+
+pub fn validateReadRequest(bytes: []const u8) !void {
+    var iterator = ReadRequestIterator.init(bytes);
+    while (try iterator.next()) |_| {}
+}
+
+pub const response_terminator_size: usize = 9;
+pub const error_result_size: usize = 13;
+pub const get_data_result_base_size: usize = 81;
+pub const get_children_result_base_size: usize = 13;
+
+pub fn ensureReadResponseRoom(
+    current_size: usize,
+    operation_size: usize,
+    body_limit: usize,
+) !void {
+    const with_operation = std.math.add(usize, current_size, operation_size) catch
+        return error.MultiReadResponseTooLarge;
+    const with_terminator = std.math.add(
+        usize,
+        with_operation,
+        response_terminator_size,
+    ) catch return error.MultiReadResponseTooLarge;
+    if (with_terminator > body_limit) return error.MultiReadResponseTooLarge;
+}
+
+pub fn writeErrorResult(writer: *jute.Writer, code: i32) !void {
+    try writeHeader(writer, -1, false, code);
+    try jute.serialize(writer, protocol.proto.ErrorResponse{ .err = code });
+}
 
 pub fn responseBodyCapacity(bytes: []const u8) !usize {
     var reader = jute.Reader.init(bytes);
@@ -216,4 +297,86 @@ test "multi request iterator rejects missing terminator" {
     const testing = std.testing;
     var iterator = RequestIterator.init("");
     try testing.expectError(error.EndOfStream, iterator.next(testing.allocator));
+}
+
+test "multi read iterator parses getData and getChildren" {
+    const testing = std.testing;
+    var writer = jute.Writer.init(testing.allocator);
+    defer writer.deinit();
+    try writeHeader(&writer, @intFromEnum(ReadKind.get_data), false, -1);
+    try jute.serialize(&writer, protocol.proto.GetDataRequest{
+        .path = "/data",
+        .watch = false,
+    });
+    try writeHeader(&writer, @intFromEnum(ReadKind.get_children), false, -1);
+    try jute.serialize(&writer, protocol.proto.GetChildrenRequest{
+        .path = "/parent",
+        .watch = false,
+    });
+    try writeTerminator(&writer);
+    try validateReadRequest(writer.bytes());
+
+    var iterator = ReadRequestIterator.init(writer.bytes());
+    const get_data = (try iterator.next()).?;
+    try testing.expectEqualStrings("/data", get_data.get_data.path.?);
+    const get_children = (try iterator.next()).?;
+    try testing.expectEqualStrings("/parent", get_children.get_children.path.?);
+    try testing.expect((try iterator.next()) == null);
+}
+
+test "multi read response size constants match Jute encoding" {
+    const testing = std.testing;
+    var writer = jute.Writer.init(testing.allocator);
+    defer writer.deinit();
+    try writeHeader(&writer, @intFromEnum(ReadKind.get_data), false, 0);
+    try jute.serialize(&writer, protocol.proto.GetDataResponse{
+        .data = "abc",
+        .stat = std.mem.zeroes(protocol.data.Stat),
+    });
+    try testing.expectEqual(get_data_result_base_size + 3, writer.dataSize());
+
+    writer.truncate(0);
+    try writeHeader(&writer, @intFromEnum(ReadKind.get_children), false, 0);
+    try jute.serialize(&writer, protocol.proto.GetChildrenResponse{
+        .children = &.{ "one", "two" },
+    });
+    try testing.expectEqual(
+        get_children_result_base_size + 4 + 3 + 4 + 3,
+        writer.dataSize(),
+    );
+}
+
+test "multi read response budget reserves the terminator" {
+    const testing = std.testing;
+    try ensureReadResponseRoom(0, error_result_size, error_result_size + response_terminator_size);
+    try testing.expectError(
+        error.MultiReadResponseTooLarge,
+        ensureReadResponseRoom(0, error_result_size, error_result_size + response_terminator_size - 1),
+    );
+    try testing.expectError(
+        error.MultiReadResponseTooLarge,
+        ensureReadResponseRoom(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
+    );
+}
+
+test "multi read iterator rejects write operations and trailing data" {
+    const testing = std.testing;
+    var write_request = jute.Writer.init(testing.allocator);
+    defer write_request.deinit();
+    try writeHeader(&write_request, @intFromEnum(Kind.check), false, -1);
+    try jute.serialize(&write_request, protocol.proto.CheckVersionRequest{
+        .path = "/node",
+        .version = 0,
+    });
+    try writeTerminator(&write_request);
+    try testing.expectError(
+        error.UnsupportedMultiOperation,
+        validateReadRequest(write_request.bytes()),
+    );
+
+    var trailing = jute.Writer.init(testing.allocator);
+    defer trailing.deinit();
+    try writeTerminator(&trailing);
+    try trailing.writeByte(0);
+    try testing.expectError(error.InvalidMultiRequest, validateReadRequest(trailing.bytes()));
 }

@@ -435,6 +435,7 @@ pub const TcpServer = struct {
             .set_acl => try self.setAcl(transport, session, context.identities.items, xid, body),
             .set_data => try self.setData(transport, session, context.identities.items, xid, body),
             .multi => try self.multiRequest(transport, session, context.identities.items, xid, body),
+            .multi_read => try self.multiReadRequest(transport, session, context.identities.items, xid, body),
             .exists => try self.exists(transport, session, context.identities.items, xid, body),
             .get_acl => try self.getAcl(transport, session, context.identities.items, xid, body),
             .get_data => try self.getData(transport, session, context.identities.items, xid, body),
@@ -813,7 +814,7 @@ pub const TcpServer = struct {
             return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
         const response_payload_capacity = std.math.add(
             usize,
-            12,
+            wire.reply_header_size,
             response_body_capacity,
         ) catch return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
         if (response_payload_capacity > wire.default_max_payload) {
@@ -845,6 +846,70 @@ pub const TcpServer = struct {
             .zxid = result.zxid,
             .err = 0,
         }, result.body);
+    }
+
+    fn multiReadRequest(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        multi.validateReadRequest(bytes) catch |err| switch (err) {
+            error.UnsupportedMultiOperation => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .unimplemented,
+            ),
+            else => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                -1,
+                .bad_arguments,
+            ),
+        };
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        const response_body = self.quorum.machine.multiReadAuthorizedForSession(
+            self.allocator,
+            session.id,
+            session.generation,
+            identities_blob,
+            bytes,
+            wire.default_max_payload - wire.reply_header_size,
+        ) catch |err| switch (err) {
+            error.SessionExpired, error.SessionMoved => return sendMappedSessionError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                err,
+            ),
+            error.MultiReadResponseTooLarge => return sendError(
+                transport,
+                self.allocator,
+                self.io,
+                xid,
+                zxid,
+                .marshalling_error,
+            ),
+            else => return err,
+        };
+        defer self.allocator.free(response_body);
+        try sendRawReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, response_body);
     }
 
     fn exists(
@@ -1486,6 +1551,132 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqualStrings("after", transaction_get.data.?);
+
+    var multi_read_request = jute.Writer.init(testing.allocator);
+    defer multi_read_request.deinit();
+    try multi.writeHeader(
+        &multi_read_request,
+        @intFromEnum(multi.ReadKind.get_data),
+        false,
+        -1,
+    );
+    try jute.serialize(&multi_read_request, protocol.proto.GetDataRequest{
+        .path = "/transaction",
+        .watch = false,
+    });
+    try multi.writeHeader(
+        &multi_read_request,
+        @intFromEnum(multi.ReadKind.get_children),
+        false,
+        -1,
+    );
+    try jute.serialize(&multi_read_request, protocol.proto.GetChildrenRequest{
+        .path = "/transaction",
+        .watch = false,
+    });
+    try multi.writeHeader(
+        &multi_read_request,
+        @intFromEnum(multi.ReadKind.get_data),
+        false,
+        -1,
+    );
+    try jute.serialize(&multi_read_request, protocol.proto.GetDataRequest{
+        .path = "/missing",
+        .watch = false,
+    });
+    try multi.writeHeader(
+        &multi_read_request,
+        @intFromEnum(multi.ReadKind.get_data),
+        false,
+        -1,
+    );
+    try jute.serialize(&multi_read_request, protocol.proto.GetDataRequest{
+        .path = "/app",
+        .watch = false,
+    });
+    try multi.writeTerminator(&multi_read_request);
+    const multi_read_xid = try client.sendEncodedRequest(.multi_read, multi_read_request.bytes());
+    var multi_read_reply = try expectResponse(&client, multi_read_xid);
+    defer multi_read_reply.deinit();
+    var multi_read_response = jute.Reader.init(multi_read_reply.body());
+
+    const multi_get_data_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @as(i32, @intFromEnum(multi.ReadKind.get_data)),
+        multi_get_data_header.type,
+    );
+    const multi_get_data = try jute.deserialize(
+        protocol.proto.GetDataResponse,
+        &multi_read_response,
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(multi_get_data, testing.allocator);
+    try testing.expectEqualStrings("after", multi_get_data.data.?);
+
+    const multi_get_children_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @as(i32, @intFromEnum(multi.ReadKind.get_children)),
+        multi_get_children_header.type,
+    );
+    const multi_get_children = try jute.deserialize(
+        protocol.proto.GetChildrenResponse,
+        &multi_read_response,
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(multi_get_children, testing.allocator);
+    try testing.expectEqual(@as(usize, 0), multi_get_children.children.?.len);
+
+    const multi_read_error_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, -1), multi_read_error_header.type);
+    try testing.expectEqual(
+        @as(i32, @intFromEnum(data_tree.ErrorCode.no_node)),
+        multi_read_error_header.err,
+    );
+    const multi_read_error = try jute.deserialize(
+        protocol.proto.ErrorResponse,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @as(i32, @intFromEnum(data_tree.ErrorCode.no_node)),
+        multi_read_error.err,
+    );
+
+    const multi_read_after_error_header = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expectEqual(
+        @as(i32, @intFromEnum(multi.ReadKind.get_data)),
+        multi_read_after_error_header.type,
+    );
+    const multi_read_after_error = try jute.deserialize(
+        protocol.proto.GetDataResponse,
+        &multi_read_response,
+        testing.allocator,
+    );
+    defer jute.deinitDecoded(multi_read_after_error, testing.allocator);
+    try testing.expectEqualStrings("two", multi_read_after_error.data.?);
+    const multi_read_end = try jute.deserialize(
+        protocol.proto.MultiHeader,
+        &multi_read_response,
+        testing.allocator,
+    );
+    try testing.expect(multi_read_end.done);
+    try testing.expectEqual(@as(usize, 0), multi_read_response.remaining());
 
     const ip_secure_xid = try client.sendRequest(.create, protocol.proto.CreateRequest{
         .path = "/ip-secure",

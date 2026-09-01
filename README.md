@@ -177,17 +177,19 @@ The current server supports replicated sessions, session resume and expiration,
 ephemeral, sequential, container, and TTL nodes, digest authentication, ACL
 enforcement, Connect, ping, closeSession, create/create2/createContainer/createTTL,
 delete, setData, getACL/setACL, exists, getData, getChildren/getChildren2,
-sync, and atomic write multi operations. Multi supports create, create2,
-container/TTL create, delete, setData, and version checks. Reads use Raft
-ReadIndex before accessing RocksDB. Session close and
+sync, atomic write multi operations, and multiRead. Write multi supports create,
+create2, container/TTL create, delete, setData, and version checks. MultiRead
+supports getData and getChildren with independent per-operation results. Reads
+use Raft ReadIndex before accessing RocksDB. Session close and
 expiration atomically remove all session-owned ephemeral nodes. ACLs support
 `world`, `auth`, `digest`, and IPv4 `ip` identities, including CIDR masks.
 Connection establishment and client requests pass through a bounded
 `std.Io.Queue` and a fixed worker pool before entering Raft or RocksDB. The
 worker count defaults to the number of logical CPUs and the queue capacity
 defaults to 256; override them with `--client-request-workers` and
-`--client-request-queue-capacity`. IPv6 ACL identities, SASL, watches, and
-read-only multi operations are not implemented yet.
+`--client-request-queue-capacity`. IPv6 ACL identities, SASL, and watches are
+not implemented yet. MultiRead watch flags are accepted but do not register
+watches.
 
 ## Java client interoperability
 
@@ -202,16 +204,18 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream `AsyncOpsTest` and
 `ClientTest` methods unchanged. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current selection covers 50
+server starts an isolated Zig server instead. The current selection covers 53
 synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-container, TTL, atomic write-multi, large-data, sync, lifecycle cleanup,
+container, TTL, write-multi, multiRead, large-data, sync, lifecycle cleanup,
 error-code, and three-node failover tests. The quorum case verifies official-client session continuity,
 re-authentication, ephemeral ownership, rolling node restarts, and follower
-catch-up; watch, read-only multi, and Java-server-internal tests remain excluded.
+catch-up; watch-dependent and Java-server-internal tests remain excluded.
 
 The source checkout is cached under `~/.cache/zookeeper-zig`. Set
 `ZOOKEEPER_SOURCE_DIR` to use an existing official checkout containing commit
-`293c895a8d966a3ecb92872be4a1daf87d725da2`. Maven Central requests use the
+`293c895a8d966a3ecb92872be4a1daf87d725da2`. Focused runs of the unchanged
+upstream `MultiOperationTest` cover synchronous and asynchronous multiRead.
+Maven Central requests use the
 Aliyun public mirror by default; set `ZOOKEEPER_MAVEN_MIRROR=central` to use
 Central directly or `MAVEN_SETTINGS=/path/to/settings.xml` for custom settings.
 Git, Maven, Python 3, and a JDK are required.
@@ -228,7 +232,7 @@ processes. It covers create responses, Stat fields, null data, root ACLs,
 request retry, concurrent CRUD, session restoration, and session continuity
 across a server restart. Set `ZOOKEEPER_SERVER_TEST_SELECTOR` to override the
 Surefire selector while evaluating additional upstream cases. Tests requiring
-watches, upstream multi cases, or Java server internals remain excluded.
+watches or Java server internals remain excluded.
 
 ## Jepsen
 
@@ -256,6 +260,6 @@ logs, and retains resumable sessions and ephemeral nodes. See
 ## Roadmap
 
 1. Complete reconnect, watches, and high-level client APIs.
-2. Add IPv6/SASL authentication, watches, and read-only multi operations.
+2. Add IPv6 and SASL authentication.
 3. Add dynamic quorum membership, operational metrics, and administration APIs.
 4. Expand ZooKeeper 3.9.5 compatibility and interoperability testing.

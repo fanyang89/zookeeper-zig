@@ -8,6 +8,7 @@ pub const ErrorCode = enum(i32) {
     ok = 0,
     runtime_inconsistency = -2,
     connection_loss = -4,
+    marshalling_error = -5,
     unimplemented = -6,
     bad_arguments = -8,
     no_node = -101,

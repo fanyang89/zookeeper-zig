@@ -4,6 +4,7 @@ const data = @import("protocol/data.zig");
 const proto = @import("protocol/proto.zig");
 
 pub const default_max_payload: usize = 0xfffff;
+pub const reply_header_size: usize = 16;
 
 pub const Limits = struct {
     max_payload_size: usize = default_max_payload,
