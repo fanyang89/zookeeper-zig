@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       time_limit:
-        description: "Workload duration in seconds"
+        description: "Workload duration per configuration in seconds"
         required: false
         default: 30
         type: number
@@ -139,7 +139,7 @@ jobs:
       options: --security-opt seccomp=unconfined
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
-    timeout-minutes: 45
+    timeout-minutes: 360
     defaults:
       run:
         shell: bash
@@ -187,6 +187,7 @@ jobs:
           lein version
 
       - name: Run Jepsen tests
+        id: jepsen-tests
         run: zig build test-jepsen -Dsystem-rocksdb=true --summary all
 
       - name: Build Jepsen HTML report
@@ -210,7 +211,10 @@ jobs:
 
       - name: Upload Jepsen Pages artifact
         id: upload-pages
-        if: always() && steps.report.outcome == 'success'
+        if: >-
+          always() &&
+          steps.jepsen-tests.outcome == 'success' &&
+          steps.report.outcome == 'success'
         uses: actions/upload-pages-artifact@v4
         with:
           path: tests/jepsen/report

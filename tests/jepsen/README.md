@@ -129,9 +129,12 @@ GitHub Actions runs one 30-second register smoke test for matching pushes and
 pull requests without exposing the Docker socket. The nightly schedule and
 trusted manual full runs execute the complete suite, including `partition-one`,
 with Docker socket access and 120 seconds per configuration by default. Manual
-runs can configure the workload duration and test count. Every run uploads
-Jepsen reports and preserved failure logs. Nightly and trusted manual full runs
-also deploy the latest full-suite HTML report to GitHub Pages and show an
-`Open HTML report` link in the deployment job summary. Smoke runs do not deploy
-to Pages, so they cannot replace the full-suite report. Set the repository's
-Pages source to **GitHub Actions** once before the first deployment.
+runs can configure the per-configuration workload duration and test count. Full
+configurations run serially, and the full-suite job allows up to six hours for
+long stress runs. Every run uploads Jepsen reports and preserved failure logs.
+Nightly and trusted manual full runs also deploy the latest full-suite HTML
+report to GitHub Pages and show an
+`Open HTML report` link in the deployment job summary. Smoke, failed, and timed
+out full runs do not deploy to Pages, so they cannot replace a complete
+full-suite report. Set the repository's Pages source to **GitHub Actions** once
+before the first deployment.
