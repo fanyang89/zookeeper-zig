@@ -56,6 +56,26 @@
             (ensure-cluster! subject))))
     (is (= [[] nil nil false] @cleanup-arguments))))
 
+(deftest docker-network-is-recreated-with-an-explicit-subnet
+  (let [calls (atom [])
+        create-network! (deref
+                         #'zookeeper-zig.docker-cluster/create-static-ip-network!)]
+    (with-redefs-fn
+      {#'zookeeper-zig.docker-cluster/run!
+       (fn [& arguments]
+         (swap! calls conj (vec arguments))
+         (when (= ["network" "inspect"] (take 2 arguments))
+           "172.19.0.0/16"))}
+      #(is (= "172.19.0.0/16"
+              (create-network! "test-network" "test-label"))))
+    (is (= [["network" "create" "--label" "test-label" "test-network"]
+            ["network" "inspect" "--format"
+             "{{(index .IPAM.Config 0).Subnet}}" "test-network"]
+            ["network" "rm" "test-network"]
+            ["network" "create" "--subnet" "172.19.0.0/16"
+             "--label" "test-label" "test-network"]]
+           @calls))))
+
 (deftest healing-refuses-stopped-containers
   (let [subject {:nodes [:n1 :n2 :n3]
                  :state (atom {:docker {:initialized? true

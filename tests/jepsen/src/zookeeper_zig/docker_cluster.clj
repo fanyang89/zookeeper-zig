@@ -190,6 +190,19 @@
     (when network
       (execute "network" "rm" network))))
 
+(defn- create-static-ip-network!
+  [network label]
+  (run! "network" "create" "--label" label network)
+  (try
+    (let [cidr (run! "network" "inspect" "--format"
+                     "{{(index .IPAM.Config 0).Subnet}}" network)]
+      (run! "network" "rm" network)
+      (run! "network" "create" "--subnet" cidr "--label" label network)
+      cidr)
+    (catch Throwable error
+      (run-ok? "network" "rm" network)
+      (throw error))))
+
 (defn- ensure-cluster!
   [cluster]
   (locking (:state cluster)
@@ -203,11 +216,10 @@
             controller (atom nil)]
         (try
           (run! "image" "inspect" image)
-          (run! "network" "create" "--label" label network)
-          (reset! network-created? true)
-          (reset! controller (attach-controller! network))
-          (let [cidr (run! "network" "inspect" "--format"
-                           "{{(index .IPAM.Config 0).Subnet}}" network)
+          (let [cidr (create-static-ip-network! network label)
+                _network-created (reset! network-created? true)
+                _controller-attached (reset! controller
+                                             (attach-controller! network))
                 addresses (into {}
                                 (map-indexed
                                  (fn [index node]
