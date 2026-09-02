@@ -130,7 +130,8 @@ pull requests without exposing the Docker socket. The nightly schedule and
 trusted manual full runs execute the complete suite, including `partition-one`,
 with Docker socket access and 120 seconds per configuration by default. Manual
 runs can configure the workload duration and test count. Every run uploads
-Jepsen reports and preserved failure logs. Non-PR runs also deploy the latest
-HTML report to GitHub Pages and show an `Open HTML report` link in the deployment
-job summary. Set the repository's Pages source to **GitHub Actions** once before
-the first deployment.
+Jepsen reports and preserved failure logs. Nightly and trusted manual full runs
+also deploy the latest full-suite HTML report to GitHub Pages and show an
+`Open HTML report` link in the deployment job summary. Smoke runs do not deploy
+to Pages, so they cannot replace the full-suite report. Set the repository's
+Pages source to **GitHub Actions** once before the first deployment.

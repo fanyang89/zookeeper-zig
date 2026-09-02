@@ -55,8 +55,6 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.suite != 'full')
     name: Jepsen smoke
     runs-on: ubuntu-24.04
-    outputs:
-      pages_artifact_id: ${{ steps.upload-pages.outputs.artifact_id }}
     container:
       image: fedora:44
       options: --security-opt seccomp=unconfined
@@ -127,13 +125,6 @@ jobs:
             tests/jepsen/report
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload Jepsen Pages artifact
-        id: upload-pages
-        if: always() && steps.report.outcome == 'success' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: tests/jepsen/report
 
   jepsen-full:
     if: >-
@@ -226,13 +217,10 @@ jobs:
 
   deploy-report:
     name: Publish Jepsen report
-    needs:
-      - jepsen
-      - jepsen-full
+    needs: jepsen-full
     if: >-
       always() &&
-      (needs.jepsen.outputs.pages_artifact_id != '' ||
-       needs.jepsen-full.outputs.pages_artifact_id != '')
+      needs.jepsen-full.outputs.pages_artifact_id != ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
