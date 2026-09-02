@@ -76,6 +76,53 @@
              "--label" "test-label" "test-network"]]
            @calls))))
 
+(deftest partition-probe-checks-both-sides-of-the-cut
+  (let [subject {:nodes [:n1 :n2 :n3]
+                 :container-names {:n1 "c1" :n2 "c2" :n3 "c3"}
+                 :state (atom {:docker {:addresses {:n1 "172.20.0.10"
+                                                    :n2 "172.20.0.11"
+                                                    :n3 "172.20.0.12"}}})}
+        calls (atom [])
+        verify! (deref #'zookeeper-zig.docker-cluster/verify-partition!)]
+    (with-redefs-fn
+      {#'zookeeper-zig.docker-cluster/run-result
+       (fn [arguments]
+         (swap! calls conj (vec arguments))
+         {:exit 1 :output "Operation not permitted"})
+       #'zookeeper-zig.docker-cluster/dropped-packets
+       (fn [container]
+         ({"c1" 2 "c2" 1 "c3" 1} container))}
+      #(is (= {:n1 2 :n2 1 :n3 1}
+              (verify! subject :n1 [:n2 :n3]))))
+    (is (= #{["exec" "c1" "bash" "-c"
+              "printf x > /dev/udp/172.20.0.11/7000"]
+             ["exec" "c2" "bash" "-c"
+              "printf x > /dev/udp/172.20.0.10/7000"]
+             ["exec" "c1" "bash" "-c"
+              "printf x > /dev/udp/172.20.0.12/7000"]
+             ["exec" "c3" "bash" "-c"
+              "printf x > /dev/udp/172.20.0.10/7000"]}
+           (set @calls)))))
+
+(deftest partition-probe-rejects-an-unverified-node
+  (let [subject {:nodes [:n1 :n2 :n3]
+                 :container-names {:n1 "c1" :n2 "c2" :n3 "c3"}
+                 :state (atom {:docker {:addresses {:n1 "172.20.0.10"
+                                                    :n2 "172.20.0.11"
+                                                    :n3 "172.20.0.12"}}})}
+        verify! (deref #'zookeeper-zig.docker-cluster/verify-partition!)]
+    (with-redefs-fn
+      {#'zookeeper-zig.docker-cluster/run-result
+       (fn [_]
+         {:exit 1 :output "Operation not permitted"})
+       #'zookeeper-zig.docker-cluster/dropped-packets
+       (fn [container]
+         ({"c1" 2 "c2" 0 "c3" 1} container))}
+      #(is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"did not block probe traffic"
+            (verify! subject :n1 [:n2 :n3]))))))
+
 (deftest healing-refuses-stopped-containers
   (let [subject {:nodes [:n1 :n2 :n3]
                  :state (atom {:docker {:initialized? true

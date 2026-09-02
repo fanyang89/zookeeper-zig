@@ -432,17 +432,47 @@
     (run! "exec" container "iptables" "-w" "5" "-I" "OUTPUT" "1"
           "-j" partition-chain)))
 
+(defn- send-partition-probe!
+  [cluster source target]
+  (run-result ["exec" (container-name cluster source) "bash" "-c"
+               (str "printf x > /dev/udp/" (node-address cluster target)
+                    "/" raft-port)]))
+
+(defn- verify-partition!
+  [cluster isolated others]
+  (doseq [other others]
+    (send-partition-probe! cluster isolated other)
+    (send-partition-probe! cluster other isolated))
+  (let [nodes (into [isolated] others)
+        evidence (into {}
+                       (map (fn [node]
+                              [node (dropped-packets
+                                     (container-name cluster node))])
+                            nodes))
+        unverified (->> evidence
+                        (keep (fn [[node packets]]
+                                (when (zero? packets) node)))
+                        vec)]
+    (info "Verified Docker partition" isolated "dropped probe packets" evidence)
+    (when (seq unverified)
+      (throw (ex-info "Docker partition did not block probe traffic"
+                      {:partitioned isolated
+                       :unverified unverified
+                       :evidence evidence})))
+    evidence))
+
 (defn partition-node!
   [cluster isolated]
   (ensure-cluster! cluster)
   (heal-partition! cluster)
-  (let [others (remove #{isolated} (:nodes cluster))
+  (let [others (vec (remove #{isolated} (:nodes cluster)))
         isolated-address (node-address cluster isolated)]
     (try
       (install-partition-rules! cluster isolated
                                 (map #(node-address cluster %) others))
       (doseq [node others]
         (install-partition-rules! cluster node [isolated-address]))
+      (verify-partition! cluster isolated others)
       (swap! (:state cluster) assoc-in [:docker :partition] isolated)
       (info "Partitioned Docker ZooKeeper node" isolated)
       :partitioned
