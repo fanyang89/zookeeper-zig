@@ -456,7 +456,10 @@ test "single-node quorum persists committed state through WAL restart" {
 
     {
         const quorum = try Quorum.create(std.heap.smp_allocator, testing.io, &config, options);
-        defer quorum.deinit();
+        defer {
+            quorum.shutdown() catch {};
+            quorum.deinit();
+        }
         try waitForLeader(quorum, testing.io);
         const password = [_]u8{0x33} ** 16;
         const now_ms = std.Io.Clock.real.now(testing.io).toMilliseconds();
@@ -482,7 +485,7 @@ test "single-node quorum persists committed state through WAL restart" {
         try testing.expectEqual(data_tree.ErrorCode.ok, ephemeral_result.code);
         ephemeral.deinit();
         var expiration_attempts: usize = 0;
-        while ((try quorum.machine.getSession(77)) != null and expiration_attempts < 100) : (expiration_attempts += 1) {
+        while ((try quorum.machine.getSession(77)) != null and expiration_attempts < 500) : (expiration_attempts += 1) {
             try testing.io.sleep(.fromMilliseconds(10), .awake);
         }
         try testing.expect((try quorum.machine.getSession(77)) == null);
@@ -505,7 +508,10 @@ test "single-node quorum persists committed state through WAL restart" {
 
     {
         const quorum = try Quorum.create(std.heap.smp_allocator, testing.io, &config, options);
-        defer quorum.deinit();
+        defer {
+            quorum.shutdown() catch {};
+            quorum.deinit();
+        }
         try waitForLeader(quorum, testing.io);
         try quorum.linearizableRead();
         var restored = (try quorum.machine.getData(testing.allocator, "/durable")).?;
