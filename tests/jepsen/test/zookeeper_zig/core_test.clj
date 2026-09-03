@@ -36,6 +36,10 @@
     (is (contains? configurations
                    {:workload "register" :nemesis "pause-all"}))))
 
+(deftest linear-queue-uses-memory-efficient-checker
+  (let [workload (#'core/linear-queue-workload 30)]
+    (is (= :wgl (-> workload :checker :algorithm)))))
+
 (deftest all-tests-expands-test-count
   (with-redefs [core/zookeeper-test identity]
     (let [tests (doall (core/all-tests {:test-count 2}))]

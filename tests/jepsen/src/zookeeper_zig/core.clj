@@ -176,7 +176,7 @@
   [time-limit]
   {:client-generator (queue-generator)
    :checker (checker/linearizable {:model (model/unordered-queue)
-                                   :algorithm :linear})
+                                   :algorithm :wgl})
    :client-fn zk-client/linear-queue-client})
 
 (defn- workload
