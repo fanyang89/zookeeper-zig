@@ -224,6 +224,9 @@ StaleGenerationNeverWins ==
     (* generation cannot have produced the last renewal.                   *)
     lastRenewGen <= maxGen
 
-Spec == Init /\ [][Next]_<<clock, term, st, scan>>
+vars == <<clock, term, st, scan, lastRenewClock, lastRenewGen, maxGen,
+          removal, removedClock, expiredAt>>
+
+Spec == Init /\ [][Next]_vars
 
 =============================================================================

@@ -52,6 +52,53 @@ Checked exhaustively (3,526 distinct states at `MaxClock=5, MaxCzxid=4`).
 Mutation-validated: dropping the czxid compare or the empty check each
 violates an invariant.
 
+## MultiAtomicity
+
+`MultiAtomicity.tla` / `MCMultiAtomicity.cfg` — isolation and atomic commit
+of ZooKeeper `multi`. Each operation evaluates against a private workspace;
+reads may interleave between operation evaluations but can access only the
+committed store. A successful transaction publishes the complete workspace,
+while a failed operation publishes none of it.
+
+Invariants:
+
+- `ReadIsolation` — an interleaved read observes the committed snapshot,
+  never a partially evaluated workspace.
+- `FailedMultiNoEffect` — a failed multi leaves values and versions exactly
+  at their initial state.
+- `SuccessfulMultiAllEffects` — a successful multi publishes the sequential
+  effect of both operations, including version increments.
+- `CommittedStateNeverUsesWorkspace` — no intermediate evaluation changes
+  committed state.
+
+The bounded transaction set covers distinct-node success, failure after one
+successful operation, and same-node sequential version dependence. TLC
+checks all 38 distinct states. Mutation validation catches early commit,
+workspace reads, and partial publication on failure.
+
+## LinearizableRead
+
+`LinearizableRead.tla` / `MCLinearizableRead.cfg` — the
+`Quorum.linearizableRead` and `raftz.readIndex` path. It models commit/apply
+lag, quorum confirmation, leader changes, callback completion, and writes
+before and during a read.
+
+Invariants:
+
+- `ReadIndexCoversInvocation` — the quorum-confirmed index includes every
+  write committed before invocation.
+- `CompletedAfterApply` — success is delayed until the local state machine
+  applies through the confirmed index.
+- `CompletedReadReflectsAppliedPrefix` / `CompletedReadIsLinearizable` —
+  the returned value belongs to an applied log prefix no earlier than the
+  invocation boundary.
+- `PendingReadFencedByLeadership` / `SuccessBelongsToRequestTerm` — a read
+  cannot cross a leader epoch and then report success.
+
+TLC checks all 138,284 distinct states at `MaxIndex=4, MaxTerm=3`.
+Mutation validation catches a missing apply barrier, failure to cancel reads
+on leadership loss, and an index chosen from stale applied state.
+
 ## Running
 
 ```sh
@@ -59,15 +106,33 @@ mise run tla-check   # or: bash tools/tla-check.sh
 ```
 
 The script pins `tla2tools` 1.7.0 by SHA-256, caches it under
-`~/.cache/zookeeper-zig`, and runs TLC for both configurations. Bounded
-state budgets are set by the constants in the `.cfg` files; both runs
-complete exhaustively in seconds on a laptop.
+`~/.cache/zookeeper-zig`, and runs TLC for all four configurations. Bounded
+state budgets are set by the constants in the `.cfg` files; all runs complete
+exhaustively in seconds on a laptop.
 
 ## Verification boundary
 
-The specs verify the state-machine logic that commits through Raft: guards,
-CAS fencing, and the replicated clock. They assume Raft delivers a totally
-ordered, gap-free log (the `raftz` dependency's own verification remains
-open, tracked in the roadmap) and assume server-generated session passwords
-are unique per incarnation, which fences cross-incarnation confusion
-together with generations.
+These specifications do **not** verify the external `raftz` dependency or
+provide a refinement proof from the standard Raft TLA+ specification.
+Instead, the models explicitly assume that `raftz` provides:
+
+- a totally ordered, gap-free committed log whose entries are applied once
+  and in index order;
+- leader completeness and quorum safety across terms;
+- a successful read-index that was quorum-confirmed in the requesting
+  leadership epoch;
+- read-index callback completion only after the local state machine has
+  applied through the confirmed index;
+- failure of pending read-index requests when leadership is lost.
+
+`LinearizableRead.tla` verifies the ZooKeeper-visible consequences of those
+read-index guarantees, not their implementation inside `raftz`. The relevant
+implementation boundary is `raftz`'s `ReadyProcessor`: it records ready read
+indexes, calls `completeReadyReads(applied_index)` after applying committed
+entries, and detaches pending callbacks on leadership loss.
+
+The state-machine specs verify guards, CAS fencing, atomic publication, and
+the replicated clock after that boundary. They additionally assume
+server-generated session passwords are unique per incarnation, which fences
+cross-incarnation confusion together with generations. Mixed Java/Zig Raft
+ensembles remain outside the compatibility and verification boundary.

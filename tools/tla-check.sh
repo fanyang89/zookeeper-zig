@@ -32,3 +32,5 @@ run() {
 
 run SessionTracker.tla MCSessionTracker.cfg
 run ContainerCleanup.tla MCContainerCleanup.cfg
+run MultiAtomicity.tla MCMultiAtomicity.cfg
+run LinearizableRead.tla MCLinearizableRead.cfg

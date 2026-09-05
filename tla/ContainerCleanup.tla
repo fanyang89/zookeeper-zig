@@ -160,6 +160,8 @@ CzxidStrictlyIncreases ==
     (* which is what makes the fencing value unique.                      *)
     ~Absent => Czxid < next_czxid
 
-Spec == Init /\ [][Next]_<<clock, node, scan>>
+vars == <<clock, node, next_czxid, scan, victim, lastScan>>
+
+Spec == Init /\ [][Next]_vars
 
 =============================================================================
