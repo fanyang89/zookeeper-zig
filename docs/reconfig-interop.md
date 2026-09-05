@@ -26,6 +26,30 @@ with ID 2 stopped: the new voter is needed. No IDs or old data directories are
 reused; no mixed Java/Zig ensemble is started. Tests have per-operation and
 whole-test deadlines and process cleanup through `AutoCloseable`.
 
+## Bounded negative-CAS stabilization
+
+The FAN-7 bulk case previously received `ConnectionLoss` instead of `BadVersion`
+immediately after successful removal at `87d2a6d` (retained validation artifact:
+`fix-java-full.log`). A passing unchanged-head rerun did
+not erase this new-test instability; the original failure remains recorded.
+
+Only the two negative-CAS checks in incremental/bulk voter replacement now use
+`assertBadVersionEventually`. Every attempt retains the exact target, invalid
+version, and post-removal baseline. One monotonic 30-second budget includes both
+reconfiguration and verification reads; async callback waits consume the remaining
+budget, with at most 100 ms between retries. Only `ConnectionLossException` is
+retryable. A recovered read must match config bytes and the full captured Stat,
+and the helper must eventually receive `BadVersionException`. Success, mutation,
+other semantic errors, or deadline expiry fail with version/attempt/endpoint
+diagnostics. Read retries never resubmit a CAS already rejected by BadVersion.
+Positive reconfigs and the separate async-removal scenario are unchanged.
+
+Four scripted tests (no server processes) cover transient request/read loss then
+BadVersion, forbidden success/unexpected request errors, request/read deadline
+expiry without reset, and mutation/unexpected read errors. The class selection
+therefore contains five distributed scenarios plus four helper tests. These
+are local harness tests, not additional unchanged upstream scenarios.
+
 ## Role and recovery safety limits
 
 Pinned raftz commit `78e6a811b5a965ea92bc5034daf541eb3191a956` exposes

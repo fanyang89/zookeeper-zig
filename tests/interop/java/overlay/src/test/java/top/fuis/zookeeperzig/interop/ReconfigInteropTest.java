@@ -1,5 +1,6 @@
 package top.fuis.zookeeperzig.interop;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -15,6 +16,9 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Op;
@@ -81,15 +85,10 @@ public final class ReconfigInteropTest {
                 // Both stale and future CAS must leave bytes/stat unchanged,
                 // not merely report an error while publishing a new target.
                 for (long invalidVersion : new long[] {removedStat.getVersion() - 1L, removedStat.getVersion() + 1L}) {
-                    assertThrows(
-                        KeeperException.BadVersionException.class,
-                        () -> admin.reconfigure(
-                            bulk ? null : Collections.singletonList(nodeFourConfig),
-                            null,
-                            bulk ? Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), nodeFourConfig) : null,
-                            invalidVersion,
-                            new Stat()));
-                    assertConfigUnchanged(admin, removedConfig, removedStat);
+                    assertBadVersionEventually(admin, nodeOne,
+                        bulk ? null : Collections.singletonList(nodeFourConfig),
+                        bulk ? Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), nodeFourConfig) : null,
+                        invalidVersion, removedConfig, removedStat);
                 }
             }
 
@@ -278,6 +277,164 @@ public final class ReconfigInteropTest {
             // A poisoned/deleted public node did not demote voter 3.
             cluster.stopNode(1);
             createEventually(admin, "/after-public-config-repair");
+        }
+    }
+
+    private static void assertBadVersionEventually(
+        ZooKeeperAdmin admin, String endpoint, List<String> joining, List<String> newMembers,
+        long invalidVersion, String expectedConfig, Stat expectedStat) throws Exception {
+        // Capture the target/version and baseline once. Positive reconfigs do
+        // not use this helper. Async waits bound even a stalled client request.
+        assertBadVersionEventually(endpoint, invalidVersion,
+            TimeUnit.MILLISECONDS.toNanos(OPERATION_TIMEOUT_MILLIS), System::nanoTime,
+            remaining -> {
+                CompletableFuture<ReconfigResult> completed = new CompletableFuture<>();
+                admin.reconfigure(joining, null, newMembers, invalidVersion,
+                    (rc, path, ctx, data, stat) -> completed.complete(new ReconfigResult(rc, path, ctx, data, stat)), null);
+                requireOk(completed.get(remaining, TimeUnit.NANOSECONDS));
+            },
+            remaining -> {
+                CompletableFuture<ReconfigResult> completed = new CompletableFuture<>();
+                admin.getConfig(false,
+                    (rc, path, ctx, data, stat) -> completed.complete(new ReconfigResult(rc, path, ctx, data, stat)), null);
+                ReconfigResult result = completed.get(remaining, TimeUnit.NANOSECONDS);
+                requireOk(result);
+                assertArrayEquals(expectedConfig.getBytes(StandardCharsets.UTF_8), result.data,
+                    "negative CAS changed config bytes");
+                assertEquals(expectedStat, result.stat, "negative CAS changed config Stat");
+            });
+    }
+
+    private static void requireOk(ReconfigResult result) throws KeeperException {
+        if (result.rc != KeeperException.Code.OK.intValue()) {
+            throw KeeperException.create(KeeperException.Code.get(result.rc));
+        }
+    }
+
+    @FunctionalInterface
+    private interface BoundedAction {
+        void run(long remainingNanos) throws Exception;
+    }
+
+    private static void assertBadVersionEventually(
+        String endpoint, long invalidVersion, long timeoutNanos, LongSupplier clock,
+        BoundedAction request, BoundedAction verifyConfig) throws Exception {
+        final long deadline = clock.getAsLong() + timeoutNanos;
+        for (int attempt = 1; ; attempt++) {
+            String context = "negative CAS invalidVersion=" + invalidVersion
+                + " attempt=" + attempt + " endpoint=" + endpoint;
+            boolean rejected = false;
+            try {
+                request.run(remainingNanos(deadline, clock, context));
+                throw new AssertionError(context + " unexpectedly succeeded");
+            } catch (KeeperException.BadVersionException expected) {
+                rejected = true;
+            } catch (KeeperException.ConnectionLossException transientFailure) {
+                // An ambiguous reply never counts as the expected rejection.
+            } catch (Exception unexpected) {
+                throw new AssertionError(context + " unexpected request error", unexpected);
+            }
+            // Check the same baseline after any recoverable read, including
+            // after ambiguous replies. Read retries never resubmit the CAS.
+            for (int readAttempt = 1; ; readAttempt++) {
+                String readContext = context + " readAttempt=" + readAttempt;
+                try {
+                    verifyConfig.run(remainingNanos(deadline, clock, readContext));
+                    remainingNanos(deadline, clock, readContext);
+                    break;
+                } catch (KeeperException.ConnectionLossException transientFailure) {
+                    pauseBeforeRetry(deadline, clock, readContext);
+                } catch (Exception | AssertionError unexpected) {
+                    throw new AssertionError(readContext + " config verification failed", unexpected);
+                }
+            }
+            if (rejected) return;
+            pauseBeforeRetry(deadline, clock, context);
+        }
+    }
+
+    private static long remainingNanos(long deadline, LongSupplier clock, String context) {
+        long remaining = deadline - clock.getAsLong();
+        if (remaining <= 0) throw new AssertionError(context + " deadline expired");
+        return remaining;
+    }
+
+    private static void pauseBeforeRetry(long deadline, LongSupplier clock, String context) throws InterruptedException {
+        TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(100),
+            remainingNanos(deadline, clock, context)));
+    }
+
+    @Test
+    @Timeout(value = 5)
+    public void testNegativeCasRetriesOnlyConnectionLoss() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        AtomicInteger reads = new AtomicInteger();
+        assertBadVersionEventually("scripted:1", 7, TimeUnit.SECONDS.toNanos(1), () -> 0,
+            remaining -> {
+                if (requests.incrementAndGet() == 1) throw new KeeperException.ConnectionLossException();
+                throw new KeeperException.BadVersionException();
+            },
+            remaining -> {
+                if (reads.incrementAndGet() == 1) throw new KeeperException.ConnectionLossException();
+            });
+        assertEquals(2, requests.get());
+        assertEquals(3, reads.get());
+    }
+
+    @Test
+    @Timeout(value = 5)
+    public void testNegativeCasFailsOnSuccessOrUnexpectedError() {
+        for (boolean succeeds : new boolean[] {false, true}) {
+            AssertionError failure = assertThrows(AssertionError.class,
+                () -> assertBadVersionEventually("scripted:2", 9, 10, () -> 0,
+                    remaining -> {
+                        if (!succeeds) throw new KeeperException.BadArgumentsException();
+                    }, remaining -> { throw new AssertionError("must not read after request failure"); }));
+            assertTrue(failure.getMessage().contains("invalidVersion=9 attempt=1 endpoint=scripted:2"));
+            assertTrue(failure.getMessage().contains(succeeds ? "unexpectedly succeeded" : "unexpected request error"));
+        }
+    }
+
+    @Test
+    @Timeout(value = 5)
+    public void testNegativeCasConnectionLossExpiresWithoutResettingDeadline() {
+        for (boolean readFails : new boolean[] {false, true}) {
+            AtomicLong now = new AtomicLong();
+            AtomicInteger requests = new AtomicInteger();
+            AssertionError failure = assertThrows(AssertionError.class,
+                () -> assertBadVersionEventually("scripted:3", 11, 10, now::get,
+                    remaining -> {
+                        requests.incrementAndGet();
+                        if (readFails) throw new KeeperException.BadVersionException();
+                        now.addAndGet(6);
+                        throw new KeeperException.ConnectionLossException();
+                    }, remaining -> {
+                        if (readFails) {
+                            now.addAndGet(6);
+                            throw new KeeperException.ConnectionLossException();
+                        }
+                    }));
+            int expectedAttempts = readFails ? 1 : 2;
+            assertEquals(expectedAttempts, requests.get());
+            assertTrue(failure.getMessage().contains("invalidVersion=11 attempt=" + expectedAttempts + " endpoint=scripted:3"));
+            Throwable detail = failure.getCause() == null ? failure : failure.getCause();
+            assertTrue(detail.getMessage().contains("deadline expired"));
+        }
+    }
+
+    @Test
+    @Timeout(value = 5)
+    public void testNegativeCasFailsOnMutationOrUnexpectedReadError() {
+        for (boolean mutation : new boolean[] {false, true}) {
+            AssertionError failure = assertThrows(AssertionError.class,
+                () -> assertBadVersionEventually("scripted:4", 13, 10, () -> 0,
+                    remaining -> { throw new KeeperException.BadVersionException(); },
+                    remaining -> {
+                        if (mutation) throw new AssertionError("config Stat changed");
+                        throw new KeeperException.NoNodeException();
+                    }));
+            assertTrue(failure.getMessage().contains("invalidVersion=13 attempt=1 endpoint=scripted:4"));
+            assertTrue(failure.getMessage().contains("config verification failed"));
         }
     }
 
