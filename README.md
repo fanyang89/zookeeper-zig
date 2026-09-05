@@ -24,6 +24,21 @@ mise run test
 The lint task compiles the native test tree in `ReleaseSafe`; formatting is
 checked separately with `zig fmt --check`.
 
+ThreadSanitizer covers the project-owned worker pool, watch manager, async
+client, and TCP transport concurrency paths:
+
+```sh
+mise run test-tsan
+```
+
+The task first runs the idempotent `patch-zig-tsan` workaround. Zig 0.16.0's
+vendored libtsan contains an unused `linux/scc.h` include and two unused SCC
+size declarations that fail to compile with its selected libc headers. The
+workaround removes exactly those three lines from the mise-managed Zig
+installation and refuses partially matching source. `src/tsan_test.zig`
+keeps the sanitized dependency closure free of C++ runtimes; Raft, grpc-lite,
+and RocksDB retain their upstream concurrency-testing boundaries.
+
 ## Native Zig API
 
 The build exports portable `zookeeper` and `jute` modules. The native client API

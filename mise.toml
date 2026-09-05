@@ -44,3 +44,12 @@ run = "bash tools/tla-check.sh"
 
 [tasks.apalache-check]
 run = "bash tools/apalache-check.sh"
+
+[tasks.patch-zig-tsan]
+run = "bash tools/patch-zig-tsan.sh"
+
+[tasks.test-tsan]
+run = """
+bash tools/patch-zig-tsan.sh
+zig build test-tsan --summary all
+"""

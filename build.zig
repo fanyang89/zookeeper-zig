@@ -183,6 +183,23 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run native Zig unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const tsan_module = b.createModule(.{
+        .root_source_file = b.path("src/tsan_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .sanitize_thread = true,
+    });
+    const tsan_tests = b.addTest(.{
+        .root_module = tsan_module,
+        .test_runner = .{
+            .path = zest.path("src/root.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_tsan_tests = b.addRunArtifact(tsan_tests);
+    const test_tsan = b.step("test-tsan", "Run concurrent-path tests with ThreadSanitizer");
+    test_tsan.dependOn(&run_tsan_tests.step);
 }
 
 const RocksDBModules = struct {
