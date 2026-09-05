@@ -73,11 +73,18 @@ and supports bounded connect, handshake, read, and write operations. It uses the
 monotonic awake clock for session activity. Disconnects drain outstanding
 requests into `failedRequests()` with a connection-loss reason, and `close()`
 performs the ordered `closeSession` exchange. The client is single-threaded and
-does not yet reconnect, re-authenticate, or restore watches automatically; callers
-responsible for ping and expiration checks should configure finite I/O timeouts.
+does not reconnect by itself; callers responsible for ping and expiration
+checks should configure finite I/O timeouts.
 
 `zookeeper.client.AsyncClient` adds a concurrent read pump, serialized writes,
 request futures, watch notification delivery, automatic pings, timeout checks,
+automatic reconnection with session resume: outstanding requests are re-sent
+with fresh xids, `addAuth` credentials are replayed, registered watches are
+restored through `setWatches2` relative to the last zxid seen, and synthetic
+`WatcherEvent` state notifications (`Disconnected`, `SyncConnected`, `Expired`)
+surface on the notification queue. Reconnection retries with exponential
+backoff until the session expiry budget is exhausted; disable it with
+`Options.reconnect.enabled = false`,
 and an ordered `closeSession` exchange. It requires an `std.Io` implementation
 that supports `concurrent`. The client is heap allocated so its address remains
 stable while background tasks run.
@@ -115,7 +122,7 @@ with `receiveNotification()`. Canceling a request future cancels only the local
 wait; the client still consumes the server reply to preserve ZooKeeper's ordered
 request stream. A full notification queue disconnects with
 `NotificationQueueFull` rather than blocking request dispatch or session timers.
-Reconnection, re-authentication, and watch restoration remain future work.
+The options above cover the automatic-reconnection defaults; see the section above for the full resume behavior.
 
 The protocol modules contain all 72 records from ZooKeeper 3.9.5's
 `zookeeper.jute`: `data`, `proto`, `quorum`, `persistence`, and `txn`.
