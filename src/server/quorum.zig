@@ -100,15 +100,19 @@ pub const Quorum = struct {
     ) !*Quorum {
         const self = try allocator.create(Quorum);
         errdefer allocator.destroy(self);
-        self.allocator = allocator;
-        self.io = io;
-        self.options = options;
-        self.owned_transport = owned_transport;
-        self.driver_stop = .init(false);
-        self.session_reaper_stop = .init(false);
-        self.driver_failed = .init(false);
-        self.member_count = .init(@max(config.peers.len, 1));
-        self.running = false;
+        // `Allocator.create` returns uninitialized storage, so assign the whole
+        // value to apply defaults for mutexes, atomics, and optional state.
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .options = options,
+            .machine = undefined,
+            .owned_transport = owned_transport,
+            .raftor = undefined,
+            .driver_thread = undefined,
+            .session_reaper_thread = undefined,
+            .member_count = .init(@max(config.peers.len, 1)),
+        };
 
         try std.Io.Dir.cwd().createDirPath(io, config.data_dir);
         const data_dir = try std.fmt.allocPrintSentinel(allocator, "{s}", .{config.data_dir}, 0);
@@ -561,6 +565,7 @@ test "single-node quorum persists committed state through WAL restart" {
         .read_index_timeout_ticks = 100,
         .snapshot_entries_threshold = 1,
         .session_reap_interval_ms = 10,
+        .campaign_on_start = true,
     };
 
     {
