@@ -76,7 +76,7 @@ public class WatchInteropTest extends ClientBase {
     public void testMultiAndSessionCloseWatches() throws Exception {
         RecordingWatcher multiWatcher = new RecordingWatcher();
         assertNull(zk.exists("/multi-watch", multiWatcher));
-        assertTrue(zk.getChildren("/", multiWatcher).isEmpty());
+        assertTrue(zk.getChildren("/", multiWatcher).contains("zookeeper"));
         zk.multi(java.util.Arrays.asList(
             Op.create("/multi-watch", bytes("created"), ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT),
             Op.setData("/multi-watch", bytes("updated"), -1)));
