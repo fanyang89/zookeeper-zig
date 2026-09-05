@@ -9,3 +9,4 @@ tests/jepsen/.lein-failures
 .pi/
 .mise.local.toml
 tests/fuzz/corpus/*/crashes/
+tla/states/
