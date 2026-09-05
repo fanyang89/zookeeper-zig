@@ -1,4 +1,5 @@
 pub const acl = @import("server/acl.zig");
+pub const admin_server = @import("server/admin_server.zig");
 pub const command = @import("server/command.zig");
 pub const config = @import("server/config.zig");
 pub const data_tree = @import("server/data_tree.zig");

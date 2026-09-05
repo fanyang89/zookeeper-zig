@@ -15,6 +15,7 @@ const usage =
     \\  [--import-zookeeper-data-dir PATH] \\
     \\  [--import-zookeeper-log-dir PATH] \\
     \\  [--peer ID=IPV4:PORT ...] [--join] [--4lw-whitelist LIST] [--reconfig-enabled]
+    \\                                              [--admin-listen HOST:PORT]
     \\
 ;
 
@@ -70,12 +71,48 @@ pub fn main(init: std.process.Init) !void {
         },
     );
     defer server.deinit();
+    if (config.admin_listen) |endpoint| {
+        var admin = try zookeeper.server.admin_server.AdminServer.init(
+            std.heap.smp_allocator,
+            init.io,
+            .{ .ctx = &server, .render = renderAdminCommand },
+            endpoint.host,
+            endpoint.port,
+        );
+        defer admin.connections.cancel(init.io);
+        var tasks: std.Io.Group = .init;
+        defer tasks.cancel(init.io);
+        const AdminServe = struct {
+            fn task(server: *zookeeper.server.admin_server.AdminServer) std.Io.Cancelable!void {
+                return server.serve() catch |err| {
+                    if (err == error.Canceled) return error.Canceled;
+                };
+            }
+        };
+        try tasks.concurrent(init.io, AdminServe.task, .{&admin});
+        raft.log.info(
+            @src(),
+            "ZooKeeper quorum node {} listening for clients on {s}:{} and Raft on {s}, admin on {s}:{}",
+            .{ config.node_id, config.client_host, config.client_port, config.raft_listen, endpoint.host, endpoint.port },
+        );
+        try server.serve();
+        return;
+    }
     raft.log.info(
         @src(),
         "ZooKeeper quorum node {} listening for clients on {s}:{} and Raft on {s}",
         .{ config.node_id, config.client_host, config.client_port, config.raft_listen },
     );
     try server.serve();
+}
+
+fn renderAdminCommand(
+    ctx: *anyopaque,
+    allocator: std.mem.Allocator,
+    command: zookeeper.server.four_letter.Command,
+) anyerror![]u8 {
+    const server: *zookeeper.server.TcpServer = @ptrCast(@alignCast(ctx));
+    return server.renderFourLetter(allocator, command);
 }
 
 fn writeStdout(io: std.Io, bytes: []const u8) !void {

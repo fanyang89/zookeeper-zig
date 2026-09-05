@@ -20,6 +20,7 @@ test {
     if (builtin.os.tag == .linux) {
         _ = @import("server/quorum.zig");
         _ = @import("server/tcp_server.zig");
+        _ = @import("server/admin_server.zig");
         _ = server.zookeeper_import.javaSessionPassword(1);
     }
     _ = wire.OpCode;

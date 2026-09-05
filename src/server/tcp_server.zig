@@ -507,20 +507,14 @@ pub const TcpServer = struct {
         };
     }
 
-    fn serveFourLetter(self: *TcpServer, transport: *TcpTransport, name: [4]u8) !void {
-        const admin_command = four_letter.commandFromName(&name) orelse return;
-        if (!self.four_letter.allows(admin_command)) {
-            const text = try std.fmt.allocPrint(self.allocator, "{s} is not executed because it is not in the whitelist.\n", .{name});
-            defer self.allocator.free(text);
-            try writeRawAll(self.io, transport.stream, text);
-            return;
-        }
-        if (admin_command == .srst) self.stats.reset();
-
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-
+    /// Renders any four-letter command; shared with the AdminServer HTTP
+    /// endpoints, which do not consult the four-letter whitelist (matching
+    /// upstream).
+    pub fn renderFourLetter(
+        self: *TcpServer,
+        allocator: std.mem.Allocator,
+        admin_command: four_letter.Command,
+    ) ![]u8 {
         var snapshot = four_letter.Snapshot{
             .mode = self.serverMode(),
             .serving = self.quorum.status().leader_id != 0,
@@ -550,8 +544,22 @@ pub const TcpServer = struct {
         if (needs_state and snapshot.serving) {
             try self.fillFourLetterState(allocator, &snapshot, admin_command);
         }
+        return four_letter.render(allocator, &snapshot, admin_command);
+    }
 
-        const text = try four_letter.render(allocator, &snapshot, admin_command);
+    fn serveFourLetter(self: *TcpServer, transport: *TcpTransport, name: [4]u8) !void {
+        const admin_command = four_letter.commandFromName(&name) orelse return;
+        if (!self.four_letter.allows(admin_command)) {
+            const text = try std.fmt.allocPrint(self.allocator, "{s} is not executed because it is not in the whitelist.\n", .{name});
+            defer self.allocator.free(text);
+            try writeRawAll(self.io, transport.stream, text);
+            return;
+        }
+        if (admin_command == .srst) self.stats.reset();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const text = try self.renderFourLetter(arena.allocator(), admin_command);
         try writeRawAll(self.io, transport.stream, text);
     }
 

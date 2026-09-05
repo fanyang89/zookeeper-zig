@@ -18,6 +18,7 @@ pub const ServerConfig = struct {
     join: bool,
     four_letter_whitelist: []u8,
     reconfig_enabled: bool,
+    admin_listen: ?Endpoint,
 
     pub fn deinit(self: *ServerConfig) void {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
@@ -46,6 +47,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var import_zookeeper_log_dir: ?[]const u8 = null;
     var join = false;
     var reconfig_enabled = false;
+    var admin_listen: ?[]const u8 = null;
     var four_letter_whitelist: ?[]const u8 = null;
     var peer_values: std.ArrayList([]const u8) = .empty;
     defer peer_values.deinit(allocator);
@@ -80,6 +82,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             raft_listen = value;
         } else if (std.mem.eql(u8, argument, "--raft-advertise")) {
             raft_advertise = value;
+        } else if (std.mem.eql(u8, argument, "--admin-listen")) {
+            admin_listen = value;
         } else if (std.mem.eql(u8, argument, "--data-dir")) {
             data_dir = value;
         } else if (std.mem.eql(u8, argument, "--import-zookeeper-data-dir")) {
@@ -169,11 +173,12 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .peers = peers,
         .join = join,
         .reconfig_enabled = reconfig_enabled,
+        .admin_listen = if (admin_listen) |listen| try parseEndpoint(listen) else null,
         .four_letter_whitelist = try allocator.dupe(u8, four_letter_whitelist orelse "srvr"),
     };
 }
 
-const Endpoint = struct {
+pub const Endpoint = struct {
     host: []const u8,
     port: u16,
 };

@@ -308,6 +308,18 @@ matching `zookeeper.4lw.commands.whitelist`. While a node has no leader,
 state-dependent commands reply `This server is not currently serving
 requests`.
 
+## Admin HTTP endpoints
+
+Start with `--admin-listen 0.0.0.0:8080` to mirror the upstream AdminServer
+URL space: `GET /commands` lists the available commands as links and
+`GET /commands/<name>` executes one, returning upstream-shaped JSON
+(`{"command": ..., "error": null, ...fields}`); `?format=txt` returns the
+plain four-letter output. Both the four-letter names and the upstream admin
+primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
+`configuration` for `conf`, ...) are accepted. Unlike the socket four-letter
+path, the HTTP endpoints are not gated by the 4lw whitelist, matching
+upstream. The server is disabled unless `--admin-listen` is set.
+
 ## Dynamic membership (reconfig)
 
 Start the server with `--reconfig-enabled` to accept the ZooKeeper `reconfig`
