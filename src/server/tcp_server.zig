@@ -939,6 +939,22 @@ pub const TcpServer = struct {
             ),
             .sync => try self.sync(transport, session, xid, body),
             .reconfig => try self.reconfig(transport, xid, body),
+            .get_ephemerals => try self.getEphemerals(transport, session, xid, body),
+            .get_all_children_number => try self.getAllChildrenNumber(
+                transport,
+                session,
+                context.identities.items,
+                xid,
+                body,
+            ),
+            .who_am_i => try self.whoAmI(transport, context.identities.items, xid),
+            .delete_container => try self.deleteContainer(
+                transport,
+                session,
+                context.identities.items,
+                xid,
+                body,
+            ),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
         return true;
@@ -1970,6 +1986,168 @@ pub const TcpServer = struct {
             .data = new_config,
             .stat = encoded.stat,
         });
+    }
+
+    fn getEphemerals(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.GetEphemeralsRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        self.quorum.machine.validateSession(session.id, session.generation) catch |err|
+            return sendMappedSessionError(transport, self.allocator, self.io, xid, zxid, err);
+
+        const paths = try self.quorum.machine.store.ephemeralPaths(self.allocator, session.id);
+        defer {
+            for (paths) |path| self.allocator.free(path);
+            self.allocator.free(paths);
+        }
+        var prefix: []const u8 = std.mem.trim(u8, request.prefixPath orelse "", " \t");
+        if (prefix.len == 0 or std.mem.eql(u8, prefix, "/")) prefix = "";
+        var filtered: std.ArrayList(?[]const u8) = .empty;
+        defer filtered.deinit(self.allocator);
+        for (paths) |path| {
+            if (prefix.len != 0 and !std.mem.startsWith(u8, path, prefix)) continue;
+            try filtered.append(self.allocator, path);
+        }
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, protocol.proto.GetEphemeralsResponse{ .ephemerals = filtered.items });
+    }
+
+    fn getAllChildrenNumber(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(protocol.proto.GetAllChildrenNumberRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const path = request.path orelse
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        self.quorum.machine.validateSession(session.id, session.generation) catch |err|
+            return sendMappedSessionError(transport, self.allocator, self.io, xid, zxid, err);
+        const stat = (try self.quorum.machine.store.exists(path)) orelse
+            return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        _ = stat;
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        const authorization = try self.quorum.machine.store.authorize(path, acl.read, identities_blob);
+        if (authorization != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, zxid, authorization);
+        }
+        const number = (try self.quorum.machine.store.allChildrenNumber(self.allocator, path)) orelse
+            return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, protocol.proto.GetAllChildrenNumberResponse{ .totalNumber = @intCast(number) });
+    }
+
+    fn whoAmI(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        identities: []const acl.Identity,
+        xid: i32,
+    ) !void {
+        const zxid = appliedZxid(self.quorum);
+        var infos: std.ArrayList(protocol.data.ClientInfo) = .empty;
+        defer infos.deinit(self.allocator);
+        for (identities) |identity| {
+            const user: ?[]const u8 = if (std.mem.eql(u8, identity.scheme, "digest"))
+                if (std.mem.indexOfScalar(u8, identity.id, ':')) |colon| identity.id[0..colon] else identity.id
+            else if (std.mem.eql(u8, identity.scheme, "ip"))
+                identity.id
+            else
+                "";
+            try infos.append(self.allocator, .{
+                .authScheme = identity.scheme,
+                .user = user,
+            });
+        }
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = zxid,
+            .err = 0,
+        }, protocol.proto.WhoAmIResponse{ .clientInfo = infos.items });
+    }
+
+    const DeleteContainerRequest = struct {
+        path: ?[]const u8,
+    };
+
+    fn deleteContainer(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        session: ConnectionSession,
+        identities: []const acl.Identity,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        const request = try decodeBody(DeleteContainerRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const path = request.path orelse
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        if (!data_tree.isValidPath(path) or std.mem.eql(u8, path, "/"))
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        try self.quorum.linearizableRead();
+        const zxid = appliedZxid(self.quorum);
+        self.quorum.machine.validateSession(session.id, session.generation) catch |err|
+            return sendMappedSessionError(transport, self.allocator, self.io, xid, zxid, err);
+        const stat = (try self.quorum.machine.store.exists(path)) orelse
+            return sendError(transport, self.allocator, self.io, xid, zxid, .no_node);
+        // Upstream rejects only normal ephemerals; containers and TTL nodes
+        // pass.
+        if (stat.ephemeralOwner != 0 and ephemeral.classifyOwner(stat.ephemeralOwner) catch .ephemeral == .ephemeral)
+            return sendError(transport, self.allocator, self.io, xid, zxid, .bad_version);
+        if (try self.quorum.machine.store.getChildren(self.allocator, path)) |children| {
+            defer {
+                for (children) |child| self.allocator.free(child);
+                self.allocator.free(children);
+            }
+            if (children.len > 0) {
+                return sendError(transport, self.allocator, self.io, xid, zxid, .not_empty);
+            }
+        }
+
+        const identities_blob = try acl.encodeIdentities(self.allocator, identities);
+        defer self.allocator.free(identities_blob);
+        var proposal = self.quorum.propose(.{ .delete = .{
+            .path = path,
+            .expected_version = -1,
+            .session_id = 0,
+            .session_generation = session.generation,
+            .identities = identities_blob,
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, result.zxid, result.code);
+        }
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, {});
     }
 
     fn sync(

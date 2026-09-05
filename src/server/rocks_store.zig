@@ -462,6 +462,48 @@ pub const RocksStore = struct {
         return try children.toOwnedSlice(allocator);
     }
 
+    /// Counts every descendant of `path`; null when the node is missing.
+    /// Walks the live tree, so concurrent deletions simply shrink the count.
+    pub fn allChildrenNumber(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+        path: []const u8,
+    ) !?usize {
+        if ((try self.exists(path)) == null) return null;
+        var total: usize = 0;
+        var pending: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (pending.items) |entry| allocator.free(entry);
+            pending.deinit(allocator);
+        }
+        try pending.append(allocator, try allocator.dupe(u8, path));
+        var index: usize = 0;
+        defer {
+            for (pending.items) |entry| allocator.free(entry);
+            pending.deinit(allocator);
+        }
+        while (index < pending.items.len) : (index += 1) {
+            const current = pending.items[index];
+            const children = (try self.getChildren(allocator, current)) orelse continue;
+            defer {
+                for (children) |child| allocator.free(child);
+                allocator.free(children);
+            }
+            total = std.math.add(usize, total, children.len) catch std.math.maxInt(usize);
+            for (children) |child| {
+                const joined = if (std.mem.eql(u8, current, "/"))
+                    try std.fmt.allocPrint(allocator, "/{s}", .{child})
+                else
+                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ current, child });
+                pending.append(allocator, joined) catch |err| {
+                    allocator.free(joined);
+                    return err;
+                };
+            }
+        }
+        return @min(total, std.math.maxInt(i32));
+    }
+
     pub fn authorize(
         self: *RocksStore,
         path: []const u8,
@@ -2906,4 +2948,33 @@ test "reconfig seeds a config baseline and applies version-checked updates" {
     defer if (updated.data) |value| testing.allocator.free(value);
     try testing.expectEqualStrings(replacement, updated.data.?);
     try testing.expectEqual(@as(i32, 1), updated.stat.version);
+}
+
+test "allChildrenNumber counts descendants recursively" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+    // Tree: /a(-> /a/b -> /a/b/c), /a/d  => root has 4 descendants,
+    // /a has 3, /a/b has 1, /a/d has 0.
+    const paths = [_][]const u8{ "/a", "/a/b", "/a/b/c", "/a/d" };
+    for (paths, 1..) |node_path, index| {
+        var created = try store.apply(.{ .create = .{
+            .path = node_path,
+            .data = "",
+            .time_ms = @intCast(index),
+        } }, index, 1);
+        defer created.deinit(testing.allocator);
+        try testing.expectEqual(ErrorCode.ok, created.code);
+    }
+
+    try testing.expectEqual(@as(?usize, 4), try store.allChildrenNumber(testing.allocator, "/"));
+    try testing.expectEqual(@as(?usize, 3), try store.allChildrenNumber(testing.allocator, "/a"));
+    try testing.expectEqual(@as(?usize, 1), try store.allChildrenNumber(testing.allocator, "/a/b"));
+    try testing.expectEqual(@as(?usize, 0), try store.allChildrenNumber(testing.allocator, "/a/d"));
+    try testing.expectEqual(@as(?usize, null), try store.allChildrenNumber(testing.allocator, "/missing"));
 }
