@@ -13,6 +13,7 @@ const ephemeral = @import("ephemeral.zig");
 const four_letter = @import("four_letter.zig");
 const multi = @import("multi.zig");
 const quorum_mod = @import("quorum.zig");
+const reconfig_mod = @import("reconfig.zig");
 const watch = @import("watch.zig");
 const worker_pool = @import("worker_pool.zig");
 
@@ -277,6 +278,7 @@ pub const Options = struct {
     /// Mirrors `zookeeper.4lw.commands.whitelist`; the upstream default is
     /// `srvr` only.
     four_letter_whitelist: []const u8 = "srvr",
+    reconfig_enabled: bool = false,
     single_member: bool = false,
     data_dir: []const u8 = "",
     tick_time_ms: u64 = 50,
@@ -293,6 +295,8 @@ pub const TcpServer = struct {
     connections: std.Io.Group = .init,
     four_letter: four_letter.Whitelist = .{},
     stats: four_letter.ServerCounters = .{},
+    reconfig_enabled: bool = false,
+    reconfig_inflight: std.atomic.Value(bool) = .init(false),
     registry_mutex: std.atomic.Mutex = .unlocked,
     registry: std.ArrayList(*ConnectionState) = .empty,
     single_member: bool = false,
@@ -328,6 +332,7 @@ pub const TcpServer = struct {
             .watch_manager = .init(allocator),
             .notification_queue_capacity = options.notification_queue_capacity,
             .four_letter = four_letter.Whitelist.parse(options.four_letter_whitelist),
+            .reconfig_enabled = options.reconfig_enabled,
             .single_member = options.single_member,
             .data_dir = options.data_dir,
             .tick_time_ms = options.tick_time_ms,
@@ -534,6 +539,9 @@ pub const TcpServer = struct {
                 .config = "",
             },
         };
+        if (admin_command == .conf and snapshot.serving) {
+            snapshot.conf.config = (try self.quorum.machine.store.configString(allocator)) orelse "";
+        }
 
         const needs_state = switch (admin_command) {
             .ruok, .isro, .gtmk, .stmk, .envi => false,
@@ -930,6 +938,7 @@ pub const TcpServer = struct {
                 body,
             ),
             .sync => try self.sync(transport, session, xid, body),
+            .reconfig => try self.reconfig(transport, xid, body),
             else => try sendError(transport, self.allocator, self.io, xid, -1, .unimplemented),
         }
         return true;
@@ -1887,6 +1896,80 @@ pub const TcpServer = struct {
         const batch_id = try self.watch_manager.beginBatch(connection_id);
         try transport.activateWatchesAfterReply(batch_id);
         return .{ .connection_id = connection_id, .batch_id = batch_id };
+    }
+
+    fn reconfig(
+        self: *TcpServer,
+        transport: *ResponseSink,
+        xid: i32,
+        bytes: []const u8,
+    ) !void {
+        if (!self.reconfig_enabled) {
+            return sendError(transport, self.allocator, self.io, xid, -1, .reconfig_disabled);
+        }
+        if (self.reconfig_inflight.swap(true, .acq_rel)) {
+            return sendError(transport, self.allocator, self.io, xid, -1, .reconfig_in_progress);
+        }
+        defer self.reconfig_inflight.store(false, .release);
+
+        const request = try decodeBody(protocol.proto.ReconfigRequest, bytes, self.allocator);
+        defer jute.deinitDecoded(request, self.allocator);
+        const joining = request.joiningServers orelse "";
+        const leaving = request.leavingServers orelse "";
+        const bulk = request.newMembers orelse "";
+        const incremental = joining.len > 0 or leaving.len > 0;
+        if (incremental == (bulk.len > 0)) {
+            // Exactly one of incremental or bulk replacement is allowed.
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        }
+        if (request.curConfigId < -1 or request.curConfigId > std.math.maxInt(i32)) {
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        }
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const current_text = (try self.quorum.machine.store.configString(allocator)) orelse "";
+        const target_members = if (bulk.len > 0)
+            reconfig_mod.parseConfig(allocator, bulk) catch
+                return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments)
+        else blk: {
+            const current = reconfig_mod.parseConfig(allocator, current_text) catch
+                return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+            break :blk reconfig_mod.applyChanges(allocator, current, joining, leaving) catch
+                return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+        };
+        const new_config = reconfig_mod.formatConfig(allocator, target_members) catch
+            return sendError(transport, self.allocator, self.io, xid, -1, .bad_arguments);
+
+        var proposal = self.quorum.propose(.{ .reconfig = .{
+            .config = new_config,
+            .expected_version = @intCast(request.curConfigId),
+            .time_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+        } }) catch return sendError(
+            transport,
+            self.allocator,
+            self.io,
+            xid,
+            -1,
+            .connection_loss,
+        );
+        defer proposal.deinit();
+        const result = try command.decodeResult(proposal.bytes);
+        if (result.code != .ok) {
+            return sendError(transport, self.allocator, self.io, xid, result.zxid, result.code);
+        }
+        var reader = jute.Reader.init(result.body);
+        const encoded = try jute.deserialize(protocol.proto.SetDataResponse, &reader, self.allocator);
+        defer jute.deinitDecoded(encoded, self.allocator);
+        return sendReply(transport, self.allocator, self.io, .{
+            .xid = xid,
+            .zxid = result.zxid,
+            .err = 0,
+        }, protocol.proto.GetDataResponse{
+            .data = new_config,
+            .stat = encoded.stat,
+        });
     }
 
     fn sync(

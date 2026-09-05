@@ -17,6 +17,7 @@ pub const ServerConfig = struct {
     peers: []raft.Peer,
     join: bool,
     four_letter_whitelist: []u8,
+    reconfig_enabled: bool,
 
     pub fn deinit(self: *ServerConfig) void {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
@@ -44,6 +45,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var import_zookeeper_data_dir: ?[]const u8 = null;
     var import_zookeeper_log_dir: ?[]const u8 = null;
     var join = false;
+    var reconfig_enabled = false;
     var four_letter_whitelist: ?[]const u8 = null;
     var peer_values: std.ArrayList([]const u8) = .empty;
     defer peer_values.deinit(allocator);
@@ -53,6 +55,10 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         const argument = arguments[index];
         if (std.mem.eql(u8, argument, "--join")) {
             join = true;
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "--reconfig-enabled")) {
+            reconfig_enabled = true;
             continue;
         }
         if (index + 1 == arguments.len) return error.MissingOptionValue;
@@ -162,6 +168,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .import_zookeeper_log_dir = owned_import_log_dir,
         .peers = peers,
         .join = join,
+        .reconfig_enabled = reconfig_enabled,
         .four_letter_whitelist = try allocator.dupe(u8, four_letter_whitelist orelse "srvr"),
     };
 }

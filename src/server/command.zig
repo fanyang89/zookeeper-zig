@@ -20,6 +20,7 @@ pub const Kind = enum(i32) {
     session_tick = 105,
     delete_extended = 106,
     multi = 107,
+    reconfig = 108,
 };
 
 pub const Mutation = union(Kind) {
@@ -104,6 +105,11 @@ pub const Mutation = union(Kind) {
         session_generation: u64,
         identities: ?[]const u8 = null,
     },
+    reconfig: struct {
+        config: []const u8,
+        expected_version: i32,
+        time_ms: i64,
+    },
 };
 
 pub const ResultView = struct {
@@ -117,6 +123,7 @@ pub fn resultCapacity(mutation: Mutation) !usize {
         .create => |value| std.math.add(usize, 94, value.path.len) catch error.SizeOverflow,
         .delete, .open_session, .touch_session, .close_session, .expire_session, .move_session, .session_tick, .delete_extended => 12,
         .set_acl, .set_data => 80,
+        .reconfig => 80,
         .multi => |value| std.math.add(
             usize,
             12,
@@ -216,6 +223,11 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeLong(@bitCast(value.session_generation));
             try writer.writeBuffer(value.identities);
         },
+        .reconfig => |value| {
+            try writer.writeBuffer(value.config);
+            try writer.writeInt(value.expected_version);
+            try writer.writeLong(value.time_ms);
+        },
     }
     return allocator.dupe(u8, writer.bytes());
 }
@@ -309,6 +321,14 @@ pub fn decode(bytes: []const u8) !Mutation {
                 .identities = try reader.readBuffer(),
             } };
         },
+        .reconfig => blk: {
+            if (encoded_version < 6) return error.UnsupportedCommandVersion;
+            break :blk .{ .reconfig = .{
+                .config = (try reader.readBuffer()) orelse return error.InvalidCommand,
+                .expected_version = try reader.readInt(),
+                .time_ms = try reader.readLong(),
+            } };
+        },
     };
     if (reader.remaining() != 0) return error.InvalidCommand;
     return mutation;
@@ -377,6 +397,17 @@ fn checkedEnum(comptime T: type, value: std.meta.Tag(T)) ?T {
 
 test "mutation commands and results round trip" {
     const testing = std.testing;
+    const reconfig_encoded = try encode(testing.allocator, .{ .reconfig = .{
+        .config = "server.1=127.0.0.1:2881:participant",
+        .expected_version = 3,
+        .time_ms = 77,
+    } });
+    defer testing.allocator.free(reconfig_encoded);
+    const reconfig_decoded = try decode(reconfig_encoded);
+    try testing.expectEqualStrings("server.1=127.0.0.1:2881:participant", reconfig_decoded.reconfig.config);
+    try testing.expectEqual(@as(i32, 3), reconfig_decoded.reconfig.expected_version);
+    try testing.expectEqual(@as(i64, 77), reconfig_decoded.reconfig.time_ms);
+
     const encoded = try encode(testing.allocator, .{ .set_data = .{
         .path = "/node",
         .data = "value",

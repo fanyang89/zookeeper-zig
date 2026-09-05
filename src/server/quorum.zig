@@ -7,6 +7,7 @@ const data_tree = @import("data_tree.zig");
 const distributed_test = @import("distributed_test.zig");
 const real_transport_test = @import("real_transport_test.zig");
 const state_machine = @import("state_machine.zig");
+const reconfig = @import("reconfig.zig");
 
 pub const Options = struct {
     tick_interval_ms: u64 = 50,
@@ -41,6 +42,10 @@ pub const Quorum = struct {
     driver_stop: std.atomic.Value(bool) = .init(false),
     session_reaper_stop: std.atomic.Value(bool) = .init(false),
     driver_failed: std.atomic.Value(bool) = .init(false),
+    membership_mutex: std.atomic.Mutex = .unlocked,
+    pending_config: ?[]u8 = null,
+    pending_version: i64 = 0,
+    driven_version: i64 = 0,
     running: bool = false,
 
     fn validateOptions(options: Options) !void {
@@ -110,6 +115,10 @@ pub const Quorum = struct {
         defer allocator.free(state_dir);
         self.machine = try state_machine.ZooKeeperStateMachine.init(allocator, state_dir);
         errdefer self.machine.deinit();
+        self.machine.reconfig_callback = .{ .ctx = self, .function = onReconfigApplied };
+        if (!config.join) {
+            try self.seedConfigBaseline(config);
+        }
 
         var raft_config: raft.RaftorConfig = .{};
         raft_config.raft.id = config.node_id;
@@ -213,9 +222,95 @@ pub const Quorum = struct {
                 break;
             };
             if (self.driver_stop.load(.acquire)) break;
+            self.driveMembership();
             sleepNanoseconds(self.options.tick_interval_ms * std.time.ns_per_ms);
         }
         if (self.driver_failed.load(.acquire)) self.raftor.stop();
+    }
+
+    /// Builds the initial `/zookeeper/config` baseline from the static peer
+    /// list so `getData("/zookeeper/config")` and reconfig CAS checks have a
+    /// starting point. Runs before Raft starts; identical on every initial
+    /// member.
+    fn seedConfigBaseline(self: *Quorum, config: *const config_mod.ServerConfig) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        var members: std.ArrayList(reconfig.Member) = .empty;
+        for (config.peers) |peer| {
+            try members.append(allocator, .{
+                .id = peer.id,
+                .address = try allocator.dupe(u8, peer.context orelse continue),
+            });
+        }
+        if (members.items.len == 0) {
+            try members.append(allocator, .{
+                .id = config.node_id,
+                .address = try allocator.dupe(u8, config.raft_advertise),
+            });
+        }
+        try self.machine.store.ensureConfigBaseline(members.items);
+    }
+
+    fn onReconfigApplied(ctx: *anyopaque, config: []const u8, version: i32) void {
+        const self: *Quorum = @ptrCast(@alignCast(ctx));
+        while (!self.membership_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.membership_mutex.unlock();
+        if (self.pending_config) |old| self.allocator.free(old);
+        self.pending_config = self.allocator.dupe(u8, config) catch null;
+        self.pending_version = version;
+    }
+
+    /// Reconciles live Raft membership toward the latest committed reconfig
+    /// one operation per tick, so the quorum never shrinks before new
+    /// members join. Retries naturally on the next tick; safe to recompute
+    /// because the diff is idempotent.
+    fn driveMembership(self: *Quorum) void {
+        while (!self.membership_mutex.tryLock()) std.atomic.spinLoopHint();
+        const pending = self.pending_config;
+        const pending_version = self.pending_version;
+        if (pending == null or pending_version <= self.driven_version) {
+            self.membership_mutex.unlock();
+            return;
+        }
+        self.membership_mutex.unlock();
+        if (!self.raftor.isLeader()) return;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        const target = reconfig.parseConfig(allocator, pending.?) catch {
+            // A committed config we cannot parse cannot be driven; retrying
+            // will not help.
+            while (!self.membership_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.membership_mutex.unlock();
+            self.driven_version = pending_version;
+            return;
+        };
+        const membership = self.raftor.getClusterMembership() orelse return;
+        var live: std.ArrayList(reconfig.LiveMember) = .empty;
+        for (membership.peers) |peer| {
+            live.append(allocator, .{ .id = peer.node_id, .address = peer.address }) catch return;
+        }
+        const ops = reconfig.diffMembership(allocator, live.items, target) catch return;
+        if (ops.len == 0) {
+            while (!self.membership_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.membership_mutex.unlock();
+            self.driven_version = pending_version;
+            return;
+        }
+        const op = ops[0];
+        const outcome = switch (op) {
+            .add => |value| if (value.learner)
+                self.raftor.addLearner(value.id, value.address)
+            else
+                self.raftor.addNode(value.id, value.address),
+            .update_address => |value| self.raftor.updateNodeAddress(value.id, value.address),
+            .remove => |value| self.raftor.removeNode(value.id),
+        };
+        outcome catch |err| {
+            raft.log.warn(@src(), "ZooKeeper membership change {s} failed: {s}; retrying", .{ @tagName(op), @errorName(err) });
+        };
     }
 
     fn runSessionReaper(self: *Quorum) void {

@@ -6,6 +6,7 @@ const acl = @import("acl.zig");
 const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
 const multi = @import("multi.zig");
+const reconfig = @import("reconfig.zig");
 const rocks_store = @import("rocks_store.zig");
 const watch = @import("watch.zig");
 
@@ -45,11 +46,20 @@ pub const AclResult = struct {
 
 pub const SessionReadError = error{ SessionExpired, SessionMoved, NoAuth };
 
+/// Notified after a committed reconfig mutation applies. Runs on the Raft
+/// driver thread while the state-machine mutex is held; handlers must not
+/// take that mutex.
+pub const ReconfigCallback = struct {
+    ctx: *anyopaque,
+    function: *const fn (ctx: *anyopaque, config: []const u8, version: i32) void,
+};
+
 pub const ZooKeeperStateMachine = struct {
     allocator: std.mem.Allocator,
     store: rocks_store.RocksStore,
     mutex: std.atomic.Mutex = .unlocked,
     watch_manager: ?*watch.Manager = null,
+    reconfig_callback: ?ReconfigCallback = null,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !ZooKeeperStateMachine {
         return .{
@@ -658,6 +668,12 @@ pub const ZooKeeperStateMachine = struct {
             return mapStoreError(err);
         defer result.deinit(self.allocator);
 
+        if (mutation == .reconfig and result.code == .ok) {
+            if (self.reconfig_callback) |callback| {
+                callback.function(callback.ctx, mutation.reconfig.config, result.stat.?.version);
+            }
+        }
+
         if (result.code == .ok) {
             if (self.watch_manager) |manager| {
                 publishMutationEvents(
@@ -703,6 +719,9 @@ pub const ZooKeeperStateMachine = struct {
                 .stat = result.stat.?,
             }) catch unreachable,
             .set_data => jute.serialize(&writer, protocol.proto.SetDataResponse{
+                .stat = result.stat.?,
+            }) catch unreachable,
+            .reconfig => jute.serialize(&writer, protocol.proto.SetDataResponse{
                 .stat = result.stat.?,
             }) catch unreachable,
             .multi => unreachable,
@@ -806,6 +825,14 @@ fn publishMutationEvents(
             .node_data_changed,
             zxid,
             request.path,
+        ),
+        .reconfig => try publishCurrentEvent(
+            manager,
+            store,
+            allocator,
+            .node_data_changed,
+            zxid,
+            reconfig.path,
         ),
         .delete_extended => |request| {
             if (result.changed) try publishDeleted(
@@ -951,6 +978,7 @@ fn mutationSuccessResponseSize(mutation: command.Mutation) !usize {
             ) catch return error.SizeOverflow,
         ) catch error.SizeOverflow,
         .set_acl, .set_data => 80,
+        .reconfig => 80,
         .delete,
         .open_session,
         .touch_session,

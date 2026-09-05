@@ -22,6 +22,8 @@ pub const ErrorCode = enum(i32) {
     auth_failed = -115,
     session_moved = -118,
     no_watcher = -121,
+    reconfig_in_progress = -14,
+    reconfig_disabled = -123,
 };
 
 pub const MutationEventType = enum {

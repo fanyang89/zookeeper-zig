@@ -8,12 +8,14 @@ const command = @import("command.zig");
 const data_tree = @import("data_tree.zig");
 const multi = @import("multi.zig");
 const ephemeral = @import("ephemeral.zig");
+const reconfig = @import("reconfig.zig");
 
 const Node = data_tree.Node;
 const ErrorCode = data_tree.ErrorCode;
 
 const applied_key = "\x00applied";
 const import_zxid_key = "\x00import-zxid";
+const config_string_key = "\x00reconfig-config";
 const state_prefix = "\x01";
 const session_clock_key = "\x01clock";
 const zxid_base_key = "\x01zxid-base";
@@ -257,6 +259,13 @@ pub const RocksStore = struct {
         const result = if (try self.validateMutationConnection(operation)) |rejected|
             rejected
         else switch (operation) {
+            .reconfig => |request| try self.applyReconfig(
+                request.config,
+                request.expected_version,
+                request.time_ms,
+                index,
+                term,
+            ),
             .create => |request| try self.create(
                 request.path,
                 request.data,
@@ -1866,6 +1875,141 @@ pub const RocksStore = struct {
         return .{ .code = .ok, .stat = node.stat() };
     }
 
+    /// The persisted dynamic-membership config string, if reconfiguration
+    /// has run or the node was seeded from its initial peers.
+    pub fn configString(self: *RocksStore, allocator: std.mem.Allocator) !?[]u8 {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        const maybe_data = try self.db.get(self.default_family, config_string_key, &error_data);
+        if (maybe_data) |data| {
+            defer data.deinit();
+            return try allocator.dupe(u8, data.data);
+        }
+        return null;
+    }
+
+    /// Creates the `/zookeeper` system node and the `/zookeeper/config`
+    /// baseline from the initial static peer list when reconfiguration state
+    /// is absent. Runs before Raft starts; every initial member computes the
+    /// same baseline, like the import path.
+    pub fn ensureConfigBaseline(self: *RocksStore, members: []const reconfig.Member) !void {
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        if (try self.db.get(self.default_family, config_string_key, &error_data)) |existing| {
+            existing.deinit();
+            return;
+        }
+        if (try self.getNode(reconfig.path)) |value| {
+            // An imported upstream config node exists but the metadata key
+            // was not written; sync the metadata from the node so
+            // `configString` stays authoritative.
+            var node = value;
+            defer node.deinit(self.allocator);
+            var batch = rocksdb.WriteBatch.init();
+            defer batch.deinit();
+            batch.put(self.default_family, config_string_key, node.data);
+            try self.writeSync(batch);
+            return;
+        }
+
+        const config = try reconfig.formatConfig(self.allocator, members);
+        defer self.allocator.free(config);
+
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        if ((try self.getNode("/zookeeper")) == null) {
+            const system_node = Node{
+                .data = try self.allocator.dupe(u8, &.{}),
+                .czxid = 0,
+                .mzxid = 0,
+                .ctime = 0,
+                .mtime = 0,
+                .cversion = 1,
+                .pzxid = 0,
+                .child_count = 1,
+            };
+            const encoded_system = try encodeNode(self.allocator, system_node);
+            defer self.allocator.free(encoded_system);
+            self.allocator.free(system_node.data);
+            batch.put(self.default_family, "/zookeeper", encoded_system);
+        }
+        const config_node = Node{
+            .data = try self.allocator.dupe(u8, config),
+            .czxid = 0,
+            .mzxid = 0,
+            .ctime = 0,
+            .mtime = 0,
+            .pzxid = 0,
+        };
+        const encoded_config = try encodeNode(self.allocator, config_node);
+        defer self.allocator.free(encoded_config);
+        self.allocator.free(config_node.data);
+        batch.put(self.default_family, reconfig.path, encoded_config);
+        batch.put(self.default_family, config_string_key, config);
+        try self.writeSync(batch);
+    }
+
+    fn applyReconfig(
+        self: *RocksStore,
+        config: []const u8,
+        expected_version: i32,
+        time_ms: i64,
+        index: u64,
+        term: u64,
+    ) !data_tree.MutationResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const members = reconfig.parseConfig(arena.allocator(), config) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .code = .bad_arguments },
+        };
+        _ = members;
+
+        const zxid = try self.clientZxid(index);
+        var batch = rocksdb.WriteBatch.init();
+        defer batch.deinit();
+        if (try self.getNode(reconfig.path)) |value| {
+            var node = value;
+            defer node.deinit(self.allocator);
+            if (expected_version != -1 and expected_version != node.version) {
+                return .{ .code = .bad_version };
+            }
+            const replacement = try self.allocator.dupe(u8, config);
+            self.allocator.free(node.data);
+            node.data = replacement;
+            node.mzxid = zxid;
+            node.mtime = time_ms;
+            node.version += 1;
+            const encoded = try encodeNode(self.allocator, node);
+            defer self.allocator.free(encoded);
+            batch.put(self.default_family, reconfig.path, encoded);
+            batch.put(self.default_family, config_string_key, config);
+            putApplied(&batch, self.default_family, .{ .index = index, .term = term });
+            try self.writeSync(batch);
+            return .{ .code = .ok, .changed = true, .stat = node.stat() };
+        }
+
+        // A config node that was never seeded starts at version 0, matching
+        // the upstream initial configVersion.
+        if (expected_version > 0) return .{ .code = .bad_version };
+        const node = Node{
+            .data = try self.allocator.dupe(u8, config),
+            .czxid = zxid,
+            .mzxid = zxid,
+            .ctime = time_ms,
+            .mtime = time_ms,
+            .pzxid = zxid,
+        };
+        defer self.allocator.free(node.data);
+        const encoded = try encodeNode(self.allocator, node);
+        defer self.allocator.free(encoded);
+        batch.put(self.default_family, reconfig.path, encoded);
+        batch.put(self.default_family, config_string_key, config);
+        putApplied(&batch, self.default_family, .{ .index = index, .term = term });
+        try self.writeSync(batch);
+        return .{ .code = .ok, .changed = true, .stat = node.stat() };
+    }
+
     const NodeUpdate = struct {
         path: []const u8,
         node: Node,
@@ -2698,4 +2842,68 @@ test "multi watch events retain intermediate state and deletion ACLs" {
     try testing.expectEqual(data_tree.MutationEventType.node_created, transient.events.?[0].type);
     try testing.expectEqual(data_tree.MutationEventType.node_data_changed, transient.events.?[2].type);
     try testing.expectEqual(data_tree.MutationEventType.node_deleted, transient.events.?[3].type);
+}
+
+test "reconfig seeds a config baseline and applies version-checked updates" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+
+    const members = [_]reconfig.Member{
+        .{ .id = 1, .address = "127.0.0.1:2881" },
+        .{ .id = 2, .address = "127.0.0.1:2882" },
+    };
+    try store.ensureConfigBaseline(&members);
+
+    const baseline = (try store.getData(testing.allocator, reconfig.path)).?;
+    defer if (baseline.data) |value| testing.allocator.free(value);
+    try testing.expectEqualStrings(
+        "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:participant",
+        baseline.data.?,
+    );
+    try testing.expectEqual(@as(i32, 0), baseline.stat.version);
+
+    // Seeding twice keeps the first baseline.
+    try store.ensureConfigBaseline(&members);
+    const seeded = (try store.configString(testing.allocator)).?;
+    defer testing.allocator.free(seeded);
+    try testing.expectEqualStrings(baseline.data.?, seeded);
+
+    const replacement = "server.1=127.0.0.1:3881:participant\nserver.3=127.0.0.1:3883:observer";
+    var applied = try store.apply(.{ .reconfig = .{
+        .config = replacement,
+        .expected_version = 0,
+        .time_ms = 10,
+    } }, 1, 1);
+    defer applied.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.ok, applied.code);
+    try testing.expectEqual(@as(i32, 1), applied.stat.?.version);
+
+    // A stale curConfigId fails the compare-and-set.
+    var stale = try store.apply(.{ .reconfig = .{
+        .config = replacement,
+        .expected_version = 0,
+        .time_ms = 11,
+    } }, 2, 1);
+    defer stale.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.bad_version, stale.code);
+
+    // A malformed member list is rejected without touching the node.
+    var malformed = try store.apply(.{ .reconfig = .{
+        .config = "not-a-config",
+        .expected_version = -1,
+        .time_ms = 12,
+    } }, 3, 1);
+    defer malformed.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.bad_arguments, malformed.code);
+
+    const updated = (try store.getData(testing.allocator, reconfig.path)).?;
+    defer if (updated.data) |value| testing.allocator.free(value);
+    try testing.expectEqualStrings(replacement, updated.data.?);
+    try testing.expectEqual(@as(i32, 1), updated.stat.version);
 }

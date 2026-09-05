@@ -308,6 +308,25 @@ matching `zookeeper.4lw.commands.whitelist`. While a node has no leader,
 state-dependent commands reply `This server is not currently serving
 requests`.
 
+## Dynamic membership (reconfig)
+
+Start the server with `--reconfig-enabled` to accept the ZooKeeper `reconfig`
+opcode. Requests take the upstream incremental form
+(`joiningServers`/`leavingServers`) or the bulk `newMembers` form, guarded by
+`curConfigId` against the version of `/zookeeper/config`; `-1` skips the
+check and concurrent reconfigs answer `ReconfigInProgress` (-14). The
+reply is a `GetDataResponse` carrying the new config string and the node
+stat, matching upstream. Member entries use `server.<id>=<host>:<raft_port>`
+with an optional `participant`/`observer` role; the upstream three- and
+four-port spellings and `;<client address>` suffixes are accepted and
+ignored (the Raft port is the first port). The canonical config is stored
+at `/zookeeper/config` (watchable, version = configVersion), and each node
+seeds a baseline from its static `--peer` list before its first start.
+After a reconfig commits, the Raft leader reconciles cluster membership one
+change at a time — adds and address updates before removes. If the leader
+dies in the window between commit and reconciliation, any retry of the same
+reconfig completes the membership change idempotently.
+
 ## Roadmap
 
 1. Complete reconnect and high-level client APIs.
