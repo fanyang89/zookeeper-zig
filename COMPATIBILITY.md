@@ -52,11 +52,20 @@ Only Java 3.9.5 is currently a verified external-client compatibility claim.
 | Feature | Status | Boundary |
 | --- | --- | --- |
 | `world`, `auth`, `digest`, IPv4 `ip` ACL identities | **Implemented** | Includes IPv4 CIDR masks and ACL enforcement on reads, writes, watches, and administrative deletes. |
-| SASL / DIGEST-MD5 | **Unsupported** | The opcode is recognized, but no SASL mechanism is negotiated. |
+| SASL opcode, no configured mechanism | **Implemented** | Empty/nonempty and repeated tokens receive ZooKeeper 3.9.5's `OK`, zxid `0`, and a Jute null response token (not empty). No authenticated identity is added; ACLs remain enforced. Native tests and `SaslInteropTest` cover the baseline and safe rejection of null/malformed/truncated/oversized requests. |
+| Full SASL authentication / DIGEST-MD5 | **Unsupported** | No SASL mechanism, JAAS configuration, or SASL identity is supported (FAN-10). An `OK` SASL opcode reply is not authentication success. |
 | X.509 client identity | **Unsupported** | No secure client port or certificate authentication. |
 | `super` digest | **Unsupported** | No administrative bypass identity. |
 | TLS client port | **Unsupported** | Client connections are plaintext TCP. |
 | TLS or authenticated Raft transport | **Unsupported** | Peer transport has no TLS or quorum authentication. Deploy only on a trusted network boundary. |
+
+The no-mechanism SASL behavior follows Apache ZooKeeper 3.9.5
+`ZooKeeperServer.processSasl`: without a SASL server, a non-null request token
+gets a null challenge and no auth identity. Null request tokens close the
+connection safely (upstream accesses their length before its exception handler).
+`ZooKeeperSaslClient.createSaslToken` treats a null server challenge during an
+incomplete exchange as authentication failure, not successful negotiation.
+This baseline does not enable SASL-required configurations or secure transport.
 
 ## Server roles and ensemble compatibility
 

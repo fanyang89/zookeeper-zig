@@ -895,6 +895,7 @@ pub const TcpServer = struct {
                 return false;
             },
             .auth => try self.authenticate(transport, context, body),
+            .sasl => try sendSaslReply(transport, self.allocator, self.io, xid, body),
             .create, .create2, .create_container => try self.create(transport, session, context.identities.items, xid, opcode, body),
             .create_ttl => try self.createTtl(transport, session, context.identities.items, xid, body),
             .delete => try self.delete(transport, session, context.identities.items, xid, body),
@@ -2265,6 +2266,26 @@ fn decodeBody(comptime T: type, bytes: []const u8, allocator: std.mem.Allocator)
     return value;
 }
 
+fn sendSaslReply(
+    transport: *ResponseSink,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    xid: i32,
+    bytes: []const u8,
+) !void {
+    const request = try decodeBody(protocol.proto.GetSASLRequest, bytes, allocator);
+    defer jute.deinitDecoded(request, allocator);
+    if (request.token == null) return error.InvalidSaslToken;
+
+    // ZooKeeper 3.9.5 processSasl with no configured server mechanism returns
+    // a null challenge, not authentication success. Never add an identity.
+    try sendReply(transport, allocator, io, .{
+        .xid = xid,
+        .zxid = 0,
+        .err = 0,
+    }, protocol.proto.SetSASLResponse{ .token = null });
+}
+
 fn sendFailedConnect(
     transport: *ResponseSink,
     allocator: std.mem.Allocator,
@@ -2966,6 +2987,47 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     try testing.expect((try quorum.machine.getSession(session_id)) == null);
     try testing.expect((try quorum.machine.exists(ephemeral_path)) == null);
     try quorum.shutdown();
+}
+
+test "SASL no-mechanism reply has a null token and zero zxid" {
+    const testing = std.testing;
+    for ([_][]const u8{ "", "untrusted-token", "" }, 0..) |token, index| {
+        var request = jute.Writer.init(testing.allocator);
+        defer request.deinit();
+        try jute.serialize(&request, protocol.proto.GetSASLRequest{ .token = token });
+        var sink = ResponseSink{};
+        defer sink.deinit(testing.allocator);
+        const xid: i32 = @intCast(index + 1);
+        try sendSaslReply(&sink, testing.allocator, testing.io, xid, request.bytes());
+        var reader = jute.Reader.init(sink.frame.?);
+        try testing.expectEqual(@as(i32, 20), try reader.readInt());
+        const header = try jute.deserialize(protocol.proto.ReplyHeader, &reader, testing.allocator);
+        try testing.expectEqual(xid, header.xid);
+        try testing.expectEqual(@as(i64, 0), header.zxid);
+        try testing.expectEqual(@as(i32, 0), header.err);
+        // An empty token would encode as zero, which means something different.
+        try testing.expectEqual(@as(i32, -1), try reader.readInt());
+        try testing.expectEqual(@as(usize, 0), reader.remaining());
+    }
+}
+
+test "SASL rejects null malformed truncated and oversized records without a reply" {
+    const testing = std.testing;
+    const cases = [_]struct { bytes: []const u8, err: anyerror }{
+        .{ .bytes = &.{}, .err = error.EndOfStream },
+        .{ .bytes = &.{ 0, 0, 0 }, .err = error.EndOfStream },
+        .{ .bytes = &.{ 0, 0, 0, 2, 1 }, .err = error.EndOfStream },
+        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff }, .err = error.InvalidSaslToken },
+        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xfe }, .err = error.InvalidLength },
+        .{ .bytes = &.{ 0x7f, 0xff, 0xff, 0xff }, .err = error.LengthLimitExceeded },
+        .{ .bytes = &.{ 0, 0, 0, 1, 1, 2 }, .err = error.TrailingData },
+    };
+    for (cases) |case| {
+        var sink = ResponseSink{};
+        defer sink.deinit(testing.allocator);
+        try testing.expectError(case.err, sendSaslReply(&sink, testing.allocator, testing.io, 1, case.bytes));
+        try testing.expectEqual(null, sink.frame);
+    }
 }
 
 test "setWatches validates every path before registration" {
