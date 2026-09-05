@@ -79,3 +79,66 @@ jobs:
 
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}
+
+  interop:
+    name: Interop (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      options: --security-opt seccomp=unconfined
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      ZOOKEEPER_MAVEN_MIRROR: central
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: java-client
+            command: zig build test-interop-java -Dsystem-rocksdb=true --summary all
+          - suite: upstream-server
+            command: zig build test-upstream-server -Dsystem-rocksdb=true --summary all
+
+    steps:
+      - name: Install Fedora toolchain
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False \
+            binutils cmake git make ninja-build zig \
+            python3 maven pkgconf-pkg-config rocksdb-devel snappy-devel
+          test "$(zig version)" = "0.16.0"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Cache Zig dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            zig-pkg
+          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-fedora-44-${{ runner.arch }}-
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: interop-maven-zookeeper-3.9.5-${{ runner.arch }}-v1
+
+      - name: Cache Apache ZooKeeper source
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zookeeper-zig
+          key: interop-zookeeper-src-3.9.5-${{ runner.arch }}-v1
+
+      - name: Run ${{ matrix.suite }}
+        run: ${{ matrix.command }}
