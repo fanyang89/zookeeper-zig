@@ -4,7 +4,8 @@ Formal models of the correctness-critical replicated components, checked
 with TLC bounded model checking. The specs abstract Raft into the totally
 ordered log the state machine sees and model exactly the interleavings the
 implementation permits, mirroring `src/server/rocks_store.zig` operation by
-operation.
+operation. [`REFINEMENT.md`](REFINEMENT.md) maps every abstract variable and
+action to its concrete Zig representation.
 
 ## SessionTracker
 
