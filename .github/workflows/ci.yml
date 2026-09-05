@@ -58,12 +58,17 @@ jobs:
             cache-zig: true
             system-rocksdb: true
             timeout-minutes: 15
+          - name: TLA+
+            command: timeout --foreground --kill-after=10s 8m bash tools/tla-check.sh
+            cache-zig: false
+            system-rocksdb: false
+            timeout-minutes: 10
 
     steps:
       - name: Install Fedora toolchain
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
-            binutils cmake git make ninja-build zig
+            binutils cmake git make ninja-build zig java-17-openjdk-headless
           if [[ "${{ matrix.system-rocksdb }}" == true ]]; then
             dnf install --assumeyes --setopt=install_weak_deps=False \
               pkgconf-pkg-config rocksdb-devel snappy-devel

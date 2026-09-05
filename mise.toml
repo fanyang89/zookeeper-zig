@@ -38,3 +38,6 @@ run = "zig build test-fuzz-smoke --summary all"
 
 [tasks.fuzz-wire]
 run = "zig build fuzz-wire --summary all"
+
+[tasks.tla-check]
+run = "bash tools/tla-check.sh"

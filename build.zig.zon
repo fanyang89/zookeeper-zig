@@ -21,6 +21,7 @@
         "build.zig",
         "build.zig.zon",
         "schema",
+        "tla",
         "LICENSE",
         "README.md",
         "src",

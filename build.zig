@@ -165,6 +165,11 @@ pub fn build(b: *std.Build) void {
         test_fuzz_smoke.dependOn(&fuzz_smoke.step);
     }
 
+    const tla_check = b.addSystemCommand(&.{"bash"});
+    tla_check.addFileArg(b.path("tools/tla-check.sh"));
+    const test_tla = b.step("test-tla", "Run TLA+ TLC bounded model checks");
+    test_tla.dependOn(&tla_check.step);
+
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");
     check_zig.dependOn(&tests.step);
     const check_jute = b.step("check-jute", "Alias for check-zig");

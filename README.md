@@ -346,6 +346,20 @@ change at a time — adds and address updates before removes. If the leader
 dies in the window between commit and reconciliation, any retry of the same
 reconfig completes the membership change idempotently.
 
+## Formal verification (TLA+)
+
+Correctness-critical replicated components are modeled in TLA+ and checked
+with TLC bounded model checking: the session tracker (touch/reap races,
+the expire compare-and-set, reconnect generation fencing, the replicated
+term-checked clock) and container/TTL cleanup (the czxid recreate fence).
+Both models complete exhaustive state-space searches in seconds and are
+mutation-validated — removing any guard breaks a corresponding invariant.
+See [`tla/README.md`](tla/README.md).
+
+```sh
+mise run tla-check
+```
+
 ## Roadmap
 
 1. Complete reconnect and high-level client APIs.
