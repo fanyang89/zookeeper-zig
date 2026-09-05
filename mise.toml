@@ -41,3 +41,6 @@ run = "zig build fuzz-wire --summary all"
 
 [tasks.tla-check]
 run = "bash tools/tla-check.sh"
+
+[tasks.apalache-check]
+run = "bash tools/apalache-check.sh"

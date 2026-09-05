@@ -348,16 +348,16 @@ reconfig completes the membership change idempotently.
 
 ## Formal verification (TLA+)
 
-Correctness-critical replicated components are modeled in TLA+ and checked
-with TLC bounded model checking: the session tracker (touch/reap races,
-the expire compare-and-set, reconnect generation fencing, the replicated
-term-checked clock) and container/TTL cleanup (the czxid recreate fence).
-Both models complete exhaustive state-space searches in seconds and are
-mutation-validated — removing any guard breaks a corresponding invariant.
-See [`tla/README.md`](tla/README.md).
+Correctness-critical replicated components are modeled in TLA+: session
+tracking, container/TTL cleanup fencing, `multi` atomicity, linearizable
+reads, and watch delivery. TLC exhaustively checks bounded configurations;
+Apalache independently checks the session tracker with larger symbolic
+bounds. The models are mutation-validated, and their concrete mappings and
+external Raft assumptions are documented under [`tla/`](tla/README.md).
 
 ```sh
 mise run tla-check
+mise run apalache-check
 ```
 
 ## Roadmap

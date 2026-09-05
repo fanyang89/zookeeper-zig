@@ -170,6 +170,11 @@ pub fn build(b: *std.Build) void {
     const test_tla = b.step("test-tla", "Run TLA+ TLC bounded model checks");
     test_tla.dependOn(&tla_check.step);
 
+    const apalache_check = b.addSystemCommand(&.{"bash"});
+    apalache_check.addFileArg(b.path("tools/apalache-check.sh"));
+    const test_apalache = b.step("test-apalache", "Run Apalache symbolic model checking");
+    test_apalache.dependOn(&apalache_check.step);
+
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");
     check_zig.dependOn(&tests.step);
     const check_jute = b.step("check-jute", "Alias for check-zig");

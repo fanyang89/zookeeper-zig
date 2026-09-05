@@ -1,7 +1,8 @@
 # TLA+ specifications
 
 Formal models of the correctness-critical replicated components, checked
-with TLC bounded model checking. The specs abstract Raft into the totally
+with TLC exhaustive bounded searches and Apalache symbolic checking. The
+specs abstract Raft into the totally
 ordered log the state machine sees and model exactly the interleavings the
 implementation permits, mirroring `src/server/rocks_store.zig` operation by
 operation. [`REFINEMENT.md`](REFINEMENT.md) maps every abstract variable and
@@ -31,6 +32,12 @@ Checked exhaustively (2,864 distinct states at `MaxClock=6, MaxGen=3,
 Terms={1,2}`). Mutation-validated: removing the expire CAS, dropping the
 touch generation guard, or allowing touch on expired sessions each violates
 an invariant.
+
+Apalache 0.62.2 independently checks the same invariants for 25 symbolic
+steps with larger bounds (`MaxClock=20`, `MaxGen=6`, four terms, and a
+seven-tick lifetime) from `MCSessionTrackerApalache.cfg`. The Snowcat type
+annotations use a fixed `<<present, generation, expiry>>` tuple; TLC confirms
+that this representation has the same 2,864-state bounded graph as before.
 
 ## ContainerCleanup
 
@@ -128,13 +135,14 @@ are documented outside this active-connection safety model.
 ## Running
 
 ```sh
-mise run tla-check   # or: bash tools/tla-check.sh
+mise run tla-check       # or: bash tools/tla-check.sh
+mise run apalache-check  # or: bash tools/apalache-check.sh
 ```
 
-The script pins `tla2tools` 1.7.0 by SHA-256, caches it under
-`~/.cache/zookeeper-zig`, and runs TLC for all five configurations. Bounded
-state budgets are set by the constants in the `.cfg` files; all runs complete
-exhaustively in seconds on a laptop.
+The scripts pin `tla2tools` 1.7.0 and Apalache 0.62.2 by upstream SHA-256
+and cache them under `~/.cache/zookeeper-zig`. TLC runs all five bounded
+configurations exhaustively in seconds. Apalache checks the larger session
+configuration to depth 25 in roughly 30 seconds on a laptop.
 
 ## Verification boundary
 

@@ -59,10 +59,12 @@ jobs:
             system-rocksdb: true
             timeout-minutes: 15
           - name: TLA+
-            command: timeout --foreground --kill-after=10s 8m bash tools/tla-check.sh
+            command: |
+              timeout --foreground --kill-after=10s 8m bash tools/tla-check.sh
+              timeout --foreground --kill-after=10s 8m bash tools/apalache-check.sh
             cache-zig: false
             system-rocksdb: false
-            timeout-minutes: 10
+            timeout-minutes: 15
 
     steps:
       - name: Install Fedora toolchain
@@ -88,6 +90,13 @@ jobs:
           key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
             zig-fedora-44-${{ runner.arch }}-
+
+      - name: Cache formal verification toolchains
+        if: matrix.name == 'TLA+'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zookeeper-zig
+          key: formal-tools-tla-1.7.0-apalache-0.62.2-${{ runner.arch }}
 
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}

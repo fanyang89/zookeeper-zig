@@ -34,38 +34,55 @@ EXTENDS Integers, Naturals
 (* Renewal sets expires = clock + Timeout + Grace (renewedExpiry).         *)
 (***************************************************************************)
 
-CONSTANTS Timeout,      (* session lifetime in clock ticks                   *)
-          Grace,        (* extra grace added to every renewal                *)
-          MaxClock,     (* bound on the session clock                        *)
-          MaxGen,       (* bound on session generations                      *)
-          Terms         (* the set of Raft terms (leader changes)            *)
+CONSTANTS
+    \* @type: Int;
+    Timeout,      (* session lifetime in clock ticks                   *)
+    \* @type: Int;
+    Grace,        (* extra grace added to every renewal                *)
+    \* @type: Int;
+    MaxClock,     (* bound on the session clock                        *)
+    \* @type: Int;
+    MaxGen,       (* bound on session generations                      *)
+    \* @type: Set(Int);
+    Terms         (* the set of Raft terms (leader changes)            *)
 
-VARIABLES clock,         (* replicated session clock                          *)
-          term,          (* current Raft term                                 *)
-          st,            (* Absent or Present(gen, exp)                       *)
-          scan,         (* -1 (none) or the expiry the reaper scanned          *)
-          lastRenewClock,(* clock at the last successful renewal              *)
-          lastRenewGen,  (* generation that performed the last renewal        *)
-          maxGen,        (* highest generation of this incarnation            *)
-          removal,       (* None, Expired, or Closed                          *)
-          removedClock,  (* clock at which the session was removed            *)
-          expiredAt      (* -1 (none) or the clock when the session expired    *)
+VARIABLES
+    \* @type: Int;
+    clock,         (* replicated session clock                          *)
+    \* @type: Int;
+    term,          (* current Raft term                                 *)
+    \* @type: <<Bool, Int, Int>>;
+    st,            (* <<present, generation, expiry>>                   *)
+    \* @type: Int;
+    scan,          (* -1 (none) or the expiry the reaper scanned        *)
+    \* @type: Int;
+    lastRenewClock,(* clock at the last successful renewal              *)
+    \* @type: Int;
+    lastRenewGen,  (* generation that performed the last renewal        *)
+    \* @type: Int;
+    maxGen,        (* highest generation of this incarnation            *)
+    \* @type: Str;
+    removal,       (* "none", "expired", or "closed"                   *)
+    \* @type: Int;
+    removedClock,  (* clock at which the session was removed            *)
+    \* @type: Int;
+    expiredAt      (* -1 (none) or clock when the session expired       *)
 
 TypeOK ==
     /\ clock \in 0..MaxClock
     /\ term \in Terms
-    /\ st \in {<<"absent">>} \union
-              {<<"present", g, e>> : g \in 1..MaxGen, e \in 0..MaxClock + Timeout + Grace}
+    /\ st \in {<<FALSE, 0, 0>>} \union
+              {<<TRUE, g, e>> : g \in 1..MaxGen, e \in 0..MaxClock + Timeout + Grace}
     /\ scan \in -1..MaxClock + Timeout + Grace
     /\ lastRenewClock \in 0..MaxClock
     /\ lastRenewGen \in 1..MaxGen
     /\ maxGen \in 1..MaxGen
-    /\ removal \in {<<"none">>, <<"expired">>, <<"closed">>}
+    /\ removal \in {"none", "expired", "closed"}
     /\ removedClock \in 0..MaxClock
     /\ expiredAt \in -1..MaxClock
 
-Absent == st[1] = "absent"
-Present == st[1] = "present"
+Absent == ~st[1]
+Present == st[1]
 Gen == st[2]
 Exp == st[3]
 
@@ -96,9 +113,9 @@ ChangeTerm ==
 Open(g) ==
     /\ Absent
     /\ g \in 1..MaxGen
-    /\ st' = <<"present", g, clock + Lifetime>>
+    /\ st' = <<TRUE, g, clock + Lifetime>>
     /\ maxGen' = g
-    /\ removal' = <<"none">>
+    /\ removal' = "none"
     /\ expiredAt' = -1
     /\ lastRenewClock' = clock
     /\ lastRenewGen' = g
@@ -111,7 +128,7 @@ Touch(g) ==
     /\ g \in 1..MaxGen
     /\ Gen = g
     /\ Exp > clock
-    /\ st' = <<"present", Gen, clock + Lifetime>>
+    /\ st' = <<TRUE, Gen, clock + Lifetime>>
     /\ lastRenewClock' = clock
     /\ lastRenewGen' = g
     /\ UNCHANGED <<clock, term, scan, maxGen, removal, removedClock, expiredAt>>
@@ -123,7 +140,7 @@ Move(g) ==
     /\ g \in 1..MaxGen - 1
     /\ Gen = g
     /\ Exp > clock
-    /\ st' = <<"present", Gen + 1, clock + Lifetime>>
+    /\ st' = <<TRUE, Gen + 1, clock + Lifetime>>
     /\ maxGen' = Gen + 1
     /\ lastRenewClock' = clock
     /\ lastRenewGen' = Gen + 1
@@ -135,8 +152,8 @@ Close(g) ==
     /\ Present
     /\ g \in 1..MaxGen
     /\ Gen = g
-    /\ st' = <<"absent">>
-    /\ removal' = <<"closed">>
+    /\ st' = <<FALSE, 0, 0>>
+    /\ removal' = "closed"
     /\ removedClock' = clock
     /\ UNCHANGED <<clock, term, scan, lastRenewClock, lastRenewGen, maxGen,
                     expiredAt>>
@@ -155,8 +172,8 @@ Scan ==
 Expire ==
     /\ scan # -1
     /\ IF Present /\ Exp = scan /\ Exp <= clock
-       THEN /\ st' = <<"absent">>
-            /\ removal' = <<"expired">>
+       THEN /\ st' = <<FALSE, 0, 0>>
+            /\ removal' = "expired"
             /\ removedClock' = clock
        ELSE /\ UNCHANGED <<st, removal, removedClock>>
     /\ scan' = -1
@@ -175,12 +192,12 @@ MarkExpired ==
 Init ==
     /\ clock = 0
     /\ term = CHOOSE t \in Terms : TRUE
-    /\ st = <<"absent">>
+    /\ st = <<FALSE, 0, 0>>
     /\ scan = -1
     /\ lastRenewClock = 0
     /\ lastRenewGen = 1
     /\ maxGen = 1
-    /\ removal = <<"none">>
+    /\ removal = "none"
     /\ removedClock = 0
     /\ expiredAt = -1
 
@@ -202,20 +219,20 @@ Next ==
 NoPrematureExpiry ==
     (* A session removed by the reaper lived at least its full last        *)
     (* renewal lifetime: no scan/expire race can kill a live session.      *)
-    removal = <<"expired">> => removedClock >= lastRenewClock + Lifetime
+    removal = "expired" => removedClock >= lastRenewClock + Lifetime
 
 GenerationFenced ==
     (* Every successful renewal and removal was performed by the current   *)
     (* generation of the incarnation: a stale connection (pre-Move) never  *)
     (* renewed or closed the session it lost.                              *)
-    /\ (removal = <<"closed">> => lastRenewGen <= maxGen)
-    /\ st[1] = "present" => Gen <= maxGen
+    /\ (removal = "closed" => lastRenewGen <= maxGen)
+    /\ Present => Gen <= maxGen
 
 NoResurrection ==
     (* Once the clock passed a live session's expiry, that session was     *)
     (* never renewed again; only the reaper or an explicit close may end   *)
     (* it.                                                                 *)
-    expiredAt # -1 /\ st[1] = "present" =>
+    expiredAt # -1 /\ Present =>
         lastRenewClock + Lifetime <= clock
 
 StaleGenerationNeverWins ==
