@@ -99,6 +99,31 @@ TLC checks all 138,284 distinct states at `MaxIndex=4, MaxTerm=3`.
 Mutation validation catches a missing apply barrier, failure to cancel reads
 on leadership loss, and an index chosen from stale applied state.
 
+## WatchDelivery
+
+`WatchDelivery.tla` / `MCWatchDelivery.cfg` — delivery semantics for one
+active, authorized connection. It models data/child one-shot watches,
+persistent and persistent-recursive watches, overlapping registrations,
+duplicate registration barriers, exact and descendant events, explicit
+removal, and events before and after response activation.
+
+Invariants:
+
+- `ExactOnceInPublishOrder` — all matching event ids equal the concatenation
+  of delivered and pending ids, proving no loss, duplication, or reordering.
+- `NoDeliveryBeforeResponse` / `PendingHasResponseBarrier` — notifications
+  cannot cross ahead of the response that installed or refreshed a watch.
+- `WatchStateMatchesContract` / `PersistentSurvivesPublish` — matching
+  one-shot watches are consumed, while persistent modes survive until
+  explicitly removed.
+
+TLC checks all 3,701 distinct states with four publish events. Mutation
+validation catches early notification, duplicate or dropped events,
+accidental persistent-watch consumption, and activation-time reordering.
+Connection failure, queue overflow, ACL denial, session invalidation, and
+explicit connection removal terminate or suppress delivery by contract and
+are documented outside this active-connection safety model.
+
 ## Running
 
 ```sh
@@ -106,7 +131,7 @@ mise run tla-check   # or: bash tools/tla-check.sh
 ```
 
 The script pins `tla2tools` 1.7.0 by SHA-256, caches it under
-`~/.cache/zookeeper-zig`, and runs TLC for all four configurations. Bounded
+`~/.cache/zookeeper-zig`, and runs TLC for all five configurations. Bounded
 state budgets are set by the constants in the `.cfg` files; all runs complete
 exhaustively in seconds on a laptop.
 
@@ -134,5 +159,10 @@ entries, and detaches pending callbacks on leadership loss.
 The state-machine specs verify guards, CAS fencing, atomic publication, and
 the replicated clock after that boundary. They additionally assume
 server-generated session passwords are unique per incarnation, which fences
-cross-incarnation confusion together with generations. Mixed Java/Zig Raft
+cross-incarnation confusion together with generations.
+
+The watch model begins after ACL authorization and assumes an active sink
+with sufficient pending-event capacity. Sink failure, queue overflow,
+session invalidation, and connection removal deactivate the connection and
+therefore intentionally end its delivery obligations. Mixed Java/Zig Raft
 ensembles remain outside the compatibility and verification boundary.
