@@ -1227,3 +1227,53 @@ test "session-rejected multi returns an error after advancing applied state" {
     try testing.expectEqual(data_tree.ErrorCode.session_moved, rejected.code);
     try testing.expectEqual(@as(u64, 2), machine.appliedIndex());
 }
+
+test "reconfig v6 replay preserves historical role changes across reopen" {
+    const testing = std.testing;
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    // Fixed v6 Jute bytes: version=6, kind=108, config length=68,
+    // expected_version=0, time_ms=10. Independent of the current encoder.
+    const legacy = "\x00\x00\x00\x06\x00\x00\x00\x6c\x00\x00\x00\x44" ++
+        "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:observer" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0a";
+    const decoded = try command.decode(legacy);
+    try testing.expect(!decoded.reconfig.reject_role_changes);
+    try testing.expectError(error.InvalidCommand, command.encode(testing.allocator, decoded));
+    {
+        var machine = try ZooKeeperStateMachine.init(testing.allocator, path);
+        defer machine.deinit();
+        try machine.store.ensureConfigBaseline(&.{
+            .{ .id = 1, .address = "127.0.0.1:2881" },
+            .{ .id = 2, .address = "127.0.0.1:2882" },
+        });
+        var result = try machine.stateMachine().apply(.{ .index = 1, .term = 1, .data = legacy });
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(data_tree.ErrorCode.ok, (try command.decodeResult(result.response.?)).code);
+    }
+    var reopened = try ZooKeeperStateMachine.init(testing.allocator, path);
+    defer reopened.deinit();
+    const before = (try reopened.getData(testing.allocator, reconfig.path)).?;
+    defer testing.allocator.free(before.data.?);
+    try testing.expectEqualStrings(decoded.reconfig.config, before.data.?);
+    try testing.expectEqual(@as(i32, 1), before.stat.version);
+    try testing.expectEqual(@as(u64, 1), reopened.appliedIndex());
+
+    const encoded = try command.encode(testing.allocator, .{ .reconfig = .{
+        .config = "server.1=127.0.0.1:2881:participant,server.2=127.0.0.1:2882:participant",
+        .expected_version = before.stat.version,
+        .time_ms = 11,
+    } });
+    defer testing.allocator.free(encoded);
+    try testing.expect((try command.decode(encoded)).reconfig.reject_role_changes);
+    var rejected = try reopened.stateMachine().apply(.{ .index = 2, .term = 1, .data = encoded });
+    defer rejected.deinit(testing.allocator);
+    try testing.expectEqual(data_tree.ErrorCode.bad_arguments, (try command.decodeResult(rejected.response.?)).code);
+    const after = (try reopened.getData(testing.allocator, reconfig.path)).?;
+    defer testing.allocator.free(after.data.?);
+    try testing.expectEqualStrings(before.data.?, after.data.?);
+    try testing.expectEqualDeep(before.stat, after.stat);
+    try testing.expectEqual(@as(u64, 2), reopened.appliedIndex());
+}

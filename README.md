@@ -407,6 +407,19 @@ change at a time — adds and address updates before removes. If the leader
 dies in the window between commit and reconciliation, any retry of the same
 reconfig completes the membership change idempotently.
 
+Same-ID participant/observer transitions are unsupported and fail closed with
+`BadArguments` before changing the committed config or its version (both
+incremental and bulk requests). Fresh IDs and same-role address updates are
+unaffected; this does not establish full observer serving support. In particular,
+the incremental parser currently rejects observer-only joining lists.
+
+Replicated command format v7 enforces this guard at apply time against the
+committed config. Historical v6 commands retain their original apply semantics
+on replay/catch-up, including previously accepted role changes; upgrading does
+not repair those configurations. Upgrade the Zig ensemble together: old binaries
+reject v7 commands, mixed old/new Zig ensembles and downgrade after v7 writes
+are unsupported. This is a storage-command version, not a ZooKeeper wire change.
+
 ## Formal verification (TLA+)
 
 Correctness-critical replicated components are modeled in TLA+: session

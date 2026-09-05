@@ -263,6 +263,7 @@ pub const RocksStore = struct {
                 request.config,
                 request.expected_version,
                 request.time_ms,
+                request.reject_role_changes,
                 index,
                 term,
             ),
@@ -1996,6 +1997,7 @@ pub const RocksStore = struct {
         config: []const u8,
         expected_version: i32,
         time_ms: i64,
+        reject_role_changes: bool,
         index: u64,
         term: u64,
     ) !data_tree.MutationResult {
@@ -2005,7 +2007,6 @@ pub const RocksStore = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .code = .bad_arguments },
         };
-        _ = members;
 
         const zxid = try self.clientZxid(index);
         var batch = rocksdb.WriteBatch.init();
@@ -2015,6 +2016,22 @@ pub const RocksStore = struct {
             defer node.deinit(self.allocator);
             if (expected_version != -1 and expected_version != node.version) {
                 return .{ .code = .bad_version };
+            }
+            if (reject_role_changes) {
+                // Validate against the committed config under the state-machine
+                // lock, not a potentially stale request-side membership view.
+                // The reconciler cannot safely drive same-ID role transitions.
+                const current = reconfig.parseConfig(arena.allocator(), node.data) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return .{ .code = .bad_arguments },
+                };
+                for (members) |member| {
+                    for (current) |previous| {
+                        if (member.id == previous.id and member.observer != previous.observer) {
+                            return .{ .code = .bad_arguments };
+                        }
+                    }
+                }
             }
             const replacement = try self.allocator.dupe(u8, config);
             self.allocator.free(node.data);
@@ -2977,4 +2994,64 @@ test "allChildrenNumber counts descendants recursively" {
     try testing.expectEqual(@as(?usize, 1), try store.allChildrenNumber(testing.allocator, "/a/b"));
     try testing.expectEqual(@as(?usize, 0), try store.allChildrenNumber(testing.allocator, "/a/d"));
     try testing.expectEqual(@as(?usize, null), try store.allChildrenNumber(testing.allocator, "/missing"));
+}
+
+test "reconfig rejects same-ID role changes without config mutation" {
+    const testing = std.testing;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    var store = try RocksStore.open(testing.allocator, path);
+    defer store.deinit();
+    const current = [_]reconfig.Member{
+        .{ .id = 1, .address = "127.0.0.1:2881" },
+        .{ .id = 2, .address = "127.0.0.1:2882" },
+        .{ .id = 3, .address = "127.0.0.1:2883", .observer = true },
+    };
+    try store.ensureConfigBaseline(&current);
+    const before = (try store.getData(testing.allocator, reconfig.path)).?;
+    defer testing.allocator.free(before.data.?);
+
+    var index: u64 = 0;
+    for ([_]bool{ false, true }) |incremental| {
+        for ([_]bool{ false, true }) |promote| {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const allocator = arena.allocator();
+            const changes = if (promote)
+                "server.3=127.0.0.1:2883:participant"
+            else
+                "server.1=127.0.0.1:2881:participant,server.2=127.0.0.1:2882:observer";
+            var target = try allocator.dupe(reconfig.Member, &current);
+            if (incremental) {
+                target = try reconfig.applyChanges(allocator, &current, changes, null);
+            } else {
+                target[if (promote) @as(usize, 2) else 1].observer = !promote;
+            }
+            const config = try reconfig.formatConfig(allocator, target);
+            index += 1;
+            var rejected = try store.apply(.{ .reconfig = .{
+                .config = config,
+                .expected_version = if (incremental) -1 else before.stat.version,
+                .time_ms = 10,
+            } }, index, 1);
+            defer rejected.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.bad_arguments, rejected.code);
+            try testing.expect(!rejected.changed);
+            const after = (try store.getData(allocator, reconfig.path)).?;
+            try testing.expectEqualStrings(before.data.?, after.data.?);
+            try testing.expectEqualDeep(before.stat, after.stat);
+            try testing.expectEqualStrings(before.data.?, (try store.configString(allocator)).?);
+        }
+    }
+    // A rejected request does not poison subsequent valid address updates.
+    var accepted = try store.apply(.{ .reconfig = .{
+        .config = "server.1=127.0.0.1:3881:participant,server.2=127.0.0.1:2882:participant,server.3=127.0.0.1:2883:observer",
+        .expected_version = before.stat.version,
+        .time_ms = 11,
+    } }, index + 1, 1);
+    defer accepted.deinit(testing.allocator);
+    try testing.expectEqual(ErrorCode.ok, accepted.code);
+    try testing.expectEqual(before.stat.version + 1, accepted.stat.?.version);
 }

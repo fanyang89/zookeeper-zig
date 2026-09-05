@@ -110,6 +110,47 @@ public final class ReconfigInteropTest {
         }
     }
 
+    @Test
+    @Timeout(value = 120)
+    public void testRoleChangeRejectedWithoutConfigMutation() throws Exception {
+        try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
+                 System.getProperty("zookeeper.zig.server"),
+                 testDirectory,
+                 OPERATION_TIMEOUT_MILLIS);
+             ZooKeeperAdmin admin = connectAdmin(cluster.nodeConnectString(0))) {
+            Stat before = new Stat();
+            String config = text(admin.getConfig(false, before));
+            String observer = cluster.memberConfig(2).replace(":participant", ":observer");
+            java.util.List<String> unchanged = java.util.Arrays.asList(
+                cluster.memberConfig(0), cluster.memberConfig(1), cluster.memberConfig(2));
+            java.util.List<String> bulk = java.util.Arrays.asList(
+                cluster.memberConfig(0), cluster.memberConfig(1), observer);
+            // Include an unchanged participant: the existing incremental parser
+            // rejects an observer-only joining list even before role validation.
+            java.util.List<String> incremental = java.util.Arrays.asList(cluster.memberConfig(0), observer);
+            assertThrows(KeeperException.BadArgumentsException.class,
+                () -> admin.reconfigure(incremental, null, null, -1, new Stat()));
+            assertConfigUnchanged(admin, config, before);
+            assertThrows(KeeperException.BadArgumentsException.class,
+                () -> admin.reconfigure(null, null, bulk, before.getVersion(), new Stat()));
+            assertConfigUnchanged(admin, config, before);
+
+            Stat accepted = new Stat();
+            assertEquals(config, text(admin.reconfigure(null, null, unchanged, before.getVersion(), accepted)));
+            assertEquals(before.getVersion() + 1, accepted.getVersion());
+            // Node 3 must still vote: with node 2 down, nodes 1+3 can commit.
+            cluster.stopNode(1);
+            createEventually(admin, "/after-rejected-role-change");
+        }
+    }
+
+    private static void assertConfigUnchanged(ZooKeeper client, String expected, Stat before) throws Exception {
+        Stat after = new Stat();
+        assertEquals(expected, text(client.getConfig(false, after)));
+        assertEquals(before.getVersion(), after.getVersion());
+        assertEquals(before.getMzxid(), after.getMzxid());
+    }
+
     private static ZooKeeper connect(String connectString) throws Exception {
         ConnectedWatcher watcher = new ConnectedWatcher();
         ZooKeeper client = new ZooKeeper(connectString, SESSION_TIMEOUT_MILLIS, watcher);

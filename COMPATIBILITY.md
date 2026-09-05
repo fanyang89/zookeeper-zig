@@ -72,7 +72,7 @@ This baseline does not enable SASL-required configurations or secure transport.
 | Feature | Status | Boundary |
 | --- | --- | --- |
 | Single-node and voting Raft ensembles | **Implemented** | Real quorum tests cover persistence, replication, partition, and restart; local sandbox execution may require an unrestricted `io_uring` seccomp profile. |
-| Observer membership in reconfiguration | **Partial** | `observer` members map to Raft learners. Full upstream Observer serving semantics are not implemented. |
+| Observer membership in reconfiguration | **Partial** | Fresh `observer` members map to Raft learners, but observer-only incremental joining lists are rejected. Same-ID role transitions fail with `BadArguments` without changing config bytes/version; role-aware reconciliation and full upstream Observer serving semantics are unsupported. Historical v6 log replay preserves old behavior; v7 requires coordinated Zig upgrades (no mixed-version ensemble or downgrade after v7 writes). |
 | Read-only mode during partition | **Unsupported** | Connect framing negotiates the field, but the server does not enter upstream read-only mode and `isro` remains false. |
 | Mixed Java/Zig ensemble | **Unsupported** | Java servers speak ZAB peer protocols; Zig servers speak `raftz`. They cannot form one ensemble. |
 | Rolling migration between Java and Zig servers | **Unsupported** | Migration requires an offline one-way import into a new Zig ensemble. |

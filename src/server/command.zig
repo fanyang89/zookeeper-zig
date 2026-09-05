@@ -4,7 +4,7 @@ const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
 const multi = @import("multi.zig");
 
-pub const version: i32 = 6;
+pub const version: i32 = 7;
 pub const legacy_version: i32 = 1;
 
 pub const Kind = enum(i32) {
@@ -109,6 +109,9 @@ pub const Mutation = union(Kind) {
         config: []const u8,
         expected_version: i32,
         time_ms: i64,
+        // Only decoded v6 entries may bypass role validation during replay.
+        // The encoder refuses to emit this legacy behavior as a v7 command.
+        reject_role_changes: bool = true,
     },
 };
 
@@ -224,6 +227,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
             try writer.writeBuffer(value.identities);
         },
         .reconfig => |value| {
+            if (!value.reject_role_changes) return error.InvalidCommand;
             try writer.writeBuffer(value.config);
             try writer.writeInt(value.expected_version);
             try writer.writeLong(value.time_ms);
@@ -327,6 +331,7 @@ pub fn decode(bytes: []const u8) !Mutation {
                 .config = (try reader.readBuffer()) orelse return error.InvalidCommand,
                 .expected_version = try reader.readInt(),
                 .time_ms = try reader.readLong(),
+                .reject_role_changes = encoded_version >= 7,
             } };
         },
     };

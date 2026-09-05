@@ -152,3 +152,13 @@ Any change that exposes a `MultiState` before commit, changes a session or
 cleanup CAS guard, completes a read before `applied_index`, alters watch
 barrier selection, or changes the external `raftz` guarantees requires an
 update to the corresponding model and this mapping.
+
+## Reconfiguration validation boundary (not modeled)
+
+`RocksStore.applyReconfig` rejects same-ID participant/observer transitions
+against the committed config before its write batch for command format v7.
+Rejection preserves config data/stat and emits no reconfig callback/watch;
+the enclosing applied index may still advance. Historical v6 commands retain
+their original semantics on replay/catch-up. This versioned guard does not model
+or prove Raft role transitions, membership reconciliation completion, or upgrade
+safety; coordinated upgrades are required as described in README.md.
