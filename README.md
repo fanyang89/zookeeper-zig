@@ -278,7 +278,7 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream tests unchanged alongside
 focused interoperability cases. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current 98-test selection
+server starts an isolated Zig server instead. The current 99-test selection
 covers synchronous and asynchronous CRUD, create2, ACL, Stat, version,
 sequential, container, TTL, write-multi, multiRead, one-shot and persistent
 watches, large-data, sync, lifecycle cleanup, error-code, four-letter commands,
@@ -417,8 +417,10 @@ incremental and bulk requests). Fresh IDs and same-role address updates are
 unaffected; this does not establish full observer serving support. In particular,
 the incremental parser currently rejects observer-only joining lists.
 
-Replicated command format v7 enforces this guard at apply time against the
-committed config. Historical v6 commands retain their original apply semantics
+Replicated command format v7 enforces this guard at apply time against private
+persisted membership metadata, not the publicly writable `/zookeeper/config`
+node. Ordinary/multi `setData` and deletion of that node cannot bypass role
+validation; valid same-role reconfiguration can repair its public contents. Historical v6 commands retain their original apply semantics
 on replay/catch-up, including previously accepted role changes; upgrading does
 not repair those configurations. Upgrade the Zig ensemble together: old binaries
 reject v7 commands, mixed old/new Zig ensembles and downgrade after v7 writes

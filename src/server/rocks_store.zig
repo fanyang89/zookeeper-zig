@@ -2017,21 +2017,8 @@ pub const RocksStore = struct {
             if (expected_version != -1 and expected_version != node.version) {
                 return .{ .code = .bad_version };
             }
-            if (reject_role_changes) {
-                // Validate against the committed config under the state-machine
-                // lock, not a potentially stale request-side membership view.
-                // The reconciler cannot safely drive same-ID role transitions.
-                const current = reconfig.parseConfig(arena.allocator(), node.data) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return .{ .code = .bad_arguments },
-                };
-                for (members) |member| {
-                    for (current) |previous| {
-                        if (member.id == previous.id and member.observer != previous.observer) {
-                            return .{ .code = .bad_arguments };
-                        }
-                    }
-                }
+            if (reject_role_changes and !try self.reconfigRolesSupported(arena.allocator(), members, true)) {
+                return .{ .code = .bad_arguments };
             }
             const replacement = try self.allocator.dupe(u8, config);
             self.allocator.free(node.data);
@@ -2048,9 +2035,12 @@ pub const RocksStore = struct {
             return .{ .code = .ok, .changed = true, .stat = node.stat() };
         }
 
-        // A config node that was never seeded starts at version 0, matching
-        // the upstream initial configVersion.
+        // An absent public config node starts at version 0, including after
+        // deletion. Authoritative membership may nevertheless already exist.
         if (expected_version > 0) return .{ .code = .bad_version };
+        if (reject_role_changes and !try self.reconfigRolesSupported(arena.allocator(), members, false)) {
+            return .{ .code = .bad_arguments };
+        }
         const node = Node{
             .data = try self.allocator.dupe(u8, config),
             .czxid = zxid,
@@ -2067,6 +2057,32 @@ pub const RocksStore = struct {
         putApplied(&batch, self.default_family, .{ .index = index, .term = term });
         try self.writeSync(batch);
         return .{ .code = .ok, .changed = true, .stat = node.stat() };
+    }
+
+    fn reconfigRolesSupported(
+        self: *RocksStore,
+        allocator: std.mem.Allocator,
+        target: []const reconfig.Member,
+        public_node_exists: bool,
+    ) !bool {
+        // Called under apply serialization, after CAS. Ordinary/multi setData
+        // and delete can change the public node but not this membership key.
+        const config = (try self.configString(allocator)) orelse
+            // Without either representation there is no known baseline (first
+            // unseeded reconfig). Never derive metadata from public node data.
+            return !public_node_exists;
+        defer allocator.free(config);
+        const current = reconfig.parseConfig(allocator, config) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        defer reconfig.freeMembers(allocator, current);
+        for (target) |member| {
+            for (current) |previous| {
+                if (member.id == previous.id and member.observer != previous.observer) return false;
+            }
+        }
+        return true;
     }
 
     const NodeUpdate = struct {
@@ -3054,4 +3070,187 @@ test "reconfig rejects same-ID role changes without config mutation" {
     defer accepted.deinit(testing.allocator);
     try testing.expectEqual(ErrorCode.ok, accepted.code);
     try testing.expectEqual(before.stat.version + 1, accepted.stat.?.version);
+}
+
+test "reconfig ignores ordinary and multi setData poisoning of public config" {
+    const testing = std.testing;
+    const baseline = "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:participant";
+    const demoted = "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:observer";
+    for ([_]bool{ false, true }) |use_multi| {
+        for ([_][]const u8{ demoted, "not-a-config" }) |poison| {
+            var directory = testing.tmpDir(.{});
+            defer directory.cleanup();
+            const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(path);
+            var store = try RocksStore.open(testing.allocator, path);
+            defer store.deinit();
+            try store.ensureConfigBaseline(&.{
+                .{ .id = 1, .address = "127.0.0.1:2881" },
+                .{ .id = 2, .address = "127.0.0.1:2882" },
+            });
+            var request = jute.Writer.init(testing.allocator);
+            defer request.deinit();
+            try multi.writeHeader(&request, @intFromEnum(multi.Kind.set_data), false, -1);
+            try jute.serialize(&request, protocol.proto.SetDataRequest{
+                .path = reconfig.path,
+                .data = poison,
+                .version = -1,
+            });
+            try multi.writeTerminator(&request);
+            var poisoned = try store.apply(if (use_multi) .{ .multi = .{
+                .body = request.bytes(),
+                .time_ms = 1,
+                .session_id = 0,
+                .session_generation = 0,
+            } } else .{ .set_data = .{
+                .path = reconfig.path,
+                .data = poison,
+                .expected_version = -1,
+                .time_ms = 1,
+            } }, 1, 1);
+            defer poisoned.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.ok, poisoned.code);
+            const before = (try store.getData(testing.allocator, reconfig.path)).?;
+            defer testing.allocator.free(before.data.?);
+            try testing.expectEqualStrings(poison, before.data.?);
+            const metadata = (try store.configString(testing.allocator)).?;
+            defer testing.allocator.free(metadata);
+            try testing.expectEqualStrings(baseline, metadata);
+            var rejected = try store.apply(.{ .reconfig = .{
+                .config = demoted,
+                .expected_version = before.stat.version,
+                .time_ms = 2,
+            } }, 2, 1);
+            defer rejected.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.bad_arguments, rejected.code);
+            try testing.expect(!rejected.changed);
+            const after = (try store.getData(testing.allocator, reconfig.path)).?;
+            defer testing.allocator.free(after.data.?);
+            try testing.expectEqualStrings(before.data.?, after.data.?);
+            try testing.expectEqualDeep(before.stat, after.stat);
+            const after_metadata = (try store.configString(testing.allocator)).?;
+            defer testing.allocator.free(after_metadata);
+            try testing.expectEqualStrings(metadata, after_metadata);
+            var repaired = try store.apply(.{ .reconfig = .{
+                .config = baseline,
+                .expected_version = before.stat.version,
+                .time_ms = 3,
+            } }, 3, 1);
+            defer repaired.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.ok, repaired.code);
+            try testing.expectEqual(before.stat.version + 1, repaired.stat.?.version);
+            const restored = (try store.getData(testing.allocator, reconfig.path)).?;
+            defer testing.allocator.free(restored.data.?);
+            try testing.expectEqualStrings(baseline, restored.data.?);
+        }
+    }
+}
+
+test "reconfig authoritative metadata and public node presence matrix" {
+    const testing = std.testing;
+    const baseline = "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:participant";
+    const demoted = "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:observer";
+    for ([_]?[]const u8{ baseline, "not-a-config", null }) |metadata| {
+        for ([_]bool{ false, true }) |public_exists| {
+            var directory = testing.tmpDir(.{});
+            defer directory.cleanup();
+            const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+            defer testing.allocator.free(path);
+            var store = try RocksStore.open(testing.allocator, path);
+            defer store.deinit();
+            // Both absent is a truly unseeded store, not a claimed repair of
+            // undetectable metadata loss after prior membership.
+            if (metadata != null or public_exists) {
+                try store.ensureConfigBaseline(&.{
+                    .{ .id = 1, .address = "127.0.0.1:2881" },
+                    .{ .id = 2, .address = "127.0.0.1:2882" },
+                });
+                if (!public_exists) {
+                    var deleted = try store.apply(.{ .delete = .{
+                        .path = reconfig.path,
+                        .expected_version = -1,
+                    } }, 1, 1);
+                    defer deleted.deinit(testing.allocator);
+                    try testing.expectEqual(ErrorCode.ok, deleted.code);
+                }
+                var batch = rocksdb.WriteBatch.init();
+                defer batch.deinit();
+                if (metadata) |text| batch.put(store.default_family, config_string_key, text) else batch.delete(store.default_family, config_string_key);
+                try store.writeSync(batch);
+            }
+            const before = try store.getData(testing.allocator, reconfig.path);
+            defer if (before) |value| testing.allocator.free(value.data.?);
+            // Preserve existing CAS precedence even with absent/bad metadata.
+            var stale = try store.apply(.{ .reconfig = .{
+                .config = demoted,
+                .expected_version = 1,
+                .time_ms = 2,
+            } }, 2, 1);
+            defer stale.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.bad_version, stale.code);
+            var result = try store.apply(.{ .reconfig = .{
+                .config = demoted,
+                .expected_version = 0,
+                .time_ms = 3,
+            } }, 3, 1);
+            defer result.deinit(testing.allocator);
+            const unseeded = metadata == null and !public_exists;
+            try testing.expectEqual(if (unseeded) ErrorCode.ok else ErrorCode.bad_arguments, result.code);
+            const after = try store.getData(testing.allocator, reconfig.path);
+            defer if (after) |value| testing.allocator.free(value.data.?);
+            const after_metadata = try store.configString(testing.allocator);
+            defer if (after_metadata) |value| testing.allocator.free(value);
+            if (unseeded) {
+                try testing.expectEqualStrings(demoted, after.?.data.?);
+                try testing.expectEqualStrings(demoted, after_metadata.?);
+                try testing.expectEqual(@as(i32, 0), after.?.stat.version);
+            } else {
+                try testing.expect(!result.changed);
+                if (before) |value| {
+                    try testing.expectEqualStrings(value.data.?, after.?.data.?);
+                    try testing.expectEqualDeep(value.stat, after.?.stat);
+                } else try testing.expect(after == null);
+                if (metadata) |text| {
+                    try testing.expectEqualStrings(text, after_metadata.?);
+                } else try testing.expect(after_metadata == null);
+                const valid_metadata = metadata != null and std.mem.eql(u8, metadata.?, baseline);
+                var repaired = try store.apply(.{ .reconfig = .{
+                    .config = baseline,
+                    .expected_version = 0,
+                    .time_ms = 4,
+                } }, 4, 1);
+                defer repaired.deinit(testing.allocator);
+                try testing.expectEqual(if (valid_metadata) ErrorCode.ok else ErrorCode.bad_arguments, repaired.code);
+                const restored = try store.getData(testing.allocator, reconfig.path);
+                defer if (restored) |value| testing.allocator.free(value.data.?);
+                if (valid_metadata) {
+                    try testing.expectEqualStrings(baseline, restored.?.data.?);
+                    try testing.expectEqual(@as(i32, if (public_exists) 1 else 0), restored.?.stat.version);
+                } else {
+                    if (before) |value| {
+                        try testing.expectEqualStrings(value.data.?, restored.?.data.?);
+                        try testing.expectEqualDeep(value.stat, restored.?.stat);
+                    } else try testing.expect(restored == null);
+                    const still_invalid = try store.configString(testing.allocator);
+                    defer if (still_invalid) |value| testing.allocator.free(value);
+                    if (metadata) |text| {
+                        try testing.expectEqualStrings(text, still_invalid.?);
+                    } else try testing.expect(still_invalid == null);
+                }
+            }
+            // Historical v6 replay must still ignore the new metadata guard,
+            // including absent/malformed metadata. Fixed bytes, not v7 encoding.
+            const legacy = "\x00\x00\x00\x06\x00\x00\x00\x6c\x00\x00\x00\x44" ++
+                "server.1=127.0.0.1:2881:participant\nserver.2=127.0.0.1:2882:observer" ++
+                "\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x0a";
+            const decoded = try command.decode(legacy);
+            try testing.expectError(error.InvalidCommand, command.encode(testing.allocator, decoded));
+            var replayed = try store.apply(decoded, 5, 1);
+            defer replayed.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.ok, replayed.code);
+            const replayed_metadata = (try store.configString(testing.allocator)).?;
+            defer testing.allocator.free(replayed_metadata);
+            try testing.expectEqualStrings(demoted, replayed_metadata);
+        }
+    }
 }

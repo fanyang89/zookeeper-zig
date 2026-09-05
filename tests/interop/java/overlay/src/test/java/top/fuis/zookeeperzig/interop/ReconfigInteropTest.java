@@ -17,6 +17,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.Op;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooDefs;
@@ -232,6 +233,51 @@ public final class ReconfigInteropTest {
             // Node 3 must still vote: with node 2 down, nodes 1+3 can commit.
             cluster.stopNode(1);
             createEventually(admin, "/after-rejected-role-change");
+        }
+    }
+
+    @Test
+    @Timeout(value = 120)
+    public void testPublicConfigPoisonCannotChangeMembership() throws Exception {
+        try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
+                 System.getProperty("zookeeper.zig.server"), testDirectory, OPERATION_TIMEOUT_MILLIS);
+             ZooKeeperAdmin admin = connectAdmin(cluster.nodeConnectString(0))) {
+            String baseline = text(admin.getConfig(false, new Stat()));
+            List<String> members = Arrays.asList(
+                cluster.memberConfig(0), cluster.memberConfig(1), cluster.memberConfig(2));
+            List<String> demoted = Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1),
+                cluster.memberConfig(2).replace(":participant", ":observer"));
+            for (boolean useMulti : new boolean[] {false, true}) {
+                for (String poison : Arrays.asList(String.join("\n", demoted), "not-a-config")) {
+                    byte[] data = poison.getBytes(StandardCharsets.UTF_8);
+                    if (useMulti) {
+                        admin.multi(Collections.singletonList(Op.setData("/zookeeper/config", data, -1)));
+                    } else {
+                        admin.setData("/zookeeper/config", data, -1);
+                    }
+                    Stat poisoned = new Stat();
+                    assertEquals(poison, text(admin.getConfig(false, poisoned)));
+                    assertThrows(KeeperException.BadArgumentsException.class,
+                        () -> admin.reconfigure(null, null, demoted, poisoned.getVersion(), new Stat()));
+                    assertConfigUnchanged(admin, poison, poisoned);
+                    Stat repaired = new Stat();
+                    assertEquals(baseline,
+                        text(admin.reconfigure(null, null, members, poisoned.getVersion(), repaired)));
+                    assertEquals(poisoned.getVersion() + 1, repaired.getVersion());
+                    assertConfigUnchanged(admin, baseline, repaired);
+                }
+            }
+            admin.delete("/zookeeper/config", -1);
+            assertNull(admin.exists("/zookeeper/config", false));
+            assertThrows(KeeperException.BadArgumentsException.class,
+                () -> admin.reconfigure(null, null, demoted, -1, new Stat()));
+            assertNull(admin.exists("/zookeeper/config", false), "rejection must not recreate public node");
+            Stat repaired = new Stat();
+            assertEquals(baseline, text(admin.reconfigure(null, null, members, -1, repaired)));
+            assertEquals(0, repaired.getVersion());
+            // A poisoned/deleted public node did not demote voter 3.
+            cluster.stopNode(1);
+            createEventually(admin, "/after-public-config-repair");
         }
     }
 

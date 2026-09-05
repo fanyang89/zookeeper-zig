@@ -156,7 +156,8 @@ update to the corresponding model and this mapping.
 ## Reconfiguration validation boundary (not modeled)
 
 `RocksStore.applyReconfig` rejects same-ID participant/observer transitions
-against the committed config before its write batch for command format v7.
+against `config_string_key` membership metadata before its write batch for
+command format v7, independent of public config-node contents or existence.
 Rejection preserves config data/stat and emits no reconfig callback/watch;
 the enclosing applied index may still advance. Historical v6 commands retain
 their original semantics on replay/catch-up. This versioned guard does not model

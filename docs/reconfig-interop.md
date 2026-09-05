@@ -13,6 +13,7 @@ called from that pinned source **unchanged**, including their assertions.
 | `officialAdminReplacesVotingMember` | Existing incremental voter removal/join scenario retained. CAS now tests stale and future versions and unchanged config bytes/full Stat. |
 | `testBulkReconfig` | Adapted from upstream lines 466-500: `newMembers` replaces 3 voters with 2, then with 3 using fresh ID 4. Uses explicit successful CAS rather than upstream `-1`. Reuses the same distributed quorum checks as incremental replacement. Excludes upstream seven-node topology, two observers, and simultaneous port changes: they would require unsupported role reconciliation or additional transport lifecycle coverage. |
 | `testRemoveOneAsynchronous` | Adapted from lines 503-539: three instead of five nodes; removes fixed ID 3 (leader or follower) rather than introspecting ZAB leader identity. Uses bounded `CompletableFuture` instead of unbounded monitor wait. Checks success code, path, context identity, data, Stat, and asynchronous stale-CAS error/null payload plus config immutability. Excludes serving/config assertions on the retired node. |
+| `testPublicConfigPoisonCannotChangeMembership` | Additional regression, not an upstream scenario: ordinary and multi `setData` write altered roles or malformed public config data; unsupported bulk changes still fail, preserving public bytes/Stat, and valid repair succeeds. Deletion cannot bypass the guard; a valid repair recreates the node. Positive writes still require the unchanged voter. Native tests inspect authoritative metadata immutability and all metadata/public-node presence combinations. |
 | `testRoleChangeRejectedWithoutConfigMutation` | Negative adaptation of lines 541-616, **not** upstream success semantics. Rejects same-ID voter demotion via incremental and bulk APIs, checks unchanged config bytes/full Stat, accepts a subsequent valid request, and proves the unchanged node still votes. Native tests additionally exercise promotion, both request construction forms, CAS and `-1`, same-role address update, fixed-v6 replay and reopen. No live observer-promotion claim. |
 
 For voter removal, after stopping the other retained voter the removed process
@@ -33,7 +34,22 @@ However, this server's `reconfig.LiveMember`/`diffMembership` compare only IDs
 and addresses; `Quorum.driveMembership` does not reconcile same-ID roles or
 establish safe leader-demotion/completion behavior. We do not change raftz or
 invent a role-transition algorithm here. New same-ID role changes fail closed
-with `BadArguments` at replicated apply time, before config publication.
+with `BadArguments` at replicated apply time, before config publication. The
+comparison uses private persisted `config_string_key` metadata, not the public
+`/zookeeper/config` data or a request-side read. Ordinary and multi writes to the
+public node retain their existing semantics; editing/deleting it cannot alter
+the authoritative role baseline.
+
+After existing target parsing and CAS checks, malformed authoritative metadata
+fails with `BadArguments`; OOM/storage errors propagate. Missing metadata with
+an existing public node also fails, without copying public data into metadata.
+If both are absent there is no known baseline, so legitimate unseeded first
+reconfiguration retains its existing behavior. This is not a guarantee of
+recovery from undetectable loss of both representations. With intact metadata,
+a valid same-role reconfig repairs malformed public data or recreates a deleted
+public node (retaining the existing absent-node CAS/version-zero behavior).
+`ensureConfigBaseline` import/bootstrap synchronization remains a separate,
+unchanged pre-Raft boundary; this fix adds no apply-time public-data fallback.
 
 Command format v7 carries these validation semantics; v6 log entries retain
 their original semantics on replay/catch-up to avoid divergent historical
