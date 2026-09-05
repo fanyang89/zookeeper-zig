@@ -44,7 +44,7 @@ Only Java 3.9.5 is currently a verified external-client compatibility claim.
 | Persistent and persistent-recursive watches | **Implemented** | Native tests and TLA+ cover response barriers, ordering, deduplication, removal, and recursive matching; upstream interoperability remains incomplete. |
 | `setWatches` / `setWatches2` | **Implemented** | Used by async reconnect watch restoration and tested natively. |
 | `getEphemerals`, `getAllChildrenNumber`, `whoAmI`, `deleteContainer` | **Implemented** | ZooKeeper 3.9.5 wire behavior and native tests; broader upstream-suite coverage remains open. |
-| Dynamic reconfiguration | **Partial** | Incremental/bulk requests, version CAS, `/zookeeper/config`, and Raft membership reconciliation are implemented. Mixed Java/Zig membership is unsupported, and distributed upstream `ReconfigTest` coverage remains open. |
+| Dynamic reconfiguration | **Partial** | Incremental/bulk requests, version CAS, `/zookeeper/config`, and Raft membership reconciliation are implemented. Official Java 3.9.5 interop covers voting-member removal, quorum loss, offline replacement join, and post-change availability. Raft-retired node IDs cannot be reused; replacements require a new ID. Mixed Java/Zig membership is unsupported, and the full upstream `ReconfigTest` suite remains open. |
 | Path quotas and `zookeeper.limitSize` | **Unsupported** | `/zookeeper/quota` enforcement is not implemented. |
 
 ## Authentication and transport security

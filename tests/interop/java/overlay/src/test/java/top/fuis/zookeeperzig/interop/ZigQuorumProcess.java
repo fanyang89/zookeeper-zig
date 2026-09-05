@@ -14,7 +14,8 @@ import java.util.concurrent.TimeUnit;
 
 public final class ZigQuorumProcess implements AutoCloseable {
     private static final String CLUSTER_ID = "0198f54d-5c2a-7000-8000-000000000002";
-    private static final int NODE_COUNT = 3;
+    private static final int INITIAL_NODE_COUNT = 3;
+    private static final int TOTAL_NODE_COUNT = 4;
 
     private final String binary;
     private final long timeoutMillis;
@@ -48,22 +49,22 @@ public final class ZigQuorumProcess implements AutoCloseable {
         if (binary == null || binary.isEmpty()) {
             throw new IllegalArgumentException("zookeeper.zig.server must name the Zig server binary");
         }
-        int[] ports = reservePorts(NODE_COUNT * 2);
-        Node[] nodes = new Node[NODE_COUNT];
-        for (int index = 0; index < NODE_COUNT; index++) {
+        int[] ports = reservePorts(TOTAL_NODE_COUNT * 2);
+        Node[] nodes = new Node[TOTAL_NODE_COUNT];
+        for (int index = 0; index < TOTAL_NODE_COUNT; index++) {
             Path dataDirectory = testDirectory.resolve("node-" + (index + 1));
             Files.createDirectories(dataDirectory);
             nodes[index] = new Node(
                 index + 1,
                 ports[index],
-                ports[index + NODE_COUNT],
+                ports[index + TOTAL_NODE_COUNT],
                 dataDirectory,
                 testDirectory.resolve("node-" + (index + 1) + ".log").toFile());
         }
 
         ZigQuorumProcess cluster = new ZigQuorumProcess(binary, timeoutMillis, nodes);
         try {
-            for (int index = 0; index < NODE_COUNT; index++) {
+            for (int index = 0; index < INITIAL_NODE_COUNT; index++) {
                 cluster.startNode(index);
             }
             return cluster;
@@ -79,11 +80,11 @@ public final class ZigQuorumProcess implements AutoCloseable {
 
     public String connectString() {
         StringBuilder result = new StringBuilder();
-        for (Node node : nodes) {
+        for (int index = 0; index < INITIAL_NODE_COUNT; index++) {
             if (result.length() != 0) {
                 result.append(',');
             }
-            result.append("127.0.0.1:").append(node.clientPort);
+            result.append("127.0.0.1:").append(nodes[index].clientPort);
         }
         return result.toString();
     }
@@ -92,7 +93,26 @@ public final class ZigQuorumProcess implements AutoCloseable {
         return "127.0.0.1:" + node(index).clientPort;
     }
 
+    public String memberConfig(int index) {
+        Node node = node(index);
+        return "server." + node.id + "=127.0.0.1:" + node.raftPort + ":participant";
+    }
+
     public synchronized void startNode(int index) throws Exception {
+        startNode(index, false, new int[] {0, 1, 2});
+    }
+
+    public synchronized void startJoiningNode(int index, int... seedIndexes) throws Exception {
+        if (index < INITIAL_NODE_COUNT) {
+            throw new IllegalArgumentException("initial node cannot use join mode: " + (index + 1));
+        }
+        if (seedIndexes.length == 0) {
+            throw new IllegalArgumentException("joining node requires at least one seed");
+        }
+        startNode(index, true, seedIndexes);
+    }
+
+    private void startNode(int index, boolean join, int[] peerIndexes) throws Exception {
         Node node = node(index);
         if (node.process != null && node.process.isAlive()) {
             throw new IllegalStateException("node is already running: " + node.id);
@@ -109,9 +129,14 @@ public final class ZigQuorumProcess implements AutoCloseable {
         command.add("127.0.0.1:" + node.raftPort);
         command.add("--data-dir");
         command.add(node.dataDirectory.toAbsolutePath().toString());
-        for (Node peer : nodes) {
+        command.add("--reconfig-enabled");
+        for (int peerIndex : peerIndexes) {
+            Node peer = node(peerIndex);
             command.add("--peer");
             command.add(peer.id + "=127.0.0.1:" + peer.raftPort);
+        }
+        if (join) {
+            command.add("--join");
         }
         node.process = new ProcessBuilder(command)
             .redirectErrorStream(true)
@@ -127,6 +152,11 @@ public final class ZigQuorumProcess implements AutoCloseable {
             }
             throw error;
         }
+    }
+
+    public synchronized boolean isNodeAlive(int index) {
+        Node node = node(index);
+        return node.process != null && node.process.isAlive();
     }
 
     public synchronized void stopNode(int index) throws Exception {
