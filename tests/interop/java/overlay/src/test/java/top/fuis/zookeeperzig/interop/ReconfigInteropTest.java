@@ -2,12 +2,17 @@ package top.fuis.zookeeperzig.interop;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.apache.zookeeper.CreateMode;
@@ -18,6 +23,7 @@ import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
 import org.apache.zookeeper.admin.ZooKeeperAdmin;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.test.ReconfigTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -32,6 +38,16 @@ public final class ReconfigInteropTest {
     @Test
     @Timeout(value = 180)
     public void officialAdminReplacesVotingMember() throws Exception {
+        replaceVotingMember(false);
+    }
+
+    @Test
+    @Timeout(value = 180)
+    public void testBulkReconfig() throws Exception {
+        replaceVotingMember(true);
+    }
+
+    private void replaceVotingMember(boolean bulk) throws Exception {
         String binary = System.getProperty("zookeeper.zig.server");
         try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
                  binary,
@@ -52,8 +68,8 @@ public final class ReconfigInteropTest {
             try (ZooKeeperAdmin admin = connectAdmin(nodeOne)) {
                 String removedConfig = text(admin.reconfigure(
                     null,
-                    Collections.singletonList("3"),
-                    null,
+                    bulk ? null : Collections.singletonList("3"),
+                    bulk ? Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1)) : null,
                     initialStat.getVersion(),
                     removedStat));
                 assertTrue(removedConfig.contains("server.1="), removedConfig);
@@ -61,14 +77,19 @@ public final class ReconfigInteropTest {
                 assertTrue(!removedConfig.contains("server.3="), removedConfig);
                 assertEquals(initialStat.getVersion() + 1, removedStat.getVersion());
 
-                assertThrows(
-                    KeeperException.BadVersionException.class,
-                    () -> admin.reconfigure(
-                        Collections.singletonList(nodeFourConfig),
-                        null,
-                        null,
-                        removedStat.getVersion() + 1L,
-                        new Stat()));
+                // Both stale and future CAS must leave bytes/stat unchanged,
+                // not merely report an error while publishing a new target.
+                for (long invalidVersion : new long[] {removedStat.getVersion() - 1L, removedStat.getVersion() + 1L}) {
+                    assertThrows(
+                        KeeperException.BadVersionException.class,
+                        () -> admin.reconfigure(
+                            bulk ? null : Collections.singletonList(nodeFourConfig),
+                            null,
+                            bulk ? Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), nodeFourConfig) : null,
+                            invalidVersion,
+                            new Stat()));
+                    assertConfigUnchanged(admin, removedConfig, removedStat);
+                }
             }
 
             cluster.stopNode(1);
@@ -86,9 +107,9 @@ public final class ReconfigInteropTest {
             Stat joinedStat = new Stat();
             try (ZooKeeperAdmin admin = connectAdmin(nodeOne)) {
                 String joinedConfig = text(admin.reconfigure(
-                    Collections.singletonList(nodeFourConfig),
+                    bulk ? null : Collections.singletonList(nodeFourConfig),
                     null,
-                    null,
+                    bulk ? Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), nodeFourConfig) : null,
                     removedStat.getVersion(),
                     joinedStat));
                 assertTrue(joinedConfig.contains(nodeFourConfig), joinedConfig);
@@ -104,9 +125,79 @@ public final class ReconfigInteropTest {
                 cluster.stopNode(1);
                 createEventually(writer, "/after-replacement");
             }
-            try (ZooKeeper verifier = connect(cluster.nodeConnectString(3))) {
+            try (ZooKeeper verifier = connect(cluster.nodeConnectString(3));
+                 ZooKeeper writer = connect(nodeOne)) {
                 awaitExists(verifier, "/after-replacement");
+                // Execute the pinned upstream helper and its assertions unchanged.
+                ReconfigTest.testNormalOperation(writer, verifier);
+                ReconfigTest.testServerHasConfig(verifier,
+                    Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), nodeFourConfig),
+                    Collections.singletonList("3"));
             }
+        }
+    }
+
+    @Test
+    @Timeout(value = 150)
+    public void testRemoveOneAsynchronous() throws Exception {
+        try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
+                 System.getProperty("zookeeper.zig.server"), testDirectory, OPERATION_TIMEOUT_MILLIS);
+             ZooKeeperAdmin admin = connectAdmin(cluster.nodeConnectString(0))) {
+            Stat before = new Stat();
+            admin.getConfig(false, before);
+            Object context = new Object();
+            CompletableFuture<ReconfigResult> completed = new CompletableFuture<>();
+            admin.reconfigure(null, Collections.singletonList("3"), null, before.getVersion(),
+                (rc, path, ctx, data, stat) -> completed.complete(new ReconfigResult(rc, path, ctx, data, stat)),
+                context);
+            ReconfigResult result = completed.get(OPERATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            assertEquals(KeeperException.Code.OK.intValue(), result.rc);
+            assertEquals("/zookeeper/config", result.path);
+            assertSame(context, result.context, "callback context must be preserved");
+            assertNotNull(result.stat);
+            String removed = text(result.data);
+            assertEquals(cluster.memberConfig(0) + "\n" + cluster.memberConfig(1), removed);
+            assertEquals(before.getVersion() + 1, result.stat.getVersion());
+            assertConfigUnchanged(admin, removed, result.stat);
+
+            CompletableFuture<ReconfigResult> rejected = new CompletableFuture<>();
+            admin.reconfigure(Collections.singletonList(cluster.memberConfig(3)), null, null, before.getVersion(),
+                (rc, path, ctx, data, stat) -> rejected.complete(new ReconfigResult(rc, path, ctx, data, stat)),
+                context);
+            ReconfigResult stale = rejected.get(OPERATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            assertEquals(KeeperException.Code.BADVERSION.intValue(), stale.rc);
+            assertEquals("/zookeeper/config", stale.path);
+            assertSame(context, stale.context);
+            assertNull(stale.data);
+            assertNull(stale.stat);
+            assertConfigUnchanged(admin, removed, result.stat);
+            createEventually(admin, "/after-async-removal");
+            cluster.stopNode(1);
+            Thread.sleep(5_000);
+            assertTrue(cluster.isNodeAlive(2), "removed node exited before async quorum check");
+            assertCannotConnect(cluster.nodeConnectString(0));
+            assertTrue(cluster.isNodeAlive(2), "removed node exited during async quorum check");
+            cluster.startNode(1);
+            try (ZooKeeper writer = connect(cluster.nodeConnectString(0));
+                 ZooKeeper reader = connect(cluster.nodeConnectString(1))) {
+                ReconfigTest.testNormalOperation(writer, reader);
+            }
+        }
+    }
+
+    private static final class ReconfigResult {
+        private final int rc;
+        private final String path;
+        private final Object context;
+        private final byte[] data;
+        private final Stat stat;
+
+        private ReconfigResult(int rc, String path, Object context, byte[] data, Stat stat) {
+            this.rc = rc;
+            this.path = path;
+            this.context = context;
+            this.data = data;
+            this.stat = stat;
         }
     }
 
@@ -121,13 +212,13 @@ public final class ReconfigInteropTest {
             Stat before = new Stat();
             String config = text(admin.getConfig(false, before));
             String observer = cluster.memberConfig(2).replace(":participant", ":observer");
-            java.util.List<String> unchanged = java.util.Arrays.asList(
+            List<String> unchanged = Arrays.asList(
                 cluster.memberConfig(0), cluster.memberConfig(1), cluster.memberConfig(2));
-            java.util.List<String> bulk = java.util.Arrays.asList(
+            List<String> bulk = Arrays.asList(
                 cluster.memberConfig(0), cluster.memberConfig(1), observer);
             // Include an unchanged participant: the existing incremental parser
             // rejects an observer-only joining list even before role validation.
-            java.util.List<String> incremental = java.util.Arrays.asList(cluster.memberConfig(0), observer);
+            List<String> incremental = Arrays.asList(cluster.memberConfig(0), observer);
             assertThrows(KeeperException.BadArgumentsException.class,
                 () -> admin.reconfigure(incremental, null, null, -1, new Stat()));
             assertConfigUnchanged(admin, config, before);
@@ -147,8 +238,7 @@ public final class ReconfigInteropTest {
     private static void assertConfigUnchanged(ZooKeeper client, String expected, Stat before) throws Exception {
         Stat after = new Stat();
         assertEquals(expected, text(client.getConfig(false, after)));
-        assertEquals(before.getVersion(), after.getVersion());
-        assertEquals(before.getMzxid(), after.getMzxid());
+        assertEquals(before, after, "config stat must not change on rejection");
     }
 
     private static ZooKeeper connect(String connectString) throws Exception {

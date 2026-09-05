@@ -278,7 +278,7 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream tests unchanged alongside
 focused interoperability cases. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current 92-test selection
+server starts an isolated Zig server instead. The current 98-test selection
 covers synchronous and asynchronous CRUD, create2, ACL, Stat, version,
 sequential, container, TTL, write-multi, multiRead, one-shot and persistent
 watches, large-data, sync, lifecycle cleanup, error-code, four-letter commands,
@@ -288,7 +288,11 @@ persistent-recursive, ACL, disconnect, overlapping-mode, and root-watch tests.
 The quorum cases verify official-client session continuity, re-authentication,
 ephemeral ownership, rolling node restarts, follower catch-up, version-guarded
 member removal, loss of the removed quorum, offline replacement join, and
-post-reconfiguration availability. Focused watch runs also execute
+post-reconfiguration availability. Reconfiguration also covers bulk voter
+replacement, asynchronous removal, stale/future CAS rejection without config
+mutation, and fail-closed same-ID role changes. See
+[the adaptation and exclusion ledger](docs/reconfig-interop.md); the full
+upstream `ReconfigTest` is not run unchanged. Focused watch runs also execute
 unchanged upstream registration, one-shot, disconnect, and auto-reset tests.
 Tests that directly inspect Java server internals remain excluded.
 
