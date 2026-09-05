@@ -117,6 +117,36 @@ pub fn build(b: *std.Build) void {
             "Run the full Jepsen workload and nemesis suite",
         );
         test_jepsen.dependOn(&jepsen_suite.step);
+
+        const fuzz_zookeeper_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        });
+        const fuzz_module = b.createModule(.{
+            .root_source_file = b.path("tools/fuzz_import.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zookeeper", .module = fuzz_zookeeper_module },
+            },
+        });
+        const fuzz_import = b.addExecutable(.{
+            .name = "zq-fuzz-import",
+            .root_module = fuzz_module,
+        });
+        const fuzz_import_step = b.step("fuzz-import", "Build the import parser fuzzer");
+        fuzz_import_step.dependOn(&b.addInstallArtifact(fuzz_import, .{}).step);
+
+        const fuzz_smoke = b.addSystemCommand(&.{"bash"});
+        fuzz_smoke.addFileArg(b.path("tools/fuzz-smoke.sh"));
+        fuzz_smoke.addArtifactArg(fuzz_import);
+        const test_fuzz_smoke = b.step(
+            "test-fuzz-smoke",
+            "Run a bounded deterministic import parser fuzz smoke test",
+        );
+        test_fuzz_smoke.dependOn(&fuzz_smoke.step);
     }
 
     const check_zig = b.step("check-zig", "Compile native Zig tests without running them");

@@ -1,0 +1,76 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "23 19 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Iterations per target"
+        required: false
+        default: 2000000
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "fuzz-${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:44
+      options: --security-opt seccomp=unconfined
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [snapshot, txnlog, snappy, gzip]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install Fedora toolchain
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False \
+            binutils cmake coreutils git make ninja-build zig \
+            pkgconf-pkg-config rocksdb-devel snappy-devel
+          test "$(zig version)" = "0.16.0"
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Cache Zig dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            zig-pkg
+          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-fedora-44-${{ runner.arch }}-
+
+      - name: Fuzz
+        run: |
+          zig build fuzz-import -Doptimize=ReleaseSafe -Dsystem-rocksdb=true --summary all
+          zig-out/bin/zq-fuzz-import \
+            --target "$TARGET" \
+            --iterations "${ITERATIONS}" \
+            --batch-timeout-ms 120000 \
+            --keep-going
+        env:
+          TARGET: ${{ matrix.target }}
+          ITERATIONS: ${{ inputs.iterations || 2000000 }}
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: tests/fuzz/corpus/import/crashes/
+          if-no-files-found: ignore

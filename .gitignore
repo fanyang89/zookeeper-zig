@@ -8,3 +8,4 @@ tests/jepsen/report/
 tests/jepsen/.lein-failures
 .pi/
 .mise.local.toml
+tests/fuzz/corpus/import/crashes/

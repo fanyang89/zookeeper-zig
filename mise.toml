@@ -29,3 +29,9 @@ run = "zig build test-jepsen-smoke --summary all"
 
 [tasks.test-jepsen]
 run = "zig build test-jepsen --summary all"
+
+[tasks.fuzz-import]
+run = "zig build fuzz-import --summary all"
+
+[tasks.test-fuzz-smoke]
+run = "zig build test-fuzz-smoke --summary all"

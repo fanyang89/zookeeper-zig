@@ -51,6 +51,13 @@ jobs:
             cache-zig: true
             system-rocksdb: true
             timeout-minutes: 20
+          - name: Fuzz smoke
+            command: |
+              zig build fuzz-import -Dsystem-rocksdb=true --summary all
+              timeout --foreground --kill-after=10s 10m zig build test-fuzz-smoke -Dsystem-rocksdb=true --summary all
+            cache-zig: true
+            system-rocksdb: true
+            timeout-minutes: 15
 
     steps:
       - name: Install Fedora toolchain
