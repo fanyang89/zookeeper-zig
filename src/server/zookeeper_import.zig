@@ -9,11 +9,11 @@ const ephemeral = @import("ephemeral.zig");
 extern fn snappy_uncompressed_length(compressed: [*]const u8, compressed_length: usize, result: *usize) c_int;
 extern fn snappy_uncompress(compressed: [*]const u8, compressed_length: usize, uncompressed: [*]u8, uncompressed_length: *usize) c_int;
 
-const snapshot_magic: i32 = 0x5a4b534e;
-const log_magic: i32 = 0x5a4b4c47;
-const persistence_version: i32 = 2;
-const transaction_eor: u8 = 0x42;
-const max_import_bytes: usize = rocks_store.max_snapshot_bytes;
+pub const snapshot_magic: i32 = 0x5a4b534e;
+pub const log_magic: i32 = 0x5a4b4c47;
+pub const persistence_version: i32 = 2;
+pub const transaction_eor: u8 = 0x42;
+pub const max_import_bytes: usize = rocks_store.max_snapshot_bytes;
 
 pub const Options = struct {
     source_data_dir: []const u8,
@@ -53,7 +53,10 @@ const ImportedNode = struct {
     }
 };
 
-const ImportState = struct {
+/// Parsed upstream state. Public for fuzzing: the fuzzer parses attacker
+/// controlled bytes and releases the result through `deinit` to exercise the
+/// full ownership transfer.
+pub const ImportState = struct {
     allocator: std.mem.Allocator,
     nodes: std.StringHashMap(ImportedNode),
     sessions: std.AutoHashMap(i64, i32),
@@ -68,7 +71,7 @@ const ImportState = struct {
         };
     }
 
-    fn deinit(self: *ImportState) void {
+    pub fn deinit(self: *ImportState) void {
         var nodes = self.nodes.iterator();
         while (nodes.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -180,11 +183,21 @@ fn parseSnapshotFile(
         .snappy => try decompressSnappy(allocator, encoded),
     };
     defer allocator.free(bytes);
+    return parseSnapshotData(allocator, bytes, candidate.zxid);
+}
+
+/// Parses a decompressed upstream snapshot image. Public for fuzzing so the
+/// harness can feed untrusted bytes directly, bypassing file discovery.
+pub fn parseSnapshotData(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    filename_zxid: i64,
+) !ImportState {
     if (bytes.len > max_import_bytes) return error.SnapshotTooLarge;
 
     var reader = jute.Reader.init(bytes);
     try readFileHeader(&reader, snapshot_magic, -1);
-    var state = ImportState.init(allocator, candidate.zxid);
+    var state = ImportState.init(allocator, filename_zxid);
     errdefer state.deinit();
 
     const session_count = try readCount(&reader);
@@ -296,7 +309,10 @@ fn replayLogs(
     }
 }
 
-fn replayLog(bytes: []const u8, filename_zxid: i64, state: *ImportState) !void {
+/// Replays one upstream transaction log file image. Public for fuzzing so the
+/// harness can feed untrusted bytes directly. `filename_zxid` is the zxid
+/// encoded in the file name.
+pub fn replayLog(bytes: []const u8, filename_zxid: i64, state: *ImportState) !void {
     var reader = jute.Reader.init(bytes);
     try readFileHeader(&reader, log_magic, null);
     var first_zxid: ?i64 = null;
@@ -566,7 +582,9 @@ fn applyMulti(state: *ImportState, header: protocol.txn.TxnHeader, reader: *jute
     }
 }
 
-fn finalizeState(state: *ImportState) !void {
+/// Cross-checks the parsed tree and repairs snapshot/replay divergence.
+/// Public for fuzzing: this validation also runs on untrusted input state.
+pub fn finalizeState(state: *ImportState) !void {
     var orphan_paths: std.ArrayList([]u8) = .empty;
     defer {
         for (orphan_paths.items) |path| state.allocator.free(path);
@@ -703,7 +721,10 @@ fn readAclBlob(allocator: std.mem.Allocator, reader: *jute.Reader) ![]u8 {
     if (count == 0) return error.InvalidAcl;
     var entries: std.ArrayList(acl.Entry) = .empty;
     defer entries.deinit(allocator);
-    try entries.ensureTotalCapacity(allocator, count);
+    // `count` is untrusted header data. Reserve only a bounded prefix and let
+    // the list grow with the bytes actually read; pre-sizing from `count`
+    // turns a four-byte field into a multi-gigabyte allocation.
+    try entries.ensureTotalCapacity(allocator, @min(count, 64));
     var index: usize = 0;
     while (index < count) : (index += 1) {
         const entry: acl.Entry = .{
@@ -717,7 +738,7 @@ fn readAclBlob(allocator: std.mem.Allocator, reader: *jute.Reader) ![]u8 {
         {
             return error.UnsupportedAclScheme;
         }
-        entries.appendAssumeCapacity(entry);
+        try entries.append(allocator, entry);
     }
     return acl.encode(allocator, entries.items);
 }
@@ -829,7 +850,9 @@ fn ensureTargetDataDirectoryEmpty(io: std.Io, target_data_dir: []const u8) !void
     if (try iterator.next(io) != null) return error.TargetDataDirectoryNotEmpty;
 }
 
-fn decompressSnappy(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+/// Decodes a Xerial legacy Snappy stream. Public for fuzzing: the stream is
+/// untrusted input and reaches the C snappy decoder.
+pub fn decompressSnappy(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     const magic = [_]u8{ 0x82, 'S', 'N', 'A', 'P', 'P', 'Y', 0 };
     var position: usize = 0;
     var output: std.ArrayList(u8) = .empty;
@@ -871,7 +894,9 @@ fn decompressSnappy(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return output.toOwnedSlice(allocator);
 }
 
-fn decompressGzip(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+/// Decompresses a gzip snapshot stream with a bounded output. Public for
+/// fuzzing: the stream is untrusted input.
+pub fn decompressGzip(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
     var input: std.Io.Reader = .fixed(encoded);
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
@@ -892,6 +917,24 @@ test "Xerial legacy Snappy stream is decoded with libsnappy" {
     const decoded = try decompressSnappy(std.testing.allocator, &encoded);
     defer std.testing.allocator.free(decoded);
     try std.testing.expectEqualStrings("hello", decoded);
+}
+
+test "huge snapshot ACL count is rejected without preallocating" {
+    // A four-byte ACL entry count must not drive the list capacity before the
+    // entries are actually readable. Found by the import fuzzer.
+    var snapshot = jute.Writer.init(std.testing.allocator);
+    defer snapshot.deinit();
+    try snapshot.writeInt(snapshot_magic);
+    try snapshot.writeInt(persistence_version);
+    try snapshot.writeLong(-1);
+    try snapshot.writeInt(0); // sessions
+    try snapshot.writeInt(1); // acl cache entries
+    try snapshot.writeLong(1);
+    try snapshot.writeInt(std.math.maxInt(i32)); // claimed ACL count
+    try std.testing.expectError(
+        error.EndOfStream,
+        parseSnapshotData(std.testing.allocator, snapshot.bytes(), 1),
+    );
 }
 
 test "gzip snapshots are decompressed through the bounded path" {
