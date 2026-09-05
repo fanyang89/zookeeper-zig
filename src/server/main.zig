@@ -50,7 +50,11 @@ pub fn main(init: std.process.Init) !void {
         std.heap.smp_allocator,
         init.io,
         &config,
-        .{},
+        .{
+            // raftz's pre-vote path needs an explicit bootstrap campaign
+            // when there is no remote voter to stimulate an election.
+            .campaign_on_start = !config.join and config.peers.len <= 1,
+        },
     );
     defer {
         if (quorum.running) quorum.shutdown() catch {};
@@ -67,7 +71,6 @@ pub fn main(init: std.process.Init) !void {
             .request_queue_capacity = config.client_request_queue_capacity,
             .four_letter_whitelist = config.four_letter_whitelist,
             .reconfig_enabled = config.reconfig_enabled,
-            .single_member = config.peers.len == 0,
             .data_dir = config.data_dir,
         },
     );
@@ -84,8 +87,8 @@ pub fn main(init: std.process.Init) !void {
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(init.io);
         const AdminServe = struct {
-            fn task(server: *zookeeper.server.admin_server.AdminServer) std.Io.Cancelable!void {
-                return server.serve() catch |err| {
+            fn task(admin_server: *zookeeper.server.admin_server.AdminServer) std.Io.Cancelable!void {
+                return admin_server.serve() catch |err| {
                     if (err == error.Canceled) return error.Canceled;
                 };
             }

@@ -278,10 +278,11 @@ The runner checks out the official `release-3.9.5` source at the verified
 upstream commit, injects the `top.fuis.zookeeperzig.interop` server lifecycle
 adapter into `ClientBase`, and runs selected upstream tests unchanged alongside
 focused interoperability cases. Each upstream test that normally starts a Java
-server starts an isolated Zig server instead. The current 89-test selection
-covers synchronous and asynchronous CRUD, create2, ACL, Stat, version, sequential,
-container, TTL, write-multi, multiRead, one-shot and persistent watches, large-data,
-sync, lifecycle cleanup, error-code, and three-node failover tests. The watch
+server starts an isolated Zig server instead. The current 91-test selection
+covers synchronous and asynchronous CRUD, create2, ACL, Stat, version,
+sequential, container, TTL, write-multi, multiRead, one-shot and persistent
+watches, large-data, sync, lifecycle cleanup, error-code, four-letter commands,
+whitelist enforcement, and three-node failover tests. The watch
 selection includes unchanged upstream persistent, persistent-recursive, ACL,
 disconnect, overlapping-mode, and root-watch tests. The quorum case verifies
 official-client session continuity, re-authentication, ephemeral ownership,

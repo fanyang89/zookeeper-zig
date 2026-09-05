@@ -29,26 +29,59 @@ public final class ZigServerProcess implements AutoCloseable {
         int clientPort,
         File testDirectory,
         long timeoutMillis) throws Exception {
+        return start(binary, serverId, clientPort, testDirectory, timeoutMillis, null, true);
+    }
+
+    public static ZigServerProcess startForFourLetterWords(
+        String binary,
+        int serverId,
+        int clientPort,
+        File testDirectory,
+        long timeoutMillis,
+        String fourLetterWhitelist) throws Exception {
+        return start(
+            binary,
+            serverId,
+            clientPort,
+            testDirectory,
+            timeoutMillis,
+            fourLetterWhitelist,
+            false);
+    }
+
+    private static ZigServerProcess start(
+        String binary,
+        int serverId,
+        int clientPort,
+        File testDirectory,
+        long timeoutMillis,
+        String fourLetterWhitelist,
+        boolean requireZooKeeperSession) throws Exception {
         int raftPort = reservePort();
         File dataDirectory = new File(testDirectory, "zig-data");
         if (!dataDirectory.isDirectory() && !dataDirectory.mkdirs()) {
             throw new IOException("failed to create Zig data directory: " + dataDirectory);
         }
         File logFile = new File(testDirectory, "zig-server.log");
-        Process process = new ProcessBuilder(
+        ProcessBuilder builder = new ProcessBuilder(
             binary,
             "--node-id", Integer.toString(serverId),
             "--cluster-id", CLUSTER_ID,
             "--client-listen", "127.0.0.1:" + clientPort,
             "--raft-listen", "127.0.0.1:" + raftPort,
             "--data-dir", dataDirectory.getAbsolutePath(),
-            "--peer", serverId + "=127.0.0.1:" + raftPort)
+            "--peer", serverId + "=127.0.0.1:" + raftPort);
+        if (fourLetterWhitelist != null) {
+            builder.command().add("--4lw-whitelist");
+            builder.command().add(fourLetterWhitelist);
+        }
+        Process process = builder
             .redirectErrorStream(true)
             .redirectOutput(logFile)
             .start();
         ZigServerProcess server = new ZigServerProcess(process, logFile);
         try {
-            server.awaitReady(clientPort, timeoutMillis);
+            server.awaitReady(clientPort, timeoutMillis, requireZooKeeperSession);
             return server;
         } catch (Exception error) {
             process.destroyForcibly();
@@ -63,7 +96,10 @@ public final class ZigServerProcess implements AutoCloseable {
         }
     }
 
-    private void awaitReady(int port, long timeoutMillis) throws Exception {
+    private void awaitReady(
+        int port,
+        long timeoutMillis,
+        boolean requireZooKeeperSession) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         while (System.nanoTime() < deadline) {
             if (!process.isAlive()) {
@@ -71,10 +107,20 @@ public final class ZigServerProcess implements AutoCloseable {
             }
             try (Socket socket = new Socket()) {
                 socket.connect(new InetSocketAddress("127.0.0.1", port), 250);
+                socket.setSoTimeout(250);
+                socket.getOutputStream().write("srvr".getBytes(StandardCharsets.US_ASCII));
+                socket.shutdownOutput();
+                while (socket.getInputStream().read() != -1) {
+                    // Drain the response so the server closes the probe cleanly.
+                }
                 break;
             } catch (IOException ignored) {
                 Thread.sleep(100);
             }
+        }
+
+        if (!requireZooKeeperSession) {
+            return;
         }
 
         CountDownLatch connected = new CountDownLatch(1);

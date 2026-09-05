@@ -213,6 +213,7 @@ pub const Snapshot = struct {
     mode: []const u8,
     serving: bool,
     zxid: i64 = 0,
+    trace_mask: i64 = 0,
     node_count: usize = 0,
     ephemeral_count: usize = 0,
     approximate_data_size: u64 = 0,
@@ -257,8 +258,11 @@ pub fn render(
     switch (command) {
         .ruok => try w.appendSlice(allocator, "imok"),
         .isro => try w.appendSlice(allocator, if (serving) "rw" else "null"),
-        .gtmk => try w.appendSlice(allocator, "0"),
-        .stmk => try w.appendSlice(allocator, "0"),
+        .gtmk, .stmk => {
+            const value = try std.fmt.allocPrint(allocator, "{d}", .{snapshot.trace_mask});
+            defer allocator.free(value);
+            try w.appendSlice(allocator, value);
+        },
         .envi => {
             try S.line(w, allocator, "Environment:", .{});
             try S.line(w, allocator, "os.name={s}", .{@tagName(@import("builtin").os.tag)});
@@ -519,6 +523,23 @@ test "ruok and isro render without trailing newline" {
     const isro = try render(std.testing.allocator, &snapshot, .isro);
     defer std.testing.allocator.free(isro);
     try std.testing.expectEqualStrings("rw", isro);
+}
+
+test "gtmk and stmk render the current trace mask" {
+    var counters = ServerCounters{};
+    var snapshot = Snapshot{
+        .mode = "leader",
+        .serving = true,
+        .trace_mask = 0x1234,
+        .counters = &counters,
+        .conf = undefined,
+    };
+    const get_text = try render(std.testing.allocator, &snapshot, .gtmk);
+    defer std.testing.allocator.free(get_text);
+    try std.testing.expectEqualStrings("4660", get_text);
+    const set_text = try render(std.testing.allocator, &snapshot, .stmk);
+    defer std.testing.allocator.free(set_text);
+    try std.testing.expectEqualStrings("4660", set_text);
 }
 
 test "srvr renders upstream field layout" {

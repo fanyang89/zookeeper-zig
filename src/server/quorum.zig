@@ -17,6 +17,7 @@ pub const Options = struct {
     read_index_timeout_ticks: u64 = 200,
     snapshot_entries_threshold: u64 = 10_000,
     session_reap_interval_ms: u64 = 500,
+    campaign_on_start: bool = false,
 };
 
 pub const ProposalResponse = struct {
@@ -42,6 +43,7 @@ pub const Quorum = struct {
     driver_stop: std.atomic.Value(bool) = .init(false),
     session_reaper_stop: std.atomic.Value(bool) = .init(false),
     driver_failed: std.atomic.Value(bool) = .init(false),
+    member_count: std.atomic.Value(usize) = .init(1),
     membership_mutex: std.atomic.Mutex = .unlocked,
     pending_config: ?[]u8 = null,
     pending_version: i64 = 0,
@@ -105,6 +107,7 @@ pub const Quorum = struct {
         self.driver_stop = .init(false);
         self.session_reaper_stop = .init(false);
         self.driver_failed = .init(false);
+        self.member_count = .init(@max(config.peers.len, 1));
         self.running = false;
 
         try std.Io.Dir.cwd().createDirPath(io, config.data_dir);
@@ -145,6 +148,7 @@ pub const Quorum = struct {
             transport,
         );
         errdefer self.raftor.destroy();
+        if (options.campaign_on_start) try self.raftor.campaign();
 
         self.driver_thread = try std.Thread.spawn(.{}, runDriver, .{self});
         errdefer {
@@ -212,6 +216,15 @@ pub const Quorum = struct {
         return self.raftor.getStatus();
     }
 
+    pub fn memberCount(self: *const Quorum) usize {
+        return self.member_count.load(.acquire);
+    }
+
+    fn refreshMemberCount(self: *Quorum) void {
+        const membership = self.raftor.getClusterMembership() orelse return;
+        self.member_count.store(membership.peers.len, .release);
+    }
+
     fn runDriver(self: *Quorum) void {
         while (!self.driver_stop.load(.acquire)) {
             _ = self.raftor.tick() catch |err| {
@@ -222,6 +235,7 @@ pub const Quorum = struct {
                 break;
             };
             if (self.driver_stop.load(.acquire)) break;
+            self.refreshMemberCount();
             self.driveMembership();
             sleepNanoseconds(self.options.tick_interval_ms * std.time.ns_per_ms);
         }

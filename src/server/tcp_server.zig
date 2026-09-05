@@ -279,7 +279,6 @@ pub const Options = struct {
     /// `srvr` only.
     four_letter_whitelist: []const u8 = "srvr",
     reconfig_enabled: bool = false,
-    single_member: bool = false,
     data_dir: []const u8 = "",
     tick_time_ms: u64 = 50,
 };
@@ -294,12 +293,12 @@ pub const TcpServer = struct {
     notification_queue_capacity: usize,
     connections: std.Io.Group = .init,
     four_letter: four_letter.Whitelist = .{},
+    trace_mask: std.atomic.Value(i64) = .init(0),
     stats: four_letter.ServerCounters = .{},
     reconfig_enabled: bool = false,
     reconfig_inflight: std.atomic.Value(bool) = .init(false),
     registry_mutex: std.atomic.Mutex = .unlocked,
     registry: std.ArrayList(*ConnectionState) = .empty,
-    single_member: bool = false,
     data_dir: []const u8 = "",
     tick_time_ms: u64 = 50,
 
@@ -333,7 +332,6 @@ pub const TcpServer = struct {
             .notification_queue_capacity = options.notification_queue_capacity,
             .four_letter = four_letter.Whitelist.parse(options.four_letter_whitelist),
             .reconfig_enabled = options.reconfig_enabled,
-            .single_member = options.single_member,
             .data_dir = options.data_dir,
             .tick_time_ms = options.tick_time_ms,
         };
@@ -499,7 +497,7 @@ pub const TcpServer = struct {
     }
 
     fn serverMode(self: *TcpServer) []const u8 {
-        if (self.single_member) return "standalone";
+        if (self.quorum.memberCount() <= 1) return "standalone";
         return switch (self.quorum.status().role) {
             .leader => "leader",
             .follower => "follower",
@@ -519,6 +517,7 @@ pub const TcpServer = struct {
             .mode = self.serverMode(),
             .serving = self.quorum.status().leader_id != 0,
             .zxid = appliedZxid(self.quorum),
+            .trace_mask = self.trace_mask.load(.acquire),
             .counters = &self.stats,
             .conf = .{
                 .client_port = self.address.getPort(),
@@ -556,6 +555,11 @@ pub const TcpServer = struct {
             return;
         }
         if (admin_command == .srst) self.stats.reset();
+        if (admin_command == .stmk) {
+            var encoded_mask: [8]u8 = undefined;
+            try readAllRaw(self.io, transport.stream, &encoded_mask);
+            self.trace_mask.store(std.mem.readInt(i64, &encoded_mask, .big), .release);
+        }
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();

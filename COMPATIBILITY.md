@@ -104,7 +104,7 @@ migration is intentionally one-way.
 
 | Feature | Status | Boundary |
 | --- | --- | --- |
-| Four-letter commands | **Implemented** | ZooKeeper 3.9.5 command set and whitelist semantics are implemented. Native tests cover output; direct upstream `FourLetterWord` test coverage remains open. |
+| Four-letter commands | **Verified** | The ZooKeeper 3.9.5 command set, whitelist rejection, and `stmk` payload are exercised through upstream `FourLetterWordMain` in CI, with native output tests. |
 | AdminServer `/commands` HTTP endpoints | **Partial** | Plaintext and JSON command responses are implemented when `--admin-listen` is set. XML and JSONP are not implemented, and the server is disabled by default instead of listening on port 8080. |
 | Prometheus-style `mntr` consumers | **Implemented** | Upstream-compatible metric keys are emitted; exporter-specific certification is not claimed. |
 | `zoo.cfg` loading | **Partial** | `dataDir`/`myid`, client endpoints, `server.N`, `dynamicConfigFile`, 4lw, reconfiguration, and AdminServer settings are loaded. The quorum port maps to Raft; election ports are unused. Initial observers, hostnames/IPv6, continuations, and enabled TLS/SASL settings are rejected. CLI flags can override file values; mutable membership requires an explicit stable cluster ID. |
