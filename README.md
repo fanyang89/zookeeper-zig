@@ -296,6 +296,18 @@ smoke task as a regression corpus. CI runs a short fixed-seed campaign on
 every pull request; a nightly workflow runs two million iterations per
 target with random seeds.
 
+## Four-letter words
+
+The server accepts the ZooKeeper four-letter admin commands on the client
+port: `conf`, `cons`, `crst`, `dump`, `envi`, `gtmk`, `isro`, `mntr`, `ruok`,
+`srst`, `srvr`, `stat`, `stmk`, `wchc`, `wchp`, and `wchs`. Output formats
+follow Apache ZooKeeper 3.9.5 so `echo ruok | nc host 2181`, `srvr`, and
+`mntr`-based Prometheus exporters keep working. Commands are selected with
+`--4lw-whitelist` (a comma-separated list, or `*`); the default is `srvr`,
+matching `zookeeper.4lw.commands.whitelist`. While a node has no leader,
+state-dependent commands reply `This server is not currently serving
+requests`.
+
 ## Roadmap
 
 1. Complete reconnect and high-level client APIs.

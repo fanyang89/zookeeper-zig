@@ -9,6 +9,17 @@ const ConnectRace = union(enum) {
 pub const TcpTransport = struct {
     stream: std.Io.net.Stream,
     closed: bool = false,
+    pushback: [4]u8 = undefined,
+    pushback_len: usize = 0,
+
+    /// Prepends up to four bytes so the next frame read consumes them first.
+    /// Used by the server after inspecting a connection's opening bytes for
+    /// four-letter admin commands.
+    pub fn pushBack(self: *TcpTransport, bytes: []const u8) void {
+        const length = @min(bytes.len, self.pushback.len);
+        @memcpy(self.pushback[0..length], bytes[0..length]);
+        self.pushback_len = length;
+    }
 
     pub fn connectAddress(
         io: std.Io,
@@ -222,6 +233,13 @@ fn readAllTimeout(
     frame_started: bool,
 ) !void {
     var offset: usize = 0;
+    if (transport.pushback_len > 0) {
+        const length = @min(transport.pushback_len, destination.len);
+        @memcpy(destination[0..length], transport.pushback[0..length]);
+        std.mem.copyForwards(u8, transport.pushback[0 .. transport.pushback_len - length], transport.pushback[length..transport.pushback_len]);
+        transport.pushback_len -= length;
+        offset = length;
+    }
     while (offset < destination.len) {
         const message = transport.stream.socket.receiveTimeout(
             io,

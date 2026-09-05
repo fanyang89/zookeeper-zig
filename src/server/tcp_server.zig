@@ -10,6 +10,7 @@ const command = @import("command.zig");
 const config_mod = @import("config.zig");
 const data_tree = @import("data_tree.zig");
 const ephemeral = @import("ephemeral.zig");
+const four_letter = @import("four_letter.zig");
 const multi = @import("multi.zig");
 const quorum_mod = @import("quorum.zig");
 const watch = @import("watch.zig");
@@ -73,6 +74,19 @@ const ConnectionState = struct {
     notification_buffer: [][]u8,
     write_mutex: std.Io.Mutex = .init,
     failed: std.atomic.Value(bool) = .init(false),
+    stats: ?*four_letter.ServerCounters = null,
+    remote: []const u8 = "",
+    session_id: std.atomic.Value(i64) = .init(0),
+    session_timeout_ms: std.atomic.Value(i32) = .init(0),
+    established_ms: i64 = 0,
+    received: std.atomic.Value(u64) = .init(0),
+    sent: std.atomic.Value(u64) = .init(0),
+    outstanding: std.atomic.Value(i64) = .init(0),
+    last_cxid: std.atomic.Value(i32) = .init(-1),
+    last_zxid: std.atomic.Value(i64) = .init(-1),
+    last_op: std.atomic.Value(u8) = .init(0),
+    last_response_ms: std.atomic.Value(i64) = .init(0),
+    latency: four_letter.LatencyTracker(16) = .{},
 
     fn init(
         allocator: std.mem.Allocator,
@@ -157,6 +171,51 @@ const ConnectionState = struct {
             self.fail();
             return err;
         };
+        _ = self.sent.fetchAdd(1, .acq_rel);
+        if (self.stats) |stats| _ = stats.packets_sent.fetchAdd(1, .acq_rel);
+        self.last_response_ms.store(std.Io.Clock.awake.now(self.io).toMilliseconds(), .release);
+    }
+
+    /// Maps an opcode to the upstream last-operation tag used by `cons`.
+    fn noteOperation(self: *ConnectionState, opcode: wire.OpCode) void {
+        const tag: u8 = switch (opcode) {
+            .exists => '1',
+            .get_data => '2',
+            .set_data => '3',
+            .get_children, .get_children2 => '4',
+            .create, .create2, .create_container, .create_ttl => '5',
+            .delete, .delete_container => '6',
+            .get_acl => '7',
+            .set_acl => '8',
+            .multi => '9',
+            .multi_read => 'A',
+            .sync => 'B',
+            .ping => 'P',
+            .close_session => 'C',
+            .auth => 'D',
+            else => '0',
+        };
+        self.last_op.store(tag, .release);
+    }
+
+    fn operationName(self: *const ConnectionState) []const u8 {
+        return switch (self.last_op.load(.acquire)) {
+            '1' => "EXST",
+            '2' => "GETD",
+            '3' => "SETD",
+            '4' => "GETC",
+            '5' => "CREA",
+            '6' => "DELE",
+            '7' => "GETA",
+            '8' => "SETA",
+            '9' => "MULT",
+            'A' => "MLTR",
+            'B' => "SYNC",
+            'P' => "PING",
+            'C' => "CLOS",
+            'D' => "AUTH",
+            else => "OTHR",
+        };
     }
 
     fn fail(self: *ConnectionState) void {
@@ -215,6 +274,12 @@ pub const Options = struct {
     request_worker_count: usize = 0,
     request_queue_capacity: usize = 256,
     notification_queue_capacity: usize = 256,
+    /// Mirrors `zookeeper.4lw.commands.whitelist`; the upstream default is
+    /// `srvr` only.
+    four_letter_whitelist: []const u8 = "srvr",
+    single_member: bool = false,
+    data_dir: []const u8 = "",
+    tick_time_ms: u64 = 50,
 };
 
 pub const TcpServer = struct {
@@ -226,6 +291,13 @@ pub const TcpServer = struct {
     watch_manager: watch.Manager,
     notification_queue_capacity: usize,
     connections: std.Io.Group = .init,
+    four_letter: four_letter.Whitelist = .{},
+    stats: four_letter.ServerCounters = .{},
+    registry_mutex: std.atomic.Mutex = .unlocked,
+    registry: std.ArrayList(*ConnectionState) = .empty,
+    single_member: bool = false,
+    data_dir: []const u8 = "",
+    tick_time_ms: u64 = 50,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -255,6 +327,10 @@ pub const TcpServer = struct {
             ),
             .watch_manager = .init(allocator),
             .notification_queue_capacity = options.notification_queue_capacity,
+            .four_letter = four_letter.Whitelist.parse(options.four_letter_whitelist),
+            .single_member = options.single_member,
+            .data_dir = options.data_dir,
+            .tick_time_ms = options.tick_time_ms,
         };
     }
 
@@ -263,6 +339,7 @@ pub const TcpServer = struct {
         self.quorum.machine.detachWatchManager(&self.watch_manager);
         self.requests.deinit();
         self.watch_manager.deinit();
+        self.registry.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -298,12 +375,23 @@ pub const TcpServer = struct {
         var transport = TcpTransport.fromStream(stream);
         defer transport.close(self.io);
 
+        // Length-prefixed protocol frames always begin with a zero byte;
+        // four-letter admin commands are lowercase ASCII. Probe the first
+        // four bytes and dispatch to the admin path or push them back.
+        var probe: [4]u8 = undefined;
+        try readAllRaw(self.io, transport.stream, &probe);
+        if (four_letter.looksLikeCommand(probe[0])) {
+            return self.serveFourLetter(&transport, probe);
+        }
+        transport.pushBack(&probe);
+
         const connect_payload = try transport.readFrameAlloc(
             self.allocator,
             self.io,
             wire.default_max_payload,
         );
         defer self.allocator.free(connect_payload);
+        _ = self.stats.packets_received.fetchAdd(1, .acq_rel);
         const connect = try wire.decodeConnectRequest(connect_payload);
         const leader_wait_ms: u64 = @intCast(@min(@max(connect.value.timeOut, 2_000), 40_000));
         var waited_ms: u64 = 0;
@@ -316,6 +404,7 @@ pub const TcpServer = struct {
             return error.ClientZxidAhead;
         }
         const session = (try self.submitEstablish(&transport, connect)) orelse return;
+        _ = self.stats.packets_sent.fetchAdd(1, .acq_rel);
         var connection = try ConnectionState.init(
             self.allocator,
             self.io,
@@ -323,6 +412,16 @@ pub const TcpServer = struct {
             self.notification_queue_capacity,
         );
         defer connection.deinit();
+        connection.stats = &self.stats;
+        connection.remote = peerAddressAlloc(self.allocator, transport.stream) catch "";
+        defer self.allocator.free(connection.remote);
+        connection.session_id.store(session.id, .release);
+        connection.session_timeout_ms.store(session.timeout_ms, .release);
+        connection.established_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
+        try self.registerConnection(&connection);
+        defer self.unregisterConnection(&connection);
+        _ = self.stats.connections.fetchAdd(1, .acq_rel);
+        defer _ = self.stats.connections.fetchSub(1, .acq_rel);
         var notification_tasks: std.Io.Group = .init;
         try notification_tasks.concurrent(self.io, notificationWriterMain, .{&connection});
         defer notification_tasks.cancel(self.io);
@@ -354,6 +453,8 @@ pub const TcpServer = struct {
                 wire.default_max_payload,
             );
             defer self.allocator.free(payload);
+            _ = self.stats.packets_received.fetchAdd(1, .acq_rel);
+            _ = connection.received.fetchAdd(1, .acq_rel);
             const request = try wire.requestView(payload);
             const opcode = wire.OpCode.fromInt(request.header.type) orelse {
                 var sink: ResponseSink = .{};
@@ -372,6 +473,161 @@ pub const TcpServer = struct {
                 request.body,
             );
             if (!keep_open) return;
+        }
+    }
+
+    fn registerConnection(self: *TcpServer, connection: *ConnectionState) !void {
+        while (!self.registry_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.registry_mutex.unlock();
+        try self.registry.append(self.allocator, connection);
+    }
+
+    fn unregisterConnection(self: *TcpServer, connection: *ConnectionState) void {
+        while (!self.registry_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.registry_mutex.unlock();
+        for (self.registry.items, 0..) |entry, index| {
+            if (entry == connection) {
+                _ = self.registry.orderedRemove(index);
+                return;
+            }
+        }
+    }
+
+    fn serverMode(self: *TcpServer) []const u8 {
+        if (self.single_member) return "standalone";
+        return switch (self.quorum.status().role) {
+            .leader => "leader",
+            .follower => "follower",
+            else => "looking",
+        };
+    }
+
+    fn serveFourLetter(self: *TcpServer, transport: *TcpTransport, name: [4]u8) !void {
+        const admin_command = four_letter.commandFromName(&name) orelse return;
+        if (!self.four_letter.allows(admin_command)) {
+            const text = try std.fmt.allocPrint(self.allocator, "{s} is not executed because it is not in the whitelist.\n", .{name});
+            defer self.allocator.free(text);
+            try writeRawAll(self.io, transport.stream, text);
+            return;
+        }
+        if (admin_command == .srst) self.stats.reset();
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        var snapshot = four_letter.Snapshot{
+            .mode = self.serverMode(),
+            .serving = self.quorum.status().leader_id != 0,
+            .zxid = appliedZxid(self.quorum),
+            .counters = &self.stats,
+            .conf = .{
+                .client_port = self.address.getPort(),
+                .server_id = self.quorum.status().id,
+                .data_dir = self.data_dir,
+                .raft_listen = "",
+                .raft_advertise = "",
+                .tick_time_ms = self.tick_time_ms,
+                .min_session_timeout_ms = 2_000,
+                .max_session_timeout_ms = 40_000,
+                .max_client_connections = -1,
+                .config = "",
+            },
+        };
+
+        const needs_state = switch (admin_command) {
+            .ruok, .isro, .gtmk, .stmk, .envi => false,
+            else => true,
+        };
+        if (needs_state and snapshot.serving) {
+            try self.fillFourLetterState(allocator, &snapshot, admin_command);
+        }
+
+        const text = try four_letter.render(allocator, &snapshot, admin_command);
+        try writeRawAll(self.io, transport.stream, text);
+    }
+
+    fn fillFourLetterState(
+        self: *TcpServer,
+        allocator: std.mem.Allocator,
+        snapshot: *four_letter.Snapshot,
+        admin_command: four_letter.Command,
+    ) !void {
+        const usage = try self.quorum.machine.store.nodeUsage();
+        snapshot.node_count = @intCast(usage.count);
+        snapshot.approximate_data_size = usage.approximate_size;
+        snapshot.open_file_descriptors = countFileDescriptors(self.io);
+        snapshot.max_file_descriptors = maxFileDescriptors(self.io);
+
+        const machine = &self.quorum.machine;
+        var ephemeral_count: usize = 0;
+        if (admin_command == .dump) {
+            const sessions = try machine.store.listSessions(allocator);
+            const session_lines = try allocator.alloc(four_letter.SessionInfo, sessions.len);
+            for (sessions, 0..) |session, index| {
+                session_lines[index] = .{ .id = session.id, .timeout_ms = session.timeout_ms };
+            }
+            snapshot.sessions = session_lines;
+
+            const ephemerals = try machine.store.listEphemerals(allocator);
+            ephemeral_count = ephemerals.len;
+            const ephemeral_lines = try allocator.alloc(four_letter.EphemeralInfo, ephemerals.len);
+            for (ephemerals, 0..) |entry, index| {
+                ephemeral_lines[index] = .{ .path = entry.path, .owner = entry.owner };
+            }
+            snapshot.ephemerals = ephemeral_lines;
+        } else {
+            const ephemerals = try machine.store.listEphemerals(allocator);
+            ephemeral_count = ephemerals.len;
+            for (ephemerals) |entry| allocator.free(entry.path);
+            allocator.free(ephemerals);
+        }
+        snapshot.ephemeral_count = ephemeral_count;
+
+        const watch_totals = self.watch_manager.summarize();
+        snapshot.watch_summary = .{ .connections = watch_totals.connections, .paths = watch_totals.paths, .total = watch_totals.total };
+        if (admin_command == .wchc) {
+            const by_session = try self.watch_manager.dumpBySession(allocator);
+            const lines = try allocator.alloc(four_letter.WatchesBySession, by_session.len);
+            for (by_session, 0..) |entry, index| {
+                lines[index] = .{ .session_id = entry.session_id, .paths = entry.paths };
+            }
+            snapshot.watches_by_session = lines;
+        }
+        if (admin_command == .wchp) {
+            const by_path = try self.watch_manager.dumpByPath(allocator);
+            const lines = try allocator.alloc(four_letter.WatchesByPath, by_path.len);
+            for (by_path, 0..) |entry, index| {
+                lines[index] = .{ .path = entry.path, .session_ids = entry.session_ids };
+            }
+            snapshot.watches_by_path = lines;
+        }
+
+        if (admin_command == .stat or admin_command == .cons) {
+            while (!self.registry_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.registry_mutex.unlock();
+            const lines = try allocator.alloc(four_letter.ConnectionInfo, self.registry.items.len);
+            for (self.registry.items, 0..) |connection, index| {
+                const latency = connection.latency.snapshot();
+                lines[index] = .{
+                    .remote = try allocator.dupe(u8, connection.remote),
+                    .session_id = connection.session_id.load(.acquire),
+                    .session_timeout_ms = connection.session_timeout_ms.load(.acquire),
+                    .established_ms = connection.established_ms,
+                    .queued = @intCast(@max(connection.outstanding.load(.acquire), 0)),
+                    .received = connection.received.load(.acquire),
+                    .sent = connection.sent.load(.acquire),
+                    .last_cxid = connection.last_cxid.load(.acquire),
+                    .last_zxid = connection.last_zxid.load(.acquire),
+                    .last_op = connection.operationName(),
+                    .last_response_ms = connection.last_response_ms.load(.acquire),
+                    .last_latency_ms = latency.min,
+                    .min_latency_ms = latency.min,
+                    .avg_latency_ms = latency.avg,
+                    .max_latency_ms = latency.max,
+                };
+            }
+            snapshot.connections = lines;
         }
     }
 
@@ -415,6 +671,19 @@ pub const TcpServer = struct {
             .opcode = opcode,
             .body = body,
         };
+        connection.noteOperation(opcode);
+        connection.last_cxid.store(xid, .release);
+        const started_ms = std.Io.Clock.awake.now(self.io).toMilliseconds();
+        _ = self.stats.outstanding_requests.fetchAdd(1, .acq_rel);
+        _ = connection.outstanding.fetchAdd(1, .acq_rel);
+        defer {
+            _ = self.stats.outstanding_requests.fetchSub(1, .acq_rel);
+            _ = connection.outstanding.fetchSub(1, .acq_rel);
+            const elapsed = std.Io.Clock.awake.now(self.io).toMilliseconds() -| started_ms;
+            const bounded: u32 = if (elapsed > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(@max(elapsed, 0));
+            self.stats.latency.record(bounded);
+            connection.latency.record(bounded);
+        }
         self.requests.submit(.{ .dispatch = &job }) catch |err| switch (err) {
             error.Closed, error.WorkerPoolNotStarted => return error.ServerStopped,
             error.Canceled => return error.Canceled,
@@ -1837,6 +2106,60 @@ fn peerIpv4Alloc(
     return std.fmt.allocPrint(allocator, "{}.{}.{}.{}", .{
         bytes[0], bytes[1], bytes[2], bytes[3],
     });
+}
+
+fn peerAddressAlloc(
+    allocator: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+) ![]u8 {
+    var address: std.posix.sockaddr.storage = undefined;
+    var length: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    try std.posix.getpeername(stream.socket.handle, @ptrCast(&address), &length);
+    if (address.family != std.posix.AF.INET) return error.UnsupportedPeerAddress;
+    const ipv4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&address));
+    const bytes = std.mem.asBytes(&ipv4.addr);
+    const port = std.mem.bigToNative(u16, ipv4.port);
+    return std.fmt.allocPrint(allocator, "{}.{}.{}.{}:{d}", .{
+        bytes[0], bytes[1], bytes[2], bytes[3], port,
+    });
+}
+
+fn readAllRaw(io: std.Io, stream: std.Io.net.Stream, destination: []u8) !void {
+    var offset: usize = 0;
+    while (offset < destination.len) {
+        const message = try stream.socket.receive(io, destination[offset..]);
+        if (message.data.len == 0) return error.EndOfStream;
+        offset += message.data.len;
+    }
+}
+
+fn writeRawAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var buffer: [0]u8 = .{};
+    var writer = stream.writer(io, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn countFileDescriptors(io: std.Io) usize {
+    var directory = std.Io.Dir.cwd().openDir(io, "/proc/self/fd", .{ .iterate = true }) catch return 0;
+    defer directory.close(io);
+    var count: usize = 0;
+    var iterator = directory.iterate();
+    while (iterator.next(io) catch null) |_| count += 1;
+    return count;
+}
+
+fn maxFileDescriptors(io: std.Io) usize {
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/limits", .{}) catch return 0;
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    const read = file.readPositionalAll(io, &buffer, 0) catch return 0;
+    const text = buffer[0..read];
+    const marker = "Max open files\t";
+    const start = std.mem.indexOf(u8, text, marker) orelse return 0;
+    var iterator = std.mem.tokenizeAny(u8, text[start + marker.len ..], " \t\n");
+    const soft = iterator.next() orelse return 0;
+    return std.fmt.parseInt(usize, soft, 10) catch 0;
 }
 
 fn reserveTestPort(io: std.Io) !u16 {

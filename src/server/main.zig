@@ -14,7 +14,7 @@ const usage =
     \\  [--client-request-queue-capacity COUNT] \\
     \\  [--import-zookeeper-data-dir PATH] \\
     \\  [--import-zookeeper-log-dir PATH] \\
-    \\  [--peer ID=IPV4:PORT ...] [--join]
+    \\  [--peer ID=IPV4:PORT ...] [--join] [--4lw-whitelist LIST]
     \\
 ;
 
@@ -63,6 +63,9 @@ pub fn main(init: std.process.Init) !void {
         .{
             .request_worker_count = config.client_request_workers,
             .request_queue_capacity = config.client_request_queue_capacity,
+            .four_letter_whitelist = config.four_letter_whitelist,
+            .single_member = config.peers.len == 0,
+            .data_dir = config.data_dir,
         },
     );
     defer server.deinit();

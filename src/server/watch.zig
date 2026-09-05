@@ -371,6 +371,119 @@ pub const Manager = struct {
             };
         }
     }
+    /// Watch totals for the `wchs` four-letter word: distinct connections with
+    /// at least one armed watch, distinct watched paths, and total registrations.
+    pub const Summary = struct {
+        connections: usize,
+        paths: usize,
+        total: usize,
+    };
+
+    pub fn summarize(self: *Manager) Summary {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var paths: std.StringHashMap(void) = .init(self.allocator);
+        defer paths.deinit();
+        var result = Summary{ .connections = 0, .paths = 0, .total = 0 };
+        var connections = self.connections.valueIterator();
+        while (connections.next()) |connection| {
+            var watched: usize = 0;
+            for (connection.watches.items) |registration| {
+                if (!registration.armed) continue;
+                paths.put(registration.path, {}) catch {};
+                watched += 1;
+            }
+            if (watched > 0) result.connections += 1;
+            result.total += watched;
+        }
+        result.paths = paths.count();
+        return result;
+    }
+
+    pub const SessionWatches = struct {
+        session_id: i64,
+        paths: [][]u8,
+    };
+
+    /// Armed watches grouped by session for the `wchc` four-letter word.
+    pub fn dumpBySession(self: *Manager, allocator: std.mem.Allocator) ![]SessionWatches {
+        var output: std.ArrayList(SessionWatches) = .empty;
+        errdefer {
+            for (output.items) |entry| {
+                for (entry.paths) |path| allocator.free(path);
+                allocator.free(entry.paths);
+            }
+            output.deinit(allocator);
+        }
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var connections = self.connections.valueIterator();
+        while (connections.next()) |connection| {
+            var paths: std.ArrayList([]u8) = .empty;
+            errdefer {
+                for (paths.items) |path| allocator.free(path);
+                paths.deinit(allocator);
+            }
+            for (connection.watches.items) |registration| {
+                if (!registration.armed) continue;
+                try paths.append(allocator, try allocator.dupe(u8, registration.path));
+            }
+            if (paths.items.len == 0) {
+                paths.deinit(allocator);
+                continue;
+            }
+            try output.append(allocator, .{
+                .session_id = connection.session_id,
+                .paths = try paths.toOwnedSlice(allocator),
+            });
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    pub const PathWatches = struct {
+        path: []u8,
+        session_ids: []i64,
+    };
+
+    /// Armed watches grouped by path for the `wchp` four-letter word.
+    pub fn dumpByPath(self: *Manager, allocator: std.mem.Allocator) ![]PathWatches {
+        var paths: std.StringHashMap(std.ArrayListUnmanaged(i64)) = .init(allocator);
+        defer {
+            var iterator = paths.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            paths.deinit();
+        }
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        var connections = self.connections.valueIterator();
+        while (connections.next()) |connection| {
+            for (connection.watches.items) |registration| {
+                if (!registration.armed) continue;
+                const result = try paths.getOrPut(try allocator.dupe(u8, registration.path));
+                if (!result.found_existing) result.value_ptr.* = .empty;
+                try result.value_ptr.append(allocator, connection.session_id);
+            }
+        }
+        var output: std.ArrayList(PathWatches) = .empty;
+        errdefer {
+            for (output.items) |entry| {
+                allocator.free(entry.path);
+                allocator.free(entry.session_ids);
+            }
+            output.deinit(allocator);
+        }
+        var iterator = paths.iterator();
+        while (iterator.next()) |entry| {
+            try output.append(allocator, .{
+                .path = try allocator.dupe(u8, entry.key_ptr.*),
+                .session_ids = try allocator.dupe(i64, entry.value_ptr.items),
+            });
+        }
+        return output.toOwnedSlice(allocator);
+    }
 };
 
 fn standardMatches(kind: Kind, event_type: EventType) bool {

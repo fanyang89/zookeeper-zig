@@ -509,6 +509,78 @@ pub const RocksStore = struct {
         return paths.toOwnedSlice(allocator);
     }
 
+    pub const SessionEntry = struct {
+        id: i64,
+        timeout_ms: i32,
+    };
+
+    /// All persisted sessions for the `dump` four-letter word.
+    pub fn listSessions(self: *RocksStore, allocator: std.mem.Allocator) ![]SessionEntry {
+        var sessions: std.ArrayList(SessionEntry) = .empty;
+        errdefer sessions.deinit(allocator);
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, session_prefix);
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (!std.mem.startsWith(u8, entry[0].data, session_prefix)) break;
+            const session_id = try decodeSessionKey(entry[0].data);
+            const session = try decodeSession(entry[1].data);
+            try sessions.append(allocator, .{ .id = session_id, .timeout_ms = session.timeout_ms });
+        }
+        return sessions.toOwnedSlice(allocator);
+    }
+
+    pub const EphemeralEntry = struct {
+        path: []u8,
+        owner: i64,
+    };
+
+    /// Every ephemeral node with its owning session for the `dump`
+    /// four-letter word.
+    pub fn listEphemerals(self: *RocksStore, allocator: std.mem.Allocator) ![]EphemeralEntry {
+        var nodes: std.ArrayList(EphemeralEntry) = .empty;
+        errdefer {
+            for (nodes.items) |entry| allocator.free(entry.path);
+            nodes.deinit(allocator);
+        }
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            var node = try decodeNode(self.allocator, entry[1].data);
+            defer node.deinit(self.allocator);
+            if (node.kind != .ephemeral) continue;
+            try nodes.append(allocator, .{
+                .path = try allocator.dupe(u8, entry[0].data),
+                .owner = node.ephemeral_owner,
+            });
+        }
+        return nodes.toOwnedSlice(allocator);
+    }
+
+    pub const NodeUsage = struct {
+        count: u64,
+        approximate_size: u64,
+    };
+
+    /// Node count and approximate persisted size for `srvr` and `mntr`.
+    pub fn nodeUsage(self: *RocksStore) !NodeUsage {
+        var usage = NodeUsage{ .count = 0, .approximate_size = 0 };
+        var error_data: ?rocksdb.Data = null;
+        defer deinitErrorData(&error_data);
+        var iterator = self.db.iterator(self.default_family, .forward, "/");
+        defer iterator.deinit();
+        while (try iterator.next(&error_data)) |entry| {
+            if (entry[0].data.len == 0 or entry[0].data[0] != '/') break;
+            usage.count += 1;
+            usage.approximate_size += entry[0].data.len + entry[1].data.len;
+        }
+        return usage;
+    }
+
     pub fn getSession(self: *RocksStore, session_id: i64) !?Session {
         var key_buffer: [session_prefix.len + 8]u8 = undefined;
         const key = sessionKey(session_id, &key_buffer);

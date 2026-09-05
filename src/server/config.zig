@@ -16,10 +16,12 @@ pub const ServerConfig = struct {
     import_zookeeper_log_dir: ?[]u8,
     peers: []raft.Peer,
     join: bool,
+    four_letter_whitelist: []u8,
 
     pub fn deinit(self: *ServerConfig) void {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
         self.allocator.free(self.peers);
+        self.allocator.free(self.four_letter_whitelist);
         if (self.import_zookeeper_log_dir) |value| self.allocator.free(value);
         if (self.import_zookeeper_data_dir) |value| self.allocator.free(value);
         self.allocator.free(self.data_dir);
@@ -42,6 +44,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var import_zookeeper_data_dir: ?[]const u8 = null;
     var import_zookeeper_log_dir: ?[]const u8 = null;
     var join = false;
+    var four_letter_whitelist: ?[]const u8 = null;
     var peer_values: std.ArrayList([]const u8) = .empty;
     defer peer_values.deinit(allocator);
 
@@ -77,6 +80,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             import_zookeeper_data_dir = value;
         } else if (std.mem.eql(u8, argument, "--import-zookeeper-log-dir")) {
             import_zookeeper_log_dir = value;
+        } else if (std.mem.eql(u8, argument, "--4lw-whitelist")) {
+            four_letter_whitelist = value;
         } else if (std.mem.eql(u8, argument, "--peer")) {
             try peer_values.append(allocator, value);
         } else {
@@ -157,6 +162,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .import_zookeeper_log_dir = owned_import_log_dir,
         .peers = peers,
         .join = join,
+        .four_letter_whitelist = try allocator.dupe(u8, four_letter_whitelist orelse "srvr"),
     };
 }
 
