@@ -5,6 +5,9 @@ first native layer is the Jute binary archive in `src/jute/`, with ZooKeeper
 record structs in `src/protocol/`. Comptime reflection serializes fields in
 declaration order, so the protocol structs require no generated codec methods.
 
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for verified client versions,
+feature gaps, ensemble boundaries, zxid semantics, and migration limits.
+
 ## Requirements
 
 - mise 2026.7.13 or newer
