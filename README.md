@@ -198,6 +198,46 @@ zig-out/bin/zookeeper-quorum-server \
   --peer 1=127.0.0.1:2881 --peer 2=127.0.0.1:2882 --peer 3=127.0.0.1:2883
 ```
 
+The same server can load a ZooKeeper-style configuration:
+
+```properties
+# zoo.cfg
+tickTime=2000
+dataDir=/var/lib/zookeeper
+clientPortAddress=127.0.0.1
+clientPort=2181
+server.1=127.0.0.1:2881:3881
+server.2=127.0.0.1:2882:3882
+server.3=127.0.0.1:2883:3883
+4lw.commands.whitelist=ruok,srvr,mntr
+reconfigEnabled=true
+zookeeper-zig.clusterId=0198f54d-5c2a-7000-8000-000000000001
+```
+
+Write the local server id to `/var/lib/zookeeper/myid`, then run:
+
+```sh
+zig-out/bin/zookeeper-quorum-server --config /etc/zookeeper/zoo.cfg
+```
+
+`dynamicConfigFile` and the modern `server.N=...;clientAddress:clientPort`
+syntax are supported. The first server port becomes the Raft address; the
+upstream election port is parsed but unused. For immutable static ensembles,
+the Raft cluster ID is derived deterministically from sorted member IDs and
+addresses. Dynamic files, enabled reconfiguration, joins, and CLI peer
+replacement require an explicit `zookeeper-zig.clusterId` or `--cluster-id`
+so membership changes cannot change cluster identity. A standalone file needs
+no `myid`; it defaults to node 1 and `127.0.0.1:2888` for Raft.
+
+Explicit CLI values override singular file values. Any CLI `--peer` entries
+replace the file member list; `--join` omits the local `server.N` entry from
+seed peers. Initial observer entries, hostnames/IPv6 addresses, property-line
+continuations, and enabled TLS/SASL settings are rejected rather than silently
+downgraded. AdminServer remains disabled unless its file settings explicitly
+enable or configure it. Optional `zookeeper-zig.*` keys provide `clusterId`,
+`nodeId`, `raftListen`, `raftAdvertise`, `join`, `clientRequestWorkers`, and
+`clientRequestQueueCapacity` overrides.
+
 The current server supports replicated sessions, session resume and expiration,
 ephemeral, sequential, container, and TTL nodes, digest authentication, ACL
 enforcement, Connect, ping, closeSession, create/create2/createContainer/createTTL,

@@ -22,6 +22,7 @@
         "build.zig.zon",
         "schema",
         "tla",
+        "COMPATIBILITY.md",
         "LICENSE",
         "README.md",
         "src",

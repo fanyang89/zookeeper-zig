@@ -4,6 +4,7 @@ const zookeeper = @import("zookeeper");
 
 const usage =
     \\usage: zookeeper-quorum-server \\
+    \\  [--config ZOO.CFG] \\
     \\  --node-id ID \\
     \\  --cluster-id UUID \\
     \\  --client-listen IPV4:PORT \\
@@ -28,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    var config = zookeeper.server.config.parse(init.gpa, arguments[1..]) catch |err| {
+    var config = zookeeper.server.config.parseWithIo(init.gpa, init.io, arguments[1..]) catch |err| {
         var buffer: [256]u8 = undefined;
         const message = try std.fmt.bufPrint(&buffer, "invalid server configuration: {s}\n", .{@errorName(err)});
         try writeStderr(init.io, message);

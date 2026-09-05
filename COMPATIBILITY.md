@@ -107,8 +107,8 @@ migration is intentionally one-way.
 | Four-letter commands | **Implemented** | ZooKeeper 3.9.5 command set and whitelist semantics are implemented. Native tests cover output; direct upstream `FourLetterWord` test coverage remains open. |
 | AdminServer `/commands` HTTP endpoints | **Partial** | Plaintext and JSON command responses are implemented when `--admin-listen` is set. XML and JSONP are not implemented, and the server is disabled by default instead of listening on port 8080. |
 | Prometheus-style `mntr` consumers | **Implemented** | Upstream-compatible metric keys are emitted; exporter-specific certification is not claimed. |
-| `zoo.cfg` loading | **Unsupported** | The server currently uses explicit CLI flags. |
-| Dynamic `zoo.cfg.dynamic` management | **Unsupported** | Client reconfiguration updates replicated `/zookeeper/config`, not upstream configuration files. |
+| `zoo.cfg` loading | **Partial** | `dataDir`/`myid`, client endpoints, `server.N`, `dynamicConfigFile`, 4lw, reconfiguration, and AdminServer settings are loaded. The quorum port maps to Raft; election ports are unused. Initial observers, hostnames/IPv6, continuations, and enabled TLS/SASL settings are rejected. CLI flags can override file values; mutable membership requires an explicit stable cluster ID. |
+| Dynamic `zoo.cfg.dynamic` management | **Partial** | Existing dynamic files are read at startup. Client reconfiguration updates replicated `/zookeeper/config`; it does not rewrite upstream configuration files. |
 
 ## Verification and test boundary
 

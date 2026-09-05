@@ -184,6 +184,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native Zig unit tests");
     test_step.dependOn(&run_tests.step);
 
+    const config_test_module = b.createModule(.{
+        .root_source_file = b.path("src/config_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    });
+    const config_tests = b.addTest(.{
+        .root_module = config_test_module,
+        .filters = &.{"zoo.cfg"},
+        .test_runner = .{
+            .path = zest.path("src/root.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_config_tests = b.addRunArtifact(config_tests);
+    const test_config = b.step("test-config", "Run zoo.cfg configuration tests");
+    test_config.dependOn(&run_config_tests.step);
+
     const tsan_module = b.createModule(.{
         .root_source_file = b.path("src/tsan_test.zig"),
         .target = target,

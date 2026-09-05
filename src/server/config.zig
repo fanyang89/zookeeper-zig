@@ -1,5 +1,6 @@
 const std = @import("std");
 const raft = @import("raftz");
+const zoo_cfg = @import("zoo_cfg.zig");
 
 pub const ServerConfig = struct {
     allocator: std.mem.Allocator,
@@ -24,6 +25,7 @@ pub const ServerConfig = struct {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
         self.allocator.free(self.peers);
         self.allocator.free(self.four_letter_whitelist);
+        if (self.admin_listen) |endpoint| self.allocator.free(endpoint.host);
         if (self.import_zookeeper_log_dir) |value| self.allocator.free(value);
         if (self.import_zookeeper_data_dir) |value| self.allocator.free(value);
         self.allocator.free(self.data_dir);
@@ -33,6 +35,19 @@ pub const ServerConfig = struct {
         self.* = undefined;
     }
 };
+
+pub fn parseWithIo(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    arguments: []const []const u8,
+) !ServerConfig {
+    var expanded = try zoo_cfg.expand(allocator, io, arguments);
+    if (expanded) |*owned| {
+        defer owned.deinit();
+        return parse(allocator, owned.arguments.items);
+    }
+    return parse(allocator, arguments);
+}
 
 pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !ServerConfig {
     var node_id: ?u64 = null;
@@ -156,6 +171,12 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         for (peers) |peer| found_local = found_local or peer.id == resolved_node_id;
         if (peers.len != 0 and !found_local) return error.LocalPeerRequired;
     }
+    const parsed_admin = if (admin_listen) |listen| try parseEndpoint(listen) else null;
+    const owned_admin = if (parsed_admin) |endpoint| Endpoint{
+        .host = try allocator.dupe(u8, endpoint.host),
+        .port = endpoint.port,
+    } else null;
+    errdefer if (owned_admin) |endpoint| allocator.free(endpoint.host);
 
     return .{
         .allocator = allocator,
@@ -173,7 +194,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .peers = peers,
         .join = join,
         .reconfig_enabled = reconfig_enabled,
-        .admin_listen = if (admin_listen) |listen| try parseEndpoint(listen) else null,
+        .admin_listen = owned_admin,
         .four_letter_whitelist = try allocator.dupe(u8, four_letter_whitelist orelse "srvr"),
     };
 }
@@ -274,5 +295,214 @@ test "reject zero client request limits" {
     try std.testing.expectError(
         error.InvalidClientRequestQueueCapacity,
         parse(std.testing.allocator, &queue_arguments),
+    );
+}
+
+test "load a standalone zoo.cfg without myid" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const data_dir = try temporary.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(data_dir);
+    const contents = try std.fmt.allocPrint(testing.allocator,
+        \\tickTime=2000
+        \\dataDir={s}
+        \\clientPort=2181
+        \\
+    , .{data_dir});
+    defer testing.allocator.free(contents);
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "zoo.cfg", .data = contents });
+    const config_path = try temporary.dir.realPathFileAlloc(testing.io, "zoo.cfg", testing.allocator);
+    defer testing.allocator.free(config_path);
+
+    const arguments = [_][]const u8{ "--config", config_path };
+    var parsed = try parseWithIo(testing.allocator, testing.io, &arguments);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u64, 1), parsed.node_id);
+    try testing.expectEqualStrings("0.0.0.0", parsed.client_host);
+    try testing.expectEqual(@as(u16, 2181), parsed.client_port);
+    try testing.expectEqualStrings("127.0.0.1:2888", parsed.raft_listen);
+    try testing.expectEqualStrings("127.0.0.1:2888", parsed.raft_advertise);
+    try testing.expectEqual(@as(usize, 0), parsed.peers.len);
+    try testing.expect(!std.mem.allEqual(u8, &parsed.cluster_id, 0));
+
+    const mutable_arguments = [_][]const u8{
+        "--config",           config_path,
+        "--reconfig-enabled",
+    };
+    try testing.expectError(
+        error.ZooCfgClusterIdRequiredForMutableMembership,
+        parseWithIo(testing.allocator, testing.io, &mutable_arguments),
+    );
+}
+
+test "load a standard three-node zoo.cfg" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const data_dir = try temporary.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(data_dir);
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "myid", .data = "2\n" });
+    const contents = try std.fmt.allocPrint(testing.allocator,
+        \\tickTime=2000
+        \\dataDir={s}
+        \\clientPortAddress=127.0.0.1
+        \\clientPort=2182
+        \\initLimit=10
+        \\syncLimit=5
+        \\server.1=127.0.0.1:2881:3881
+        \\server.2=127.0.0.1:2882:3882:participant
+        \\server.3=127.0.0.1:2883:3883
+        \\4lw.commands.whitelist=ruok,srvr,mntr
+        \\reconfigEnabled=true
+        \\zookeeper-zig.clusterId=0198f54d-5c2a-7000-8000-000000000002
+        \\admin.enableServer=true
+        \\admin.serverAddress=127.0.0.1
+        \\admin.serverPort=9080
+        \\
+    , .{data_dir});
+    defer testing.allocator.free(contents);
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "zoo.cfg", .data = contents });
+    const config_path = try temporary.dir.realPathFileAlloc(testing.io, "zoo.cfg", testing.allocator);
+    defer testing.allocator.free(config_path);
+
+    const arguments = [_][]const u8{ "--config", config_path };
+    var parsed = try parseWithIo(testing.allocator, testing.io, &arguments);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u64, 2), parsed.node_id);
+    try testing.expectEqualStrings(data_dir, parsed.data_dir);
+    try testing.expectEqualStrings("127.0.0.1", parsed.client_host);
+    try testing.expectEqual(@as(u16, 2182), parsed.client_port);
+    try testing.expectEqualStrings("127.0.0.1:2882", parsed.raft_listen);
+    try testing.expectEqualStrings("127.0.0.1:2882", parsed.raft_advertise);
+    try testing.expectEqual(@as(usize, 3), parsed.peers.len);
+    try testing.expectEqualStrings("ruok,srvr,mntr", parsed.four_letter_whitelist);
+    try testing.expect(parsed.reconfig_enabled);
+    try testing.expectEqualStrings("127.0.0.1", parsed.admin_listen.?.host);
+    try testing.expectEqual(@as(u16, 9080), parsed.admin_listen.?.port);
+
+    const join_arguments = [_][]const u8{ "--config", config_path, "--join" };
+    var joining = try parseWithIo(testing.allocator, testing.io, &join_arguments);
+    defer joining.deinit();
+    try testing.expect(joining.join);
+    try testing.expectEqual(@as(usize, 2), joining.peers.len);
+    for (joining.peers) |peer_value| try testing.expect(peer_value.id != 2);
+
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "myid", .data = "1\n" });
+    var peer = try parseWithIo(testing.allocator, testing.io, &arguments);
+    defer peer.deinit();
+    try testing.expectEqual(@as(u64, 1), peer.node_id);
+    try testing.expectEqualSlices(u8, &parsed.cluster_id, &peer.cluster_id);
+    try testing.expectEqualStrings("127.0.0.1:2881", peer.raft_listen);
+}
+
+test "load dynamic zoo.cfg servers and apply CLI overrides" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const data_dir = try temporary.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+    defer testing.allocator.free(data_dir);
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "myid", .data = "2" });
+    const static_contents = try std.fmt.allocPrint(testing.allocator,
+        \\dataDir={s}
+        \\dynamicConfigFile=dynamic.cfg
+        \\reconfigEnabled=true
+        \\server.3=127.0.0.1:2883:3883
+        \\admin.enableServer=false
+        \\admin.serverPort=9080
+        \\
+    , .{data_dir});
+    defer testing.allocator.free(static_contents);
+    try temporary.dir.writeFile(testing.io, .{ .sub_path = "zoo.cfg", .data = static_contents });
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "dynamic.cfg",
+        .data =
+        \\server.1=127.0.0.1:2881:3881;127.0.0.1:2181
+        \\server.2=127.0.0.1:2882:3882;127.0.0.1:2182
+        \\version=100000000
+        \\
+        ,
+    });
+    const config_path = try temporary.dir.realPathFileAlloc(testing.io, "zoo.cfg", testing.allocator);
+    defer testing.allocator.free(config_path);
+    const file_arguments = [_][]const u8{
+        "--config",     config_path,
+        "--cluster-id", "0198f54d-5c2a-7000-8000-000000000098",
+    };
+    var from_file = try parseWithIo(testing.allocator, testing.io, &file_arguments);
+    defer from_file.deinit();
+    try testing.expectEqual(@as(usize, 2), from_file.peers.len);
+    for (from_file.peers) |peer_value| try testing.expect(peer_value.id != 3);
+    try testing.expectEqual(@as(u16, 2182), from_file.client_port);
+
+    const arguments = [_][]const u8{
+        "--config",        config_path,
+        "--cluster-id",    "0198f54d-5c2a-7000-8000-000000000099",
+        "--client-listen", "127.0.0.1:32182",
+        "--raft-listen",   "127.0.0.1:42882",
+        "--peer",          "2=127.0.0.1:42882",
+    };
+    var parsed = try parseWithIo(testing.allocator, testing.io, &arguments);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u64, 2), parsed.node_id);
+    try testing.expectEqual(@as(u16, 32182), parsed.client_port);
+    try testing.expectEqualStrings("127.0.0.1:42882", parsed.raft_listen);
+    try testing.expectEqualStrings("127.0.0.1:42882", parsed.raft_advertise);
+    try testing.expectEqual(@as(usize, 1), parsed.peers.len);
+    try testing.expectEqualStrings("127.0.0.1:42882", parsed.peers[0].context.?);
+    try testing.expect(parsed.reconfig_enabled);
+    try testing.expect(parsed.admin_listen == null);
+
+    const unsafe_peer_override = [_][]const u8{
+        "--config", config_path,
+        "--peer",   "2=127.0.0.1:42882",
+    };
+    try testing.expectError(
+        error.ZooCfgClusterIdRequiredForMutableMembership,
+        parseWithIo(testing.allocator, testing.io, &unsafe_peer_override),
+    );
+}
+
+test "reject zoo.cfg settings that cannot be safely downgraded" {
+    const testing = std.testing;
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "zoo.cfg",
+        .data = "dataDir=/tmp/zk\nclientPort=2181\nsecureClientPort=2281\n",
+    });
+    const config_path = try temporary.dir.realPathFileAlloc(testing.io, "zoo.cfg", testing.allocator);
+    defer testing.allocator.free(config_path);
+    const arguments = [_][]const u8{ "--config", config_path };
+    try testing.expectError(
+        error.UnsupportedZooCfgSecurity,
+        parseWithIo(testing.allocator, testing.io, &arguments),
+    );
+
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "zoo.cfg",
+        .data = "dataDir=/tmp/zk\nclientPort=2181\nserver.1=127.0.0.1:2881:3881:observer\n",
+    });
+    try testing.expectError(
+        error.UnsupportedZooCfgObserver,
+        parseWithIo(testing.allocator, testing.io, &arguments),
+    );
+
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "zoo.cfg",
+        .data = "dataDir=/tmp/zk\nclientPort=2181\nquorum.auth.serverRequireSasl=true\n",
+    });
+    try testing.expectError(
+        error.UnsupportedZooCfgSecurity,
+        parseWithIo(testing.allocator, testing.io, &arguments),
+    );
+
+    try temporary.dir.writeFile(testing.io, .{
+        .sub_path = "zoo.cfg",
+        .data = "dataDir=/tmp/zk\nclientPort=2181\nstandaloneEnabled=false\n",
+    });
+    try testing.expectError(
+        error.ZooCfgEnsembleRequired,
+        parseWithIo(testing.allocator, testing.io, &arguments),
     );
 }
