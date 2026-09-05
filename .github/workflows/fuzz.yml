@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   fuzz:
-    name: Fuzz (${{ matrix.target }})
+    name: Fuzz (${{ matrix.suite }}/${{ matrix.target }})
     runs-on: ubuntu-24.04
     container:
       image: fedora:44
@@ -29,7 +29,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [snapshot, txnlog, snappy, gzip]
+        include:
+          - suite: import
+            target: snapshot
+          - suite: import
+            target: txnlog
+          - suite: import
+            target: snappy
+          - suite: import
+            target: gzip
+          - suite: wire
+            target: frame
+          - suite: wire
+            target: jute-record
     defaults:
       run:
         shell: bash
@@ -57,13 +69,14 @@ jobs:
 
       - name: Fuzz
         run: |
-          zig build fuzz-import -Doptimize=ReleaseSafe -Dsystem-rocksdb=true --summary all
-          zig-out/bin/zq-fuzz-import \
+          zig build fuzz-import fuzz-wire -Doptimize=ReleaseSafe -Dsystem-rocksdb=true --summary all
+          zig-out/bin/zq-fuzz-"$SUITE" \
             --target "$TARGET" \
             --iterations "${ITERATIONS}" \
             --batch-timeout-ms 120000 \
             --keep-going
         env:
+          SUITE: ${{ matrix.suite }}
           TARGET: ${{ matrix.target }}
           ITERATIONS: ${{ inputs.iterations || 2000000 }}
 
@@ -71,6 +84,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-findings-${{ matrix.target }}
-          path: tests/fuzz/corpus/import/crashes/
+          name: fuzz-findings-${{ matrix.suite }}-${{ matrix.target }}
+          path: tests/fuzz/corpus/${{ matrix.suite }}/crashes/
           if-no-files-found: ignore

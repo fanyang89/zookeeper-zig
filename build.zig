@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = imports,
         });
-        const fuzz_module = b.createModule(.{
+        const fuzz_import_module = b.createModule(.{
             .root_source_file = b.path("tools/fuzz_import.zig"),
             .target = target,
             .optimize = optimize,
@@ -134,17 +134,33 @@ pub fn build(b: *std.Build) void {
         });
         const fuzz_import = b.addExecutable(.{
             .name = "zq-fuzz-import",
-            .root_module = fuzz_module,
+            .root_module = fuzz_import_module,
         });
         const fuzz_import_step = b.step("fuzz-import", "Build the import parser fuzzer");
         fuzz_import_step.dependOn(&b.addInstallArtifact(fuzz_import, .{}).step);
 
+        const fuzz_wire_module = b.createModule(.{
+            .root_source_file = b.path("tools/fuzz_wire.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zookeeper", .module = fuzz_zookeeper_module },
+            },
+        });
+        const fuzz_wire = b.addExecutable(.{
+            .name = "zq-fuzz-wire",
+            .root_module = fuzz_wire_module,
+        });
+        const fuzz_wire_step = b.step("fuzz-wire", "Build the wire protocol fuzzer");
+        fuzz_wire_step.dependOn(&b.addInstallArtifact(fuzz_wire, .{}).step);
+
         const fuzz_smoke = b.addSystemCommand(&.{"bash"});
         fuzz_smoke.addFileArg(b.path("tools/fuzz-smoke.sh"));
         fuzz_smoke.addArtifactArg(fuzz_import);
+        fuzz_smoke.addArtifactArg(fuzz_wire);
         const test_fuzz_smoke = b.step(
             "test-fuzz-smoke",
-            "Run a bounded deterministic import parser fuzz smoke test",
+            "Run bounded deterministic fuzz smoke tests",
         );
         test_fuzz_smoke.dependOn(&fuzz_smoke.step);
     }

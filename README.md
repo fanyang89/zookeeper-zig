@@ -273,24 +273,28 @@ logs, and retains resumable sessions and ephemeral nodes. See
 
 ## Fuzzing
 
-The import parser is fuzzed with a structure-aware harness:
+The import parser and the wire protocol are fuzzed with structure-aware
+harnesses:
 
 ```sh
-mise run fuzz-import      # build tools zq-fuzz-import
-mise run test-fuzz-smoke   # fixed-seed bounded run plus corpus replay
+mise run fuzz-import      # build zq-fuzz-import
+mise run fuzz-wire        # build zq-fuzz-wire
+mise run test-fuzz-smoke  # fixed-seed bounded runs plus corpus replay
 ```
 
-The harness generates valid snapshot, transaction-log, Snappy, and gzip
-images with the Jute writer, applies deterministic structure-aware mutations,
-and feeds the bytes to the byte-level parser entry points. Inputs are a pure
-function of `(seed, target, index)`, so every finding reproduces exactly.
-Worker processes run under `timeout`, and any panic, signal, hang, or
-allocator leak is bisected to a single saved input under
-`tests/fuzz/corpus/import/crashes/`. Rejected inputs and accepted seeds are
-committed under `tests/fuzz/corpus/import/` and replayed by the smoke task as
-a regression corpus. CI runs a short fixed-seed campaign on every pull
-request; a nightly workflow runs two million iterations per target with
-random seeds.
+`zq-fuzz-import` generates valid snapshot, transaction-log, Snappy, and gzip
+images with the Jute writer and feeds mutated bytes to the byte-level import
+entry points. `zq-fuzz-wire` generates valid wire frames (requests, replies,
+connect exchanges, control packets) and valid instances of every protocol
+record via comptime reflection, then exercises the frame parser and Jute
+deserialization. Inputs are a pure function of `(seed, target, index)`, so
+every finding reproduces exactly. Worker processes run under `timeout`, and
+any panic, signal, hang, or allocator leak is bisected to a single saved
+input under `tests/fuzz/corpus/<suite>/crashes/`. Rejected inputs and
+accepted seeds are committed under `tests/fuzz/corpus/` and replayed by the
+smoke task as a regression corpus. CI runs a short fixed-seed campaign on
+every pull request; a nightly workflow runs two million iterations per
+target with random seeds.
 
 ## Roadmap
 
