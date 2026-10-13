@@ -52,6 +52,48 @@ public final class ReconfigInteropTest {
         replaceVotingMember(true);
     }
 
+    @Test
+    @Timeout(value = 180)
+    public void testFreshObserverDoesNotVote() throws Exception {
+        try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
+                 System.getProperty("zookeeper.zig.server"), testDirectory, OPERATION_TIMEOUT_MILLIS);
+             ZooKeeperAdmin admin = connectAdmin(cluster.nodeConnectString(0))) {
+            createEventually(admin, "/before-observer");
+            Stat before = new Stat();
+            admin.getConfig(false, before);
+            String observer = cluster.memberConfig(3).replace(":participant", ":observer");
+            List<String> target = Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), observer);
+            Stat joined = new Stat();
+            assertEquals(String.join("\n", target),
+                text(admin.reconfigure(null, null, target, before.getVersion(), joined)));
+            assertEquals(before.getVersion() + 1, joined.getVersion());
+            cluster.stopNode(2);
+            cluster.startJoiningNode(3, 0, 1);
+
+            try (ZooKeeper reader = connect(cluster.nodeConnectString(3))) {
+                awaitExists(reader, "/before-observer");
+                ReconfigTest.testServerHasConfig(reader, target, Collections.singletonList("3"));
+                ReconfigTest.testNormalOperation(admin, reader);
+            }
+
+            // With only two voters, the live learner must not replace either
+            // vote. Check sustained unavailability, not one transient failure.
+            cluster.stopNode(1);
+            Thread.sleep(5_000);
+            assertTrue(cluster.isNodeAlive(3), "observer exited before quorum check");
+            assertCannotConnect(cluster.nodeConnectString(0));
+            assertTrue(cluster.isNodeAlive(3), "observer exited during quorum check");
+            cluster.startNode(1);
+            try (ZooKeeper writer = connect(cluster.nodeConnectString(0));
+                 ZooKeeper reader = connect(cluster.nodeConnectString(3))) {
+                createEventually(writer, "/after-observer-quorum-recovery");
+                awaitExists(reader, "/after-observer-quorum-recovery");
+                ReconfigTest.testNormalOperation(writer, reader);
+                ReconfigTest.testServerHasConfig(reader, target, Collections.singletonList("3"));
+            }
+        }
+    }
+
     private void replaceVotingMember(boolean bulk) throws Exception {
         String binary = System.getProperty("zookeeper.zig.server");
         try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
