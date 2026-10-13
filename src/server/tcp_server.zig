@@ -274,6 +274,7 @@ const RequestPool = worker_pool.WorkerPool(RequestJob, *TcpServer, handleRequest
 pub const Options = struct {
     /// Total admitted client sockets, including pre-handshake and 4lw. Zero is unlimited.
     max_client_connections: usize = 0,
+    handshake_timeout_ms: u32 = 10_000,
     request_worker_count: usize = 0,
     request_queue_capacity: usize = 256,
     notification_queue_capacity: usize = 256,
@@ -295,6 +296,7 @@ pub const TcpServer = struct {
     notification_queue_capacity: usize,
     connections: std.Io.Group = .init,
     max_client_connections: usize = 0,
+    handshake_timeout_ms: u32 = 10_000,
     admitted_connections: std.atomic.Value(usize) = .init(0),
     four_letter: four_letter.Whitelist = .{},
     trace_mask: std.atomic.Value(i64) = .init(0),
@@ -335,6 +337,7 @@ pub const TcpServer = struct {
             .watch_manager = .init(allocator),
             .notification_queue_capacity = options.notification_queue_capacity,
             .max_client_connections = options.max_client_connections,
+            .handshake_timeout_ms = options.handshake_timeout_ms,
             .four_letter = four_letter.Whitelist.parse(options.four_letter_whitelist),
             .reconfig_enabled = options.reconfig_enabled,
             .data_dir = options.data_dir,
@@ -418,17 +421,22 @@ pub const TcpServer = struct {
         // Length-prefixed protocol frames always begin with a zero byte;
         // four-letter admin commands are lowercase ASCII. Probe the first
         // four bytes and dispatch to the admin path or push them back.
+        const timeout: std.Io.Timeout = if (self.handshake_timeout_ms == 0) .none else .{
+            .duration = .{ .raw = .fromMilliseconds(self.handshake_timeout_ms), .clock = .awake },
+        };
+        const deadline = timeout.toDeadline(self.io);
         var probe: [4]u8 = undefined;
-        try readAllRaw(self.io, transport.stream, &probe);
+        try readAllRaw(self.io, transport.stream, &probe, deadline);
         if (four_letter.looksLikeCommand(probe[0])) {
-            return self.serveFourLetter(&transport, probe);
+            return self.serveFourLetter(&transport, probe, deadline);
         }
         transport.pushBack(&probe);
 
-        const connect_payload = try transport.readFrameAlloc(
+        const connect_payload = try transport.readFrameAllocTimeout(
             self.allocator,
             self.io,
             wire.default_max_payload,
+            deadline,
         );
         defer self.allocator.free(connect_payload);
         _ = self.stats.packets_received.fetchAdd(1, .acq_rel);
@@ -583,7 +591,7 @@ pub const TcpServer = struct {
         return four_letter.render(allocator, &snapshot, admin_command);
     }
 
-    fn serveFourLetter(self: *TcpServer, transport: *TcpTransport, name: [4]u8) !void {
+    fn serveFourLetter(self: *TcpServer, transport: *TcpTransport, name: [4]u8, deadline: std.Io.Timeout) !void {
         const admin_command = four_letter.commandFromName(&name) orelse return;
         if (!self.four_letter.allows(admin_command)) {
             const text = try std.fmt.allocPrint(self.allocator, "{s} is not executed because it is not in the whitelist.\n", .{name});
@@ -594,7 +602,7 @@ pub const TcpServer = struct {
         if (admin_command == .srst) self.stats.reset();
         if (admin_command == .stmk) {
             var encoded_mask: [8]u8 = undefined;
-            try readAllRaw(self.io, transport.stream, &encoded_mask);
+            try readAllRaw(self.io, transport.stream, &encoded_mask, deadline);
             self.trace_mask.store(std.mem.readInt(i64, &encoded_mask, .big), .release);
         }
 
@@ -2455,10 +2463,10 @@ fn peerAddressAlloc(
     });
 }
 
-fn readAllRaw(io: std.Io, stream: std.Io.net.Stream, destination: []u8) !void {
+fn readAllRaw(io: std.Io, stream: std.Io.net.Stream, destination: []u8, deadline: std.Io.Timeout) !void {
     var offset: usize = 0;
     while (offset < destination.len) {
-        const message = try stream.socket.receive(io, destination[offset..]);
+        const message = try stream.socket.receiveTimeout(io, destination[offset..], deadline);
         if (message.data.len == 0) return error.EndOfStream;
         offset += message.data.len;
     }

@@ -406,8 +406,19 @@ upstream `maxClientCnxns` (a per-IP limit), and does not cover the AdminServer o
 Raft listener. A saturated client listener may reject health probes; do not
 interpret that alone as a reason to restart. This bounds admitted connection
 work, not kernel backlog, total memory, session/watch counts, or connection
-attempt rate. Idle clients can still occupy all slots: handshake deadlines,
-per-IP admission, and rate limiting remain separate production hardening work.
+attempt rate. Per-IP admission and rate limiting remain separate production
+hardening work.
+
+Opening input has a default **10-second** absolute deadline. Configure
+`--client-handshake-timeout-ms MS` or
+`zookeeper-zig.clientHandshakeTimeoutMs=MS`; `0` disables it. The same awake-clock
+deadline covers the initial four-byte probe, the full ConnectRequest, and the
+8-byte `stmk` payload when applicable. Partial input does not reset the budget.
+Expiry closes the socket and releases its connection slot. This is an input
+receive deadline, not a timeout for leader election, session establishment,
+4lw response writes, or already-established sessions. AdminServer and Raft
+listeners are unaffected. Run `mise run test-handshake-timeout` for idle,
+fragmented, slow-drip, and `stmk` regressions.
 
 Run `mise run test-connection-limits` for the real-process saturation/recovery
 regression, also run by CI.

@@ -100,6 +100,15 @@ pub fn build(b: *std.Build) void {
         );
         test_connection_limits.dependOn(&connection_limits.step);
 
+        const handshake_timeout = b.addSystemCommand(&.{"python3"});
+        handshake_timeout.addFileArg(b.path("tests/faults/handshake_timeout.py"));
+        handshake_timeout.addArtifactArg(server);
+        const test_handshake_timeout = b.step(
+            "test-handshake-timeout",
+            "Verify bounded opening input and connection slot recovery",
+        );
+        test_handshake_timeout.dependOn(&handshake_timeout.step);
+
         const backup_restore = b.addSystemCommand(&.{"python3"});
         backup_restore.addFileArg(b.path("tests/faults/backup_restore.py"));
         backup_restore.addArtifactArg(server);

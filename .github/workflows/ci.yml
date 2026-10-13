@@ -51,6 +51,7 @@ jobs:
               timeout --foreground --kill-after=10s 3m zig build test-storage-failure -Dsystem-rocksdb=true --summary all
               timeout --foreground --kill-after=10s 3m zig build test-backup-restore -Dsystem-rocksdb=true --summary all
               timeout --foreground --kill-after=10s 3m zig build test-connection-limits -Dsystem-rocksdb=true --summary all
+              timeout --foreground --kill-after=10s 3m zig build test-handshake-timeout -Dsystem-rocksdb=true --summary all
             cache-zig: true
             system-rocksdb: true
             timeout-minutes: 20

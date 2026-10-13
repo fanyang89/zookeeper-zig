@@ -318,6 +318,9 @@ fn appendZooCfg(
         try result.append("--reconfig-enabled");
     }
     if (config_join and !overrides.join) try result.append("--join");
+    if (static.get("zookeeper-zig.clientHandshakeTimeoutMs")) |value| {
+        try result.appendPair("--client-handshake-timeout-ms", value);
+    }
     if (static.get("zookeeper-zig.clientMaxConnections")) |value| {
         try result.appendPair("--client-max-connections", value);
     }
