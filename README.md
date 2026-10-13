@@ -392,6 +392,13 @@ primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
 path, the HTTP endpoints are not gated by the 4lw whitelist, matching
 upstream. The server is disabled unless `--admin-listen` is set.
 
+## Fatal driver failures
+
+A terminal Raft driver error stops the client listener and propagates out of
+main as an unsuccessful exit. Temporary leader loss does not trigger this
+path. See [health checks and service supervision](docs/fatal-driver-handling.md)
+for readiness limits, restart policy, and the remaining fault-injection gate.
+
 ## Dynamic membership (reconfig)
 
 Start the server with `--reconfig-enabled` to accept the ZooKeeper `reconfig`

@@ -352,6 +352,26 @@ pub const TcpServer = struct {
 
         var listener = try self.address.listen(self.io, .{ .reuse_address = true });
         defer listener.deinit(self.io);
+        const Outcome = union(enum) { listener: anyerror!void, health: anyerror!void };
+        var results: [2]Outcome = undefined;
+        var select = std.Io.Select(Outcome).init(self.io, &results);
+        defer select.cancelDiscard();
+        try select.concurrent(.listener, acceptConnections, .{ self, &listener });
+        try select.concurrent(.health, watchDriver, .{self});
+        switch (try select.await()) {
+            .listener => |result| try result,
+            .health => |result| try result,
+        }
+    }
+
+    fn watchDriver(self: *TcpServer) !void {
+        while (!self.quorum.driverFailed()) {
+            try self.io.sleep(.fromMilliseconds(100), .awake);
+        }
+        return error.RaftDriverFailed;
+    }
+
+    fn acceptConnections(self: *TcpServer, listener: *std.Io.net.Server) !void {
         while (true) {
             const stream = try listener.accept(self.io);
             self.connections.concurrent(self.io, serveTask, .{ self, stream }) catch |err| {
@@ -377,6 +397,7 @@ pub const TcpServer = struct {
     fn serveConnection(self: *TcpServer, stream: std.Io.net.Stream) !void {
         var transport = TcpTransport.fromStream(stream);
         defer transport.close(self.io);
+        if (self.quorum.driverFailed()) return error.RaftDriverFailed;
 
         // Length-prefixed protocol frames always begin with a zero byte;
         // four-letter admin commands are lowercase ASCII. Probe the first
@@ -515,7 +536,7 @@ pub const TcpServer = struct {
     ) ![]u8 {
         var snapshot = four_letter.Snapshot{
             .mode = self.serverMode(),
-            .serving = self.quorum.status().leader_id != 0,
+            .serving = !self.quorum.driverFailed() and self.quorum.status().leader_id != 0,
             .zxid = appliedZxid(self.quorum),
             .trace_mask = self.trace_mask.load(.acquire),
             .counters = &self.stats,
@@ -3039,4 +3060,79 @@ test "setWatches validates every path before registration" {
     try testing.expect(validWatchPathList(&valid));
     try testing.expect(!validWatchPathList(&null_entry));
     try testing.expect(!validWatchPathList(&invalid));
+}
+
+test "fatal Raft driver stops listener and idle clients without treating election as fatal" {
+    const testing = std.testing;
+    const io = testing.io;
+    try raft.log.initGlobal(std.heap.smp_allocator, io, false);
+    defer raft.log.deinitGlobal(std.heap.smp_allocator);
+    var directory = testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try directory.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(path);
+    const raft_port = try reserveTestPort(io);
+    const client_port = try reserveTestPort(io);
+    const endpoint = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{raft_port});
+    defer testing.allocator.free(endpoint);
+    const peer = try std.fmt.allocPrint(testing.allocator, "1={s}", .{endpoint});
+    defer testing.allocator.free(peer);
+    const client_endpoint = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{}", .{client_port});
+    defer testing.allocator.free(client_endpoint);
+    var config = try config_mod.parse(testing.allocator, &.{
+        "--node-id",       "1",             "--cluster-id", "0198f54d-5c2a-7000-8000-000000000002",
+        "--client-listen", client_endpoint, "--data-dir",   path,
+        "--raft-listen",   endpoint,        "--peer",       peer,
+    });
+    defer config.deinit();
+    const quorum = try quorum_mod.Quorum.create(std.heap.smp_allocator, io, &config, .{
+        .election_tick = 100_000,
+        .session_reap_interval_ms = 10,
+    });
+    defer quorum.deinit();
+    defer if (quorum.running) quorum.shutdown() catch {};
+    var server = try TcpServer.init(std.heap.smp_allocator, io, quorum, "127.0.0.1", client_port, .{
+        .request_worker_count = 1,
+    });
+    defer server.deinit();
+    const Outcome = union(enum) { serving: anyerror!void, deadline: anyerror!void };
+    const Deadline = struct {
+        fn wait(test_io: std.Io) !void {
+            try test_io.sleep(.fromSeconds(5), .awake);
+        }
+    };
+    var results: [2]Outcome = undefined;
+    var select = std.Io.Select(Outcome).init(io, &results);
+    defer select.cancelDiscard();
+    try select.concurrent(.serving, TcpServer.serve, .{&server});
+    try select.concurrent(.deadline, Deadline.wait, .{io});
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", client_port);
+    const stream = connect: {
+        for (0..100) |_| {
+            break :connect address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch {
+                try io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            };
+        }
+        return error.ListenerStartupTimeout;
+    };
+    defer stream.close(io);
+    // No leader is normal during an election. Keep an idle connection open
+    // across more than one health poll before injecting the terminal state.
+    try io.sleep(.fromMilliseconds(250), .awake);
+    try testing.expectEqual(@as(u64, 0), quorum.status().leader_id);
+    try testing.expect(!quorum.driverFailed());
+    const probe = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    probe.close(io);
+    quorum.driver_failed.store(true, .release);
+    const status = try server.renderFourLetter(testing.allocator, .srvr);
+    defer testing.allocator.free(status);
+    try testing.expect(std.mem.indexOf(u8, status, "not currently serving") != null);
+    switch (try select.await()) {
+        .serving => |result| try testing.expectError(error.RaftDriverFailed, result),
+        .deadline => return error.FatalShutdownTimeout,
+    }
+    const unexpected = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return;
+    unexpected.close(io);
+    return error.ListenerStillAccepting;
 }

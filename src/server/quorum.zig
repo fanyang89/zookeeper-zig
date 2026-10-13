@@ -220,6 +220,11 @@ pub const Quorum = struct {
         return self.raftor.getStatus();
     }
 
+    /// A terminal driver error, not a temporary election or quorum loss.
+    pub fn driverFailed(self: *const Quorum) bool {
+        return self.driver_failed.load(.acquire);
+    }
+
     pub fn memberCount(self: *const Quorum) usize {
         return self.member_count.load(.acquire);
     }
