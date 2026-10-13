@@ -91,6 +91,15 @@ pub fn build(b: *std.Build) void {
         );
         test_storage_failure.dependOn(&storage_failure.step);
 
+        const listener_failure = b.addSystemCommand(&.{"python3"});
+        listener_failure.addFileArg(b.path("tests/faults/listener_failure.py"));
+        listener_failure.addArtifactArg(server);
+        const test_listener_failure = b.step(
+            "test-listener-failure",
+            "Verify listener errors stop the process and clean up sibling listeners",
+        );
+        test_listener_failure.dependOn(&listener_failure.step);
+
         const connection_limits = b.addSystemCommand(&.{"python3"});
         connection_limits.addFileArg(b.path("tests/faults/connection_limits.py"));
         connection_limits.addArtifactArg(server);

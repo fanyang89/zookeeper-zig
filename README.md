@@ -390,7 +390,9 @@ plain four-letter output. Both the four-letter names and the upstream admin
 primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
 `configuration` for `conf`, ...) are accepted. Unlike the socket four-letter
 path, the HTTP endpoints are not gated by the 4lw whitelist, matching
-upstream. The server is disabled unless `--admin-listen` is set. HTTP
+upstream. The server is disabled unless `--admin-listen` is set. If either configured
+listener fails, the process exits unsuccessfully and cleans up the other
+listener; `mise run test-listener-failure` covers port conflicts and restart. HTTP
 headers must be complete and at most 4096 bytes (including the final CRLF pair),
 and are read under one fixed 10-second deadline. Idle, truncated, oversized,
 and timed-out requests are closed without executing a command or sending an
