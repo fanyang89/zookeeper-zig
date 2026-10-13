@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
         backup_restore.addArtifactArg(server);
         const test_backup_restore = b.step(
             "test-backup-restore",
-            "Verify offline single-node backup and isolated directory restore",
+            "Verify offline fixed-ensemble backup and isolated directory restore",
         );
         test_backup_restore.dependOn(&backup_restore.step);
 

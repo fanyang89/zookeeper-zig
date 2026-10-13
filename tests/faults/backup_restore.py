@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Cold full-data-directory backup and isolated single-node restore drill."""
+"""Cold full-data-directory backup and isolated fixed-ensemble restore drill."""
 
+import contextlib
 import hashlib
 import pathlib
 import shutil
@@ -37,13 +38,24 @@ def absent(client, xid, path):
     assert (reply_xid, error) == (xid, -101), result
 
 
-def scenario(binary, root):
+@contextlib.contextmanager
+def ensemble(binary, directory, client_ports, raft_ports):
+    with contextlib.ExitStack() as stack:
+        processes = [stack.enter_context(server(
+            binary, str(directory / f"node-{index + 1}"), port, raft_ports[index], None,
+            node_id=index + 1, peers=list(enumerate(raft_ports, start=1))))
+            for index, port in enumerate(client_ports)]
+        yield processes
+
+
+def scenario(binary, root, node_count):
     source = root / "source"
     backup = root / "backup"
     restored = root / "restored"
-    client_port, raft_port, _ = ports()
-    with server(binary, str(source), client_port, raft_port, None) as process:
-        with await_client(process, client_port) as client:
+    reserved = ports(node_count * 2)
+    client_ports, raft_ports = reserved[:node_count], reserved[node_count:]
+    with ensemble(binary, source, client_ports, raft_ports) as processes:
+        with await_client(processes[0], client_ports[0]) as client:
             create(client, 1, b"/tree", b"parent")
             create(client, 2, b"/tree/value", b"initial")
             request(client, 3, 5, buffer(b"/tree/value") + buffer(b"at-backup")
@@ -57,6 +69,14 @@ def scenario(binary, root):
             saved_acl = request(client, 8, 6, buffer(b"/tree/value"))
             assert saved_acl.startswith(acl), saved_acl
             saved_config = node_image(client, 9, b"/zookeeper/config")
+        # Linearizable reads on every endpoint establish an application-state
+        # barrier before the full ensemble is stopped and copied.
+        for process, port in zip(processes, client_ports):
+            with await_client(process, port) as client:
+                assert node_image(client, 1, b"/tree/value") == saved_value
+                assert node_image(client, 2, b"/tree") == saved_parent
+                assert request(client, 3, 6, buffer(b"/tree/value")) == saved_acl
+                assert node_image(client, 4, b"/zookeeper/config") == saved_config
     # The context manager has waited for process exit before any file is copied.
     # Copy WAL, snapshots, RocksDB, and metadata together, not just SST files.
     shutil.copytree(source, backup)
@@ -64,8 +84,8 @@ def scenario(binary, root):
     assert manifest and checksums(source) == manifest
 
     # Demonstrate the backup's recovery point using acknowledged later changes.
-    with server(binary, str(source), client_port, raft_port, None) as process:
-        with await_client(process, client_port) as client:
+    with ensemble(binary, source, client_ports, raft_ports) as processes:
+        with await_client(processes[0], client_ports[0]) as client:
             request(client, 1, 5, buffer(b"/tree/value") + buffer(b"after-backup")
                     + struct.pack(">i", 1))
             create(client, 2, b"/after-backup", b"not-in-backup")
@@ -78,8 +98,8 @@ def scenario(binary, root):
     assert checksums(backup) == manifest
     shutil.copytree(backup, restored)
     assert checksums(restored) == manifest
-    with server(binary, str(restored), client_port, raft_port, None) as process:
-        with await_client(process, client_port) as client:
+    with ensemble(binary, restored, client_ports, raft_ports) as processes:
+        with await_client(processes[0], client_ports[0]) as client:
             assert node_image(client, 1, b"/tree/value") == saved_value
             assert node_image(client, 2, b"/tree") == saved_parent
             assert request(client, 3, 6, buffer(b"/tree/value")) == saved_acl
@@ -92,14 +112,31 @@ def scenario(binary, root):
             assert sequential(client, 8) == next_sequence
             create(client, 9, b"/restored-write", b"accepted")
             assert_data(client, 10, b"/restored-write", b"accepted")
+        for process, port in zip(processes, client_ports):
+            with await_client(process, port) as client:
+                assert node_image(client, 1, b"/tree/value") == saved_value
+                assert request(client, 2, 6, buffer(b"/tree/value")) == saved_acl
+                assert node_image(client, 3, b"/zookeeper/config") == saved_config
+                assert_data(client, 4, b"/restored-write", b"accepted")
+                absent(client, 5, b"/after-backup")
+        if node_count == 3:
+            # Stop a fixed member (possibly the leader). The two remaining
+            # restored identities must still form a real writable quorum.
+            processes[2].terminate()
+            processes[2].wait(timeout=10)
+            with await_client(processes[0], client_ports[0]) as client:
+                create(client, 1, b"/restored-majority", b"two-voters")
+            with await_client(processes[1], client_ports[1]) as client:
+                assert_data(client, 1, b"/restored-majority", b"two-voters")
     assert checksums(backup) == manifest, "restore modified the backup artifact"
-    print("PASS cold backup: data/Stat/ACL/config, recovery point, sequences, new writes")
+    print(f"PASS cold backup ({node_count} nodes): data/Stat/ACL/config, recovery point, sequences, writes")
 
 
 def main():
     binary = str(pathlib.Path(sys.argv[1]).resolve())
-    with tempfile.TemporaryDirectory(prefix="zookeeper-backup-restore-") as directory:
-        scenario(binary, pathlib.Path(directory))
+    for node_count in (1, 3):
+        with tempfile.TemporaryDirectory(prefix="zookeeper-backup-restore-") as directory:
+            scenario(binary, pathlib.Path(directory), node_count)
 
 
 if __name__ == "__main__":

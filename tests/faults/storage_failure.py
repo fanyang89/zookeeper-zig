@@ -75,9 +75,9 @@ def assert_data(sock, xid, path, expected):
     assert size == len(expected) and result[4:4 + size] == expected, result
 
 
-def ports():
+def ports(count=3):
     with contextlib.ExitStack() as stack:
-        listeners = [stack.enter_context(socket.socket()) for _ in range(3)]
+        listeners = [stack.enter_context(socket.socket()) for _ in range(count)]
         for listener in listeners:
             listener.bind(("127.0.0.1", 0))
         return [listener.getsockname()[1] for listener in listeners]
@@ -89,12 +89,14 @@ def ignore_file_size_signal():
 
 
 @contextlib.contextmanager
-def server(binary, directory, client_port, raft_port, admin_port):
-    command = [binary, "--node-id", "1", "--cluster-id",
+def server(binary, directory, client_port, raft_port, admin_port, *, node_id=1, peers=None):
+    command = [binary, "--node-id", str(node_id), "--cluster-id",
                "0198f54d-5c2a-7000-8000-000000000005",
                "--client-listen", f"127.0.0.1:{client_port}",
                "--raft-listen", f"127.0.0.1:{raft_port}",
-               "--peer", f"1=127.0.0.1:{raft_port}", "--data-dir", directory]
+               "--data-dir", directory]
+    for peer_id, port in (peers if peers is not None else [(node_id, raft_port)]):
+        command += ["--peer", f"{peer_id}=127.0.0.1:{port}"]
     if admin_port is not None:
         command += ["--admin-listen", f"127.0.0.1:{admin_port}"]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL,

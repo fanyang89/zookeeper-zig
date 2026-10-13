@@ -394,10 +394,11 @@ upstream. The server is disabled unless `--admin-listen` is set.
 
 ## Offline backup recovery
 
-Run `mise run test-backup-restore` for the bounded single-node cold-backup drill.
+Run `mise run test-backup-restore` for the single-node and fixed-three-voter cold-backup drills.
 See [backup and restore](docs/backup-restore.md) for the capture procedure,
 identity restrictions, rollback/fencing risks, and remaining production gates.
-Online and multi-node disaster recovery are not established by this test.
+Online backup and recovery from incomplete or mixed-time ensemble backups remain
+unverified.
 
 ## Fatal driver failures
 

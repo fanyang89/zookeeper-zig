@@ -2,12 +2,12 @@
 
 ## Supported drill
 
-The current automated drill covers **one voting node**, the **same executable
-version**, and the **same cluster ID, node ID, and peer endpoints**. All source
-processes are stopped while files are copied. Recovery uses a different data
-directory; the original instance remains offline. This is a bounded recovery
-exercise, not a supported online backup API or a multi-node disaster-recovery
-procedure.
+The automated drill covers **one voter and a fixed three-voter ensemble**, the
+**same executable version**, and the **same cluster ID, per-node identities, and
+peer endpoints**. All source processes are stopped before any files are copied.
+Each member is restored from its own directory into a fresh directory tree;
+all original instances remain offline. This is a coordinated cold-restore drill,
+not an online backup API or recovery from incomplete/mixed-time node backups.
 
 Run:
 
@@ -24,7 +24,8 @@ The drill verifies:
 
 1. Persistent parent/child data, an updated data version, a non-default ACL,
    a sequential node, and `/zookeeper/config` exist before backup.
-2. After process exit, the complete directory is copied. Relative filenames and
+2. Linearizable reads on every endpoint confirm the saved application state.
+   After all processes exit, the complete directory is copied. Relative filenames and
    SHA-256 hashes match; WAL, RocksDB, and any snapshots/metadata stay together.
 3. The original is restarted and acknowledges additional writes. It is then
    stopped and its directory moved out of the original path.
@@ -32,23 +33,29 @@ The drill verifies:
    there. Original data, full node Stat, ACL, and config are preserved. Later
    source writes are absent, and sequential allocation resumes from the
    backup's counter. New writes succeed.
-5. The backup artifact remains byte-for-byte unchanged after recovery.
+5. All restored endpoints serve the recovered data. In the three-node case,
+   stopping a fixed member (which may be the leader) leaves a writable majority;
+   a write through one survivor is read through the other.
+6. The backup artifact remains byte-for-byte unchanged after recovery.
 
 The fixture stops the source with SIGTERM and waits for exit (with a bounded
 kill fallback); it does not claim a graceful application shutdown protocol.
 The acknowledged writes rely on the server's durable commit path.
 
-## Operator procedure for the bounded single-node case
+## Operator procedure for the bounded fixed-membership case
 
 ### Capture
 
 - Schedule downtime and fence clients. Stop automatic restarts and verify that
-  the server process has exited and no process is writing the data directory.
+  every server process has exited and no process is writing any data directory.
   Port closure alone is not proof that all writers have stopped.
+- Before shutdown, verify the intended application recovery point on every node
+  while clients are fenced. Do not combine independent node backups taken during
+  active writes or membership changes.
 - Record the exact binary/build revision, configuration, cluster ID, node ID,
   advertised endpoints, filesystem ownership, and backup time. Store secrets
   with appropriate access controls, not in public manifests or logs.
-- Copy the **entire** configured `dataDir` to a new backup location, including
+- Copy each member's **entire** configured `dataDir` to a new backup location, including
   Raft WAL, snapshot/membership files, and `state.rocksdb`. Do not copy just SST
   files, omit hidden files, or merge files from different capture times.
 - Ensure that external mounts or symlinks do not leave required data outside
@@ -60,11 +67,13 @@ The acknowledged writes rely on the server's durable commit path.
 
 ### Restore
 
-- Keep the original identity offline and clients fenced throughout validation.
+- Keep every original identity offline and clients fenced throughout validation.
   Never run the original and restored copies concurrently in the same network.
 - Verify the artifact inventory and checksums. Restore a copy to a new empty
   directory; never overwrite a live directory or start directly on the sole
   backup. Preserve the original artifact for subsequent attempts.
+- Restore each directory only to its corresponding member identity; never clone
+  one member's data into the other members. Start the full recorded ensemble.
 - Start the recorded version with the recorded cluster/node identity and peer
   endpoints, pointing `--data-dir` to the restored directory. Do not improvise
   new membership, reuse this as a clone, or downgrade snapshot formats.
@@ -76,7 +85,8 @@ The acknowledged writes rely on the server's durable commit path.
 
 ## Production gates still open
 
-- Online checkpoint/export and consistent multi-node backup/recovery.
+- Online checkpoint/export, partial-ensemble recovery, mixed-time backups, and
+  backups captured during membership changes or partitions.
 - Forced Raft snapshot creation and restore coverage in this subprocess drill;
   its small workload primarily exercises WAL/RocksDB directory recovery.
 - Different hosts/endpoints, membership replacement, and version changes.
