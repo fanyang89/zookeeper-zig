@@ -13,6 +13,7 @@ called from that pinned source **unchanged**, including their assertions.
 | `officialAdminReplacesVotingMember` | Existing incremental voter removal/join scenario retained. CAS now tests stale and future versions and unchanged config bytes/full Stat. |
 | `testBulkReconfig` | Adapted from upstream lines 466-500: `newMembers` replaces 3 voters with 2, then with 3 using fresh ID 4. Uses explicit successful CAS rather than upstream `-1`. Reuses the same distributed quorum checks as incremental replacement. Excludes upstream seven-node topology, two observers, and simultaneous port changes: they would require unsupported role reconciliation or additional transport lifecycle coverage. |
 | `testFreshObserverDoesNotVote` | Additional bounded learner scenario: bulk CAS replaces voter 3 with fresh observer 4, starts it in join mode, checks catch-up and unchanged upstream config/read-write helpers, then keeps it alive while voter 2 is stopped. Voter 1 cannot establish sessions throughout a fifteen-second window after stabilization; restoring voter 2 restores writes and observer reads. No same-ID transition or full upstream Observer claim. |
+| `testIncrementalObserverDoesNotVote` | Runs the fresh-observer scenario with an observer-only `joiningServers` list and voter 3 in `leavingServers`. Both observer scenarios reject removing all participants without config mutation before accepting a valid target. Same catch-up, serving, sustained non-voting, and recovery assertions as the bulk case. |
 | `testRemoveOneAsynchronous` | Adapted from lines 503-539: three instead of five nodes; removes fixed ID 3 (leader or follower) rather than introspecting ZAB leader identity. Uses bounded `CompletableFuture` instead of unbounded monitor wait. Checks success code, path, context identity, data, Stat, and asynchronous stale-CAS error/null payload plus config immutability. Excludes serving/config assertions on the retired node. |
 | `testPublicConfigPoisonCannotChangeMembership` | Additional regression, not an upstream scenario: ordinary and multi `setData` write altered roles or malformed public config data; unsupported bulk changes still fail, preserving public bytes/Stat, and valid repair succeeds. Deletion cannot bypass the guard; a valid repair recreates the node. Positive writes still require the unchanged voter. Native tests inspect authoritative metadata immutability and all metadata/public-node presence combinations. |
 | `testRoleChangeRejectedWithoutConfigMutation` | Negative adaptation of lines 541-616, **not** upstream success semantics. Rejects same-ID voter demotion via incremental and bulk APIs, checks unchanged config bytes/full Stat, accepts a subsequent valid request, and proves the unchanged node still votes. Native tests additionally exercise promotion, both request construction forms, CAS and `-1`, same-role address update, fixed-v6 replay and reopen. No live observer-promotion claim. |
@@ -48,7 +49,7 @@ Positive reconfigs and the separate async-removal scenario are unchanged.
 Four scripted tests (no server processes) cover transient request/read loss then
 BadVersion, forbidden success/unexpected request errors, request/read deadline
 expiry without reset, and mutation/unexpected read errors. The class selection
-therefore contains six distributed scenarios plus four helper tests. These
+therefore contains seven distributed scenarios plus four helper tests. These
 are local harness tests, not additional unchanged upstream scenarios.
 
 ## Role and recovery safety limits
@@ -86,8 +87,12 @@ Zig ensembles and downgrade after v7 writes are unsupported. Existing incorrect
 role configurations are **not automatically repaired**. Applied Raft index may
 advance on rejection even though config data/Stat and callbacks do not.
 
-Fresh learner addition via bulk reconfiguration is covered by this Java slice;
-the incremental parser still rejects observer-only joining lists. Initial observers,
+Fresh learner addition via bulk and observer-only incremental reconfiguration is
+covered by this Java slice. Incremental entries are parsed as a subset and the
+merged target must retain a participant. This changes only request construction:
+replicated commands still contain a complete canonical target, so historical
+v6/v7 replay semantics and the authoritative same-ID role guard are unchanged.
+Initial observers,
 full Observer serving semantics, ZAB/QuorumUtil/JMX behavior, membership completion
 at successful response time, durable pending-reconciliation recovery, concurrent
 reconfigs across ingress nodes, port-change lifecycle, mixed Java/Zig clusters,

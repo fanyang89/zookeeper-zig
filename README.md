@@ -414,8 +414,9 @@ reconfig completes the membership change idempotently.
 Same-ID participant/observer transitions are unsupported and fail closed with
 `BadArguments` before changing the committed config or its version (both
 incremental and bulk requests). Fresh IDs and same-role address updates are
-unaffected; this does not establish full observer serving support. In particular,
-the incremental parser currently rejects observer-only joining lists.
+unaffected. Observer-only incremental joining lists are supported when the final
+configuration retains a participant; this does not establish full observer
+serving support.
 
 Replicated command format v7 enforces this guard at apply time against private
 persisted membership metadata, not the publicly writable `/zookeeper/config`

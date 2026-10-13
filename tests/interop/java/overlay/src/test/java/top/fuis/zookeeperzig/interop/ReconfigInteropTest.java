@@ -55,17 +55,37 @@ public final class ReconfigInteropTest {
     @Test
     @Timeout(value = 180)
     public void testFreshObserverDoesNotVote() throws Exception {
+        freshObserverDoesNotVote(false);
+    }
+
+    @Test
+    @Timeout(value = 180)
+    public void testIncrementalObserverDoesNotVote() throws Exception {
+        freshObserverDoesNotVote(true);
+    }
+
+    private void freshObserverDoesNotVote(boolean incremental) throws Exception {
         try (ZigQuorumProcess cluster = ZigQuorumProcess.start(
                  System.getProperty("zookeeper.zig.server"), testDirectory, OPERATION_TIMEOUT_MILLIS);
              ZooKeeperAdmin admin = connectAdmin(cluster.nodeConnectString(0))) {
             createEventually(admin, "/before-observer");
             Stat before = new Stat();
-            admin.getConfig(false, before);
+            String baseline = text(admin.getConfig(false, before));
             String observer = cluster.memberConfig(3).replace(":participant", ":observer");
             List<String> target = Arrays.asList(cluster.memberConfig(0), cluster.memberConfig(1), observer);
+            assertThrows(KeeperException.BadArgumentsException.class,
+                () -> admin.reconfigure(
+                    incremental ? Collections.singletonList(observer) : null,
+                    incremental ? Arrays.asList("1", "2", "3") : null,
+                    incremental ? null : Collections.singletonList(observer),
+                    before.getVersion(), new Stat()));
+            assertConfigUnchanged(admin, baseline, before);
             Stat joined = new Stat();
             assertEquals(String.join("\n", target),
-                text(admin.reconfigure(null, null, target, before.getVersion(), joined)));
+                text(admin.reconfigure(
+                    incremental ? Collections.singletonList(observer) : null,
+                    incremental ? Collections.singletonList("3") : null,
+                    incremental ? null : target, before.getVersion(), joined)));
             assertEquals(before.getVersion() + 1, joined.getVersion());
             cluster.stopNode(2);
             cluster.startJoiningNode(3, 0, 1);
@@ -258,9 +278,8 @@ public final class ReconfigInteropTest {
                 cluster.memberConfig(0), cluster.memberConfig(1), cluster.memberConfig(2));
             List<String> bulk = Arrays.asList(
                 cluster.memberConfig(0), cluster.memberConfig(1), observer);
-            // Include an unchanged participant: the existing incremental parser
-            // rejects an observer-only joining list even before role validation.
-            List<String> incremental = Arrays.asList(cluster.memberConfig(0), observer);
+            // Observer-only joins reach the authoritative same-ID role guard.
+            List<String> incremental = Collections.singletonList(observer);
             assertThrows(KeeperException.BadArgumentsException.class,
                 () -> admin.reconfigure(incremental, null, null, -1, new Stat()));
             assertConfigUnchanged(admin, config, before);

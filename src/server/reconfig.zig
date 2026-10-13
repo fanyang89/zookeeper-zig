@@ -73,6 +73,15 @@ fn parseRole(text: []const u8) Error!bool {
 
 /// Parses a full config string. Entries are separated by newlines or commas.
 pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) Error![]Member {
+    const members = try parseMembers(allocator, text);
+    errdefer freeMembers(allocator, members);
+    try validate(members);
+    return members;
+}
+
+// Joining lists are subsets, not complete configurations: they may contain
+// only observers. Validate voting membership after merging joins and leaves.
+fn parseMembers(allocator: std.mem.Allocator, text: []const u8) Error![]Member {
     var members: std.ArrayList(Member) = .empty;
     errdefer {
         for (members.items) |member| allocator.free(member.address);
@@ -94,12 +103,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, text: []const u8) Error![]Membe
             if (member.id == id) return Error.DuplicateMemberId;
         }
         const spec = try parseSpec(allocator, entry[assignment + 1 ..]);
+        errdefer allocator.free(spec.address);
         try members.append(allocator, .{ .id = id, .address = spec.address, .observer = spec.observer });
     }
-    const result = try members.toOwnedSlice(allocator);
-    errdefer allocator.free(result);
-    try validate(result);
-    return result;
+    return members.toOwnedSlice(allocator);
 }
 
 pub fn validate(members: []const Member) Error!void {
@@ -191,7 +198,7 @@ pub fn applyChanges(
 
     if (joining_text) |text| {
         if (text.len > 0) {
-            const joining = try parseConfig(allocator, text);
+            const joining = try parseMembers(allocator, text);
             defer {
                 for (joining) |member| allocator.free(member.address);
                 allocator.free(joining);
@@ -218,10 +225,8 @@ pub fn applyChanges(
         }
     }
 
-    const result = try members.toOwnedSlice(allocator);
-    errdefer allocator.free(result);
-    try validate(result);
-    return result;
+    try validate(members.items);
+    return members.toOwnedSlice(allocator);
 }
 
 /// One step toward reconciling live Raft membership with a target config.
@@ -360,4 +365,27 @@ test "diffMembership orders adds before removes" {
     try std.testing.expectEqual(@as(u64, 2), ops[0].update_address.id);
     try std.testing.expectEqual(@as(u64, 3), ops[1].add.id);
     try std.testing.expectEqual(@as(u64, 1), ops[2].remove.id);
+}
+
+test "observer-only joins validate the resulting membership" {
+    const allocator = std.testing.allocator;
+    const current = try parseConfig(allocator, "server.1=127.0.0.1:2881,server.2=127.0.0.1:2882");
+    defer freeMembers(allocator, current);
+    const observer = "server.3=127.0.0.1:2883:observer";
+    const joined = try applyChanges(allocator, current, observer, "2");
+    defer freeMembers(allocator, joined);
+    try std.testing.expectEqual(@as(usize, 2), joined.len);
+    try std.testing.expectEqual(@as(u64, 1), joined[0].id);
+    try std.testing.expect(!joined[0].observer);
+    try std.testing.expectEqual(@as(u64, 3), joined[1].id);
+    try std.testing.expect(joined[1].observer);
+
+    const updated = try applyChanges(allocator, joined, "server.3=127.0.0.1:3883:observer", null);
+    defer freeMembers(allocator, updated);
+    try std.testing.expectEqualStrings("127.0.0.1:3883", updated[1].address);
+    try std.testing.expect(updated[1].observer);
+    try std.testing.expectError(Error.EmptyMembership, parseConfig(allocator, observer));
+    try std.testing.expectError(Error.EmptyMembership, applyChanges(allocator, current, observer, "1,2"));
+    try std.testing.expectError(Error.DuplicateMemberId, applyChanges(allocator, current, observer ++ "," ++ observer, null));
+    try std.testing.expectError(Error.InvalidConfig, applyChanges(allocator, current, observer ++ ",invalid", null));
 }

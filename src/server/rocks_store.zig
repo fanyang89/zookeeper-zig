@@ -3038,7 +3038,7 @@ test "reconfig rejects same-ID role changes without config mutation" {
             const changes = if (promote)
                 "server.3=127.0.0.1:2883:participant"
             else
-                "server.1=127.0.0.1:2881:participant,server.2=127.0.0.1:2882:observer";
+                "server.2=127.0.0.1:2882:observer";
             var target = try allocator.dupe(reconfig.Member, &current);
             if (incremental) {
                 target = try reconfig.applyChanges(allocator, &current, changes, null);
