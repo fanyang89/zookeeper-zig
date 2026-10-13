@@ -79,6 +79,9 @@ fn commandForName(name: []const u8) ?four_letter.Command {
 const Format = enum { json, txt };
 
 const max_header_bytes = 4096;
+const resource_limit_response = "HTTP/1.1 503 Service Unavailable\r\n" ++
+    "Content-Type: text/plain; charset=utf-8\r\nContent-Length: 21\r\nConnection: close\r\n\r\n" ++
+    "admin resource limit\n";
 
 fn headerLength(request: []const u8) !?usize {
     if (std.mem.indexOf(u8, request, "\r\n\r\n")) |offset| {
@@ -221,6 +224,7 @@ pub const AdminServer = struct {
     header_timeout_ms: u32 = 10_000,
     response_timeout_ms: u32 = 10_000,
     max_connections: usize = 64,
+    response_memory_limit: usize = 4 * 1024 * 1024,
     admitted_connections: std.atomic.Value(usize) = .init(0),
 
     pub fn init(
@@ -281,40 +285,55 @@ pub const AdminServer = struct {
         }
         const request = buffer[0..length];
 
-        var response = handleRequest(self.allocator, self.provider, request) catch |err| switch (err) {
+        const storage = self.allocator.alloc(u8, self.response_memory_limit) catch
+            return self.writeResponse(stream, resource_limit_response);
+        defer self.allocator.free(storage);
+        var fixed = std.heap.FixedBufferAllocator.init(storage);
+        const output = self.prepareResponse(fixed.allocator(), request) catch
+            return self.writeResponse(stream, resource_limit_response);
+        try self.writeResponse(stream, output);
+    }
+
+    fn prepareResponse(self: *AdminServer, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
+        var response = handleRequest(allocator, self.provider, request) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
             error.MethodNotAllowed => Response{
                 .status = 405,
                 .content_type = "text/plain; charset=utf-8",
-                .body = try self.allocator.dupe(u8, "method not allowed\n"),
+                .body = try allocator.dupe(u8, "method not allowed\n"),
             },
             error.NotFound => Response{
                 .status = 404,
                 .content_type = "text/plain; charset=utf-8",
-                .body = try self.allocator.dupe(u8, "not found\n"),
+                .body = try allocator.dupe(u8, "not found\n"),
             },
             else => Response{
                 .status = 500,
                 .content_type = "text/plain; charset=utf-8",
-                .body = try self.allocator.dupe(u8, "internal error\n"),
+                .body = try allocator.dupe(u8, "internal error\n"),
             },
         };
-        defer response.deinit(self.allocator);
+        defer response.deinit(allocator);
 
         const head = try std.fmt.allocPrint(
-            self.allocator,
+            allocator,
             "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
             .{ response.status, reasonPhrase(response.status), response.content_type, response.body.len },
         );
-        defer self.allocator.free(head);
+        defer allocator.free(head);
         var outbound: std.ArrayList(u8) = .empty;
-        defer outbound.deinit(self.allocator);
-        try outbound.appendSlice(self.allocator, head);
-        try outbound.appendSlice(self.allocator, response.body);
+        errdefer outbound.deinit(allocator);
+        try outbound.appendSlice(allocator, head);
+        try outbound.appendSlice(allocator, response.body);
+        return outbound.toOwnedSlice(allocator);
+    }
+
+    fn writeResponse(self: *AdminServer, stream: std.Io.net.Stream, output: []const u8) !void {
         // TcpTransport writes the supplied bytes verbatim; HTTP has already
         // been framed above. Its cancelable write race also handles a peer
         // that stops reading after a partial response.
         var transport = TcpTransport.fromStream(stream);
-        try transport.writeFrameTimeout(self.io, outbound.items, .{ .duration = .{
+        try transport.writeFrameTimeout(self.io, output, .{ .duration = .{
             .raw = .fromMilliseconds(self.response_timeout_ms),
             .clock = .awake,
         } });
@@ -345,6 +364,7 @@ const StubProvider = struct {
     fn render(ctx: *anyopaque, allocator: std.mem.Allocator, command: four_letter.Command) anyerror![]u8 {
         _ = ctx;
         return switch (command) {
+            .wchc => try allocator.alloc(u8, 128 * 1024 * 1024),
             .dump => blk: {
                 const data = try allocator.alloc(u8, 16 * 1024 * 1024);
                 @memset(data, 'x');
@@ -427,6 +447,7 @@ test "admin server serves real HTTP requests over loopback" {
     admin.header_timeout_ms = 1_000;
     admin.response_timeout_ms = 100;
     admin.max_connections = 1;
+    admin.response_memory_limit = 64 * 1024 * 1024;
 
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(testing.io);
@@ -502,6 +523,22 @@ test "admin server serves real HTTP requests over loopback" {
     }
     try testing.expect(std.mem.startsWith(u8, &prefix, "HTTP/1.1 200"));
     try waitForAdmitted(&admin, 0);
+    for (0..3) |_| {
+        const oversized = try address.connect(testing.io, .{ .mode = .stream });
+        defer oversized.close(testing.io);
+        try writeAll(testing.io, oversized, "GET /commands/wchc?format=txt HTTP/1.1\r\n\r\n");
+        length = 0;
+        while (length < buffer.len) {
+            const message = try oversized.socket.receiveTimeout(testing.io, buffer[length..], .{ .duration = .{
+                .raw = .fromSeconds(2),
+                .clock = .awake,
+            } });
+            if (message.data.len == 0) break;
+            length += message.data.len;
+        }
+        try testing.expectEqualStrings(resource_limit_response, buffer[0..length]);
+        try waitForAdmitted(&admin, 0);
+    }
     for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", "x" ** max_header_bytes }) |input| {
         try waitForAdmitted(&admin, 0);
         const invalid = try address.connect(testing.io, .{ .mode = .stream });
@@ -573,4 +610,18 @@ test "admin rejects incomplete and oversized headers before invoking commands" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "admin response construction honors a shared fixed allocation budget" {
+    var admin = try AdminServer.init(std.testing.allocator, std.testing.io, stubProvider(), "127.0.0.1", 0);
+    var memory: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&memory);
+    try std.testing.expectError(error.OutOfMemory, admin.prepareResponse(fixed.allocator(), "GET /commands/dump?format=txt HTTP/1.1\r\n\r\n"));
+    // Even tiny provider output must share the budget with HTTP framing.
+    fixed = std.heap.FixedBufferAllocator.init(memory[0..8]);
+    try std.testing.expectError(error.OutOfMemory, admin.prepareResponse(fixed.allocator(), "GET /commands/ruok?format=txt HTTP/1.1\r\n\r\n"));
+    fixed = std.heap.FixedBufferAllocator.init(&memory);
+    const response = try admin.prepareResponse(fixed.allocator(), "GET /commands/ruok?format=txt HTTP/1.1\r\n\r\n");
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nimok"));
 }
