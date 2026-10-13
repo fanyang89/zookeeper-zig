@@ -39,5 +39,33 @@ The native regression starts the real client accept loop without an elected
 leader, keeps idle TCP clients connected across multiple health polls, then
 injects the same atomic terminal flag set by the driver failure path. It checks
 not-serving output, bounded return of `RaftDriverFailed`, and a closed listening
-port. It does not inject an actual disk fault or assert an OS process exit code;
-end-to-end storage-failure/process-supervisor testing remains a production gate.
+port.
+
+The Linux subprocess regression `tests/faults/storage_failure.py` starts the real
+executable, confirms a persistent write and read, opens idle clients, then uses
+`prlimit(RLIMIT_FSIZE)` to make subsequent regular-file writes fail with `EFBIG`.
+`SIGXFSZ` is ignored in the child so signal termination cannot satisfy the test.
+The parent remains unrestricted, and no filesystem is filled or remounted.
+
+Both AdminServer-disabled and AdminServer-enabled scenarios require:
+
+- no successful acknowledgement of the write attempted under the fault;
+- a logged `WalWriteFailed`, followed by `RaftDriverFailed` and a positive
+  (non-signal) process exit status within the deadline;
+- refusal of new connections to the client and enabled admin ports;
+- a fresh unrestricted process, using the same identity and untouched data
+  directory, reading the acknowledged pre-fault value and accepting new writes.
+
+Run with `mise run test-storage-failure` or
+`zig build test-storage-failure -Dsystem-rocksdb=true --summary all`. Python 3
+and Linux `prlimit` support are required. CI runs it in the Unit tests job.
+The former behavior at `3239589` fails this regression by remaining alive past
+the exit deadline; the driver-exit implementation passes with both bundled and
+system RocksDB.
+
+This is a real syscall failure but not a physical disk-failure simulation. It
+covers WAL write failure, not targeted RocksDB fsync/compaction errors, ENOSPC,
+EIO, or corrupted media. Restart is performed by the test parent, not systemd or
+Kubernetes; deployment-specific backoff and restart-policy testing remain open.
+It also does not establish backup/restore capability, multi-node recovery, or
+any outcome guarantee for unacknowledged operations.
