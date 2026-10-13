@@ -114,7 +114,7 @@ migration is intentionally one-way.
 
 | Feature | Status | Boundary |
 | --- | --- | --- |
-| Client connection admission | **Implemented** | Optional total client-socket cap via `--client-max-connections` / `zookeeper-zig.clientMaxConnections`; `0` defaults to unlimited. Includes pre-handshake/4lw sockets; subprocess tests verify rejection and slot recovery. Not upstream per-IP `maxClientCnxns`; AdminServer/Raft, rate limits, and handshake deadlines are outside this cap. |
+| Client connection admission | **Implemented** | Optional total client-socket cap via `--client-max-connections` / `zookeeper-zig.clientMaxConnections`; `0` defaults to unlimited. Includes pre-handshake/4lw sockets; subprocess tests verify rejection and slot recovery. Not upstream per-IP `maxClientCnxns`; AdminServer/Raft and rate limits are outside this cap. Opening input has a separate default 10-second absolute receive deadline (`--client-handshake-timeout-ms`, `0` disables); partial Connect/4lw input cannot extend it. Established sessions and server-side session establishment are unaffected. |
 | Four-letter commands | **Verified** | The ZooKeeper 3.9.5 command set, whitelist rejection, and `stmk` payload are exercised through upstream `FourLetterWordMain` in CI, with native output tests. |
 | AdminServer `/commands` HTTP endpoints | **Partial** | Plaintext and JSON command responses are implemented when `--admin-listen` is set. XML and JSONP are not implemented, and the server is disabled by default instead of listening on port 8080. |
 | Prometheus-style `mntr` consumers | **Implemented** | Upstream-compatible metric keys are emitted; exporter-specific certification is not claimed. |

@@ -18,6 +18,9 @@ run = "zig build check-zig -Doptimize=ReleaseSafe --summary all"
 [tasks.test]
 run = "zig build test --summary all"
 
+[tasks.test-handshake-timeout]
+run = "zig build test-handshake-timeout --summary all"
+
 [tasks.test-connection-limits]
 run = "zig build test-connection-limits --summary all"
 
