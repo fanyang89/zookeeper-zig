@@ -77,15 +77,27 @@ fn commandForName(name: []const u8) ?four_letter.Command {
 
 const Format = enum { json, txt };
 
-/// Handles one HTTP/1.x request. `request` holds the raw bytes read from the
-/// socket (the request may be truncated by the connection closing; only the
-/// request line and `?format=` parameter matter).
+const max_header_bytes = 4096;
+
+fn headerLength(request: []const u8) !?usize {
+    if (std.mem.indexOf(u8, request, "\r\n\r\n")) |offset| {
+        const length = offset + 4;
+        if (length > max_header_bytes) return error.HeadersTooLarge;
+        return length;
+    }
+    if (request.len >= max_header_bytes) return error.HeadersTooLarge;
+    return null;
+}
+
+/// Handles one HTTP/1.x request with complete, bounded headers. Truncated
+/// input must never execute a management command.
 pub fn handleRequest(
     allocator: std.mem.Allocator,
     provider: Provider,
     request: []const u8,
 ) !Response {
-    var lines = std.mem.splitSequence(u8, request, "\r\n");
+    const length = (try headerLength(request)) orelse return error.MalformedRequest;
+    var lines = std.mem.splitSequence(u8, request[0..length], "\r\n");
     const request_line = lines.next() orelse return error.MalformedRequest;
     var parts = std.mem.tokenizeScalar(u8, request_line, ' ');
     const method = parts.next() orelse return error.MalformedRequest;
@@ -205,6 +217,7 @@ pub const AdminServer = struct {
     provider: Provider,
     address: std.Io.net.IpAddress,
     connections: std.Io.Group = .init,
+    header_timeout_ms: u32 = 10_000,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -241,19 +254,21 @@ pub const AdminServer = struct {
 
     fn serveConnection(self: *AdminServer, stream: std.Io.net.Stream) !void {
         defer stream.close(self.io);
-        // Read until end of headers; requests are tiny so a single bounded
-        // buffer is enough, and HTTP/1.0-style close-delimited requests from
-        // curl still work because we only need the request line.
-        var buffer: [4096]u8 = undefined;
+        // One absolute deadline for the entire header, never reset by a
+        // partial read. Reject EOF/overflow before invoking the provider.
+        const timeout: std.Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(self.header_timeout_ms),
+            .clock = .awake,
+        } };
+        const deadline = timeout.toDeadline(self.io);
+        var buffer: [max_header_bytes]u8 = undefined;
         var length: usize = 0;
-        while (length < buffer.len) {
-            const message = try stream.socket.receive(self.io, buffer[length..]);
-            if (message.data.len == 0) break;
+        while (try headerLength(buffer[0..length]) == null) {
+            const message = try stream.socket.receiveTimeout(self.io, buffer[length..], deadline);
+            if (message.data.len == 0) return error.MalformedRequest;
             length += message.data.len;
-            if (std.mem.indexOf(u8, buffer[0..length], "\r\n\r\n") != null) break;
         }
         const request = buffer[0..length];
-        if (request.len == 0) return;
 
         var response = handleRequest(self.allocator, self.provider, request) catch |err| switch (err) {
             error.MethodNotAllowed => Response{
@@ -386,6 +401,7 @@ test "admin server serves real HTTP requests over loopback" {
     const port = try reserveTestPort(testing.io);
     var admin = try AdminServer.init(testing.allocator, testing.io, stubProvider(), "127.0.0.1", port);
     defer admin.connections.cancel(testing.io);
+    admin.header_timeout_ms = 100;
 
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(testing.io);
@@ -414,7 +430,8 @@ test "admin server serves real HTTP requests over loopback" {
     const connected = stream orelse return error.AdminServerDidNotStart;
     defer connected.close(testing.io);
 
-    try writeAll(testing.io, connected, "GET /commands/mntr HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writeAll(testing.io, connected, "GET /commands/mntr HTTP/1.1\r\n");
+    try writeAll(testing.io, connected, "Host: localhost\r\n\r\n");
     var buffer: [8192]u8 = undefined;
     var length: usize = 0;
     while (length < buffer.len) {
@@ -426,6 +443,20 @@ test "admin server serves real HTTP requests over loopback" {
     try testing.expect(std.mem.indexOf(u8, response, "HTTP/1.1 200 OK") != null);
     try testing.expect(std.mem.indexOf(u8, response, "Content-Type: application/json") != null);
     try testing.expect(std.mem.indexOf(u8, response, "\"zk_server_state\" : \"leader\"") != null);
+
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", "x" ** max_header_bytes }) |input| {
+        const invalid = try address.connect(testing.io, .{ .mode = .stream });
+        defer invalid.close(testing.io);
+        if (input.len > 0) try writeAll(testing.io, invalid, input);
+        if (input.len > 0 and input.len < max_header_bytes) try invalid.shutdown(testing.io, .send);
+        var byte: [1]u8 = undefined;
+        const closed = try invalid.socket.receiveTimeout(testing.io, &byte, .{ .duration = .{
+            .raw = .fromSeconds(2),
+            .clock = .awake,
+        } });
+        try testing.expectEqual(@as(usize, 0), closed.data.len);
+    }
 }
 
 fn reserveTestPort(io: std.Io) !u16 {
@@ -440,4 +471,25 @@ fn reserveTestPort(io: std.Io) !u16 {
         &address_length,
     )) != .SUCCESS) return error.AddressQueryFailed;
     return std.mem.bigToNative(u16, local_address.port);
+}
+
+test "admin rejects incomplete and oversized headers before invoking commands" {
+    const CountingProvider = struct {
+        fn render(ctx: *anyopaque, allocator: std.mem.Allocator, command: four_letter.Command) ![]u8 {
+            _ = command;
+            const calls: *usize = @ptrCast(@alignCast(ctx));
+            calls.* += 1;
+            return allocator.dupe(u8, "imok");
+        }
+    };
+    var calls: usize = 0;
+    const provider = Provider{ .ctx = &calls, .render = CountingProvider.render };
+    try std.testing.expectError(error.MalformedRequest, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nHost: localhost\r\n"));
+    try std.testing.expectError(error.HeadersTooLarge, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nX: " ++ "a" ** max_header_bytes ++ "\r\n\r\n"));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    const prefix = "GET /commands/ruok HTTP/1.1\r\nX: ";
+    var response = try handleRequest(std.testing.allocator, provider, prefix ++ "a" ** (max_header_bytes - prefix.len - 4) ++ "\r\n\r\n");
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }

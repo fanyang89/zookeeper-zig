@@ -390,7 +390,13 @@ plain four-letter output. Both the four-letter names and the upstream admin
 primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
 `configuration` for `conf`, ...) are accepted. Unlike the socket four-letter
 path, the HTTP endpoints are not gated by the 4lw whitelist, matching
-upstream. The server is disabled unless `--admin-listen` is set.
+upstream. The server is disabled unless `--admin-listen` is set. HTTP
+headers must be complete and at most 4096 bytes (including the final CRLF pair),
+and are read under one fixed 10-second deadline. Idle, truncated, oversized,
+and timed-out requests are closed without executing a command or sending an
+HTTP error response. Partial reads do not reset the deadline. This does not
+bound command execution or response writes, limit admin connection count, or
+provide authentication; keep this listener on a protected management network.
 
 ## Client connection admission
 
