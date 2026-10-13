@@ -731,6 +731,12 @@ pub const RocksStore = struct {
             try writer.writeBuffer(&encoded_zxid);
             count += 1;
         }
+        if (try self.configString(allocator)) |config| {
+            defer allocator.free(config);
+            try writer.writeBuffer(config_string_key);
+            try writer.writeBuffer(config);
+            count += 1;
+        }
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
         var iterator = self.db.iterator(self.default_family, .forward, state_prefix);
@@ -791,6 +797,7 @@ pub const RocksStore = struct {
         var restored_zxid_base: ?i64 = null;
         var restored_maintenance_clock: ?i64 = null;
         var restored_import_zxid: ?i64 = null;
+        var restored_config = false;
         var index: u32 = 0;
         while (index < count) : (index += 1) {
             const key = (try reader.readBuffer()) orelse return error.InvalidSnapshot;
@@ -808,6 +815,11 @@ pub const RocksStore = struct {
                     .ephemeral_owner = node.ephemeral_owner,
                     .kind = node.kind,
                 };
+            } else if (std.mem.eql(u8, key, config_string_key)) {
+                if (restored_config) return error.InvalidSnapshot;
+                // Preserve authoritative bytes even when invalid; never rebuild
+                // the role baseline from the publicly writable config node.
+                restored_config = true;
             } else if (std.mem.eql(u8, key, import_zxid_key)) {
                 if (restored_import_zxid != null or value.len != 8) return error.InvalidSnapshot;
                 restored_import_zxid = std.mem.readInt(i64, value[0..8], .big);
@@ -1960,7 +1972,20 @@ pub const RocksStore = struct {
 
         var batch = rocksdb.WriteBatch.init();
         defer batch.deinit();
-        if ((try self.getNode("/zookeeper")) == null) {
+        if (try self.getNode("/zookeeper")) |value| {
+            var parent = value;
+            defer parent.deinit(self.allocator);
+            parent.child_count = std.math.add(usize, parent.child_count, 1) catch return error.InvalidSnapshot;
+            const encoded_parent = try encodeNode(self.allocator, parent);
+            defer self.allocator.free(encoded_parent);
+            batch.put(self.default_family, "/zookeeper", encoded_parent);
+        } else {
+            var root = (try self.getNode("/")) orelse return error.InvalidSnapshot;
+            defer root.deinit(self.allocator);
+            root.child_count = std.math.add(usize, root.child_count, 1) catch return error.InvalidSnapshot;
+            const encoded_root = try encodeNode(self.allocator, root);
+            defer self.allocator.free(encoded_root);
+            batch.put(self.default_family, "/", encoded_root);
             const system_node = Node{
                 .data = try self.allocator.dupe(u8, &.{}),
                 .czxid = 0,
@@ -3252,5 +3277,63 @@ test "reconfig authoritative metadata and public node presence matrix" {
             defer testing.allocator.free(replayed_metadata);
             try testing.expectEqualStrings(demoted, replayed_metadata);
         }
+    }
+}
+
+test "config baseline snapshots preserve child counts and private membership" {
+    const testing = std.testing;
+    for ([_]bool{ false, true }) |existing_parent| {
+        var directory = testing.tmpDir(.{});
+        defer directory.cleanup();
+        const path = try directory.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
+        defer testing.allocator.free(path);
+        var store = try RocksStore.open(testing.allocator, path);
+        defer store.deinit();
+        if (existing_parent) {
+            var created = try store.apply(.{ .create = .{
+                .path = "/zookeeper",
+                .data = "existing parent",
+                .time_ms = 1,
+            } }, 1, 1);
+            defer created.deinit(testing.allocator);
+            try testing.expectEqual(ErrorCode.ok, created.code);
+        }
+        const members = [_]reconfig.Member{
+            .{ .id = 1, .address = "127.0.0.1:2881" },
+            .{ .id = 2, .address = "127.0.0.1:2882" },
+        };
+        try store.ensureConfigBaseline(&members);
+        try store.ensureConfigBaseline(&members);
+        try testing.expectEqual(@as(i32, 1), (try store.exists("/")).?.numChildren);
+        try testing.expectEqual(@as(i32, 1), (try store.exists("/zookeeper")).?.numChildren);
+        const baseline = (try store.configString(testing.allocator)).?;
+        defer testing.allocator.free(baseline);
+        // A public config edit must not become the authoritative role baseline
+        // after a snapshot transfer or restart.
+        const poisoned = "server.1=127.0.0.1:2881:participant,server.2=127.0.0.1:2882:observer";
+        var changed = try store.apply(.{ .set_data = .{
+            .path = reconfig.path,
+            .data = poisoned,
+            .expected_version = -1,
+            .time_ms = 2,
+        } }, 2, 1);
+        defer changed.deinit(testing.allocator);
+        try testing.expectEqual(ErrorCode.ok, changed.code);
+        const snapshot = try store.snapshot(testing.allocator);
+        defer testing.allocator.free(snapshot);
+        try store.restore(snapshot, 2, 1);
+        const restored = (try store.configString(testing.allocator)).?;
+        defer testing.allocator.free(restored);
+        try testing.expectEqualStrings(baseline, restored);
+        const public = (try store.getData(testing.allocator, reconfig.path)).?;
+        defer testing.allocator.free(public.data.?);
+        try testing.expectEqualStrings(poisoned, public.data.?);
+        var rejected = try store.apply(.{ .reconfig = .{
+            .config = poisoned,
+            .expected_version = -1,
+            .time_ms = 3,
+        } }, 3, 1);
+        defer rejected.deinit(testing.allocator);
+        try testing.expectEqual(ErrorCode.bad_arguments, rejected.code);
     }
 }

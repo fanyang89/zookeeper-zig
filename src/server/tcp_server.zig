@@ -2634,8 +2634,9 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     defer jute.deinitDecoded(children_response, testing.allocator);
-    try testing.expectEqual(@as(usize, 1), children_response.children.?.len);
+    try testing.expectEqual(@as(usize, 2), children_response.children.?.len);
     try testing.expectEqualStrings("app", children_response.children.?[0].?);
+    try testing.expectEqualStrings("zookeeper", children_response.children.?[1].?);
 
     const sequential_xid = try client.sendRequest(.create2, protocol.proto.CreateRequest{
         .path = "/member-",
