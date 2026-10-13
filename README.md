@@ -392,6 +392,26 @@ primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
 path, the HTTP endpoints are not gated by the 4lw whitelist, matching
 upstream. The server is disabled unless `--admin-listen` is set.
 
+## Client connection admission
+
+Set `--client-max-connections 1024` (or
+`zookeeper-zig.clientMaxConnections=1024` in `zoo.cfg`) to cap the total admitted
+sockets on the client listener. CLI overrides the file; `0` preserves unlimited
+admission. Slots are reserved before handshake/task creation and returned after
+socket closure, including malformed input and cancellation. Excess connections
+are closed without a ZooKeeper response; existing clients remain served.
+
+The cap includes idle/pre-handshake sockets and four-letter commands. It is not
+upstream `maxClientCnxns` (a per-IP limit), and does not cover the AdminServer or
+Raft listener. A saturated client listener may reject health probes; do not
+interpret that alone as a reason to restart. This bounds admitted connection
+work, not kernel backlog, total memory, session/watch counts, or connection
+attempt rate. Idle clients can still occupy all slots: handshake deadlines,
+per-IP admission, and rate limiting remain separate production hardening work.
+
+Run `mise run test-connection-limits` for the real-process saturation/recovery
+regression, also run by CI.
+
 ## Offline backup recovery
 
 Run `mise run test-backup-restore` for the single-node and fixed-three-voter cold-backup drills.

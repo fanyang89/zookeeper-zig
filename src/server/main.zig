@@ -11,6 +11,7 @@ const usage =
     \\  --raft-listen IPV4:PORT \\
     \\  --data-dir PATH \\
     \\  [--raft-advertise IPV4:PORT] \\
+    \\  [--client-max-connections COUNT] \\
     \\  [--client-request-workers COUNT] \\
     \\  [--client-request-queue-capacity COUNT] \\
     \\  [--import-zookeeper-data-dir PATH] \\
@@ -67,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
         config.client_host,
         config.client_port,
         .{
+            .max_client_connections = config.client_max_connections,
             .request_worker_count = config.client_request_workers,
             .request_queue_capacity = config.client_request_queue_capacity,
             .four_letter_whitelist = config.four_letter_whitelist,

@@ -272,6 +272,8 @@ const RequestJob = union(enum) {
 const RequestPool = worker_pool.WorkerPool(RequestJob, *TcpServer, handleRequestJob);
 
 pub const Options = struct {
+    /// Total admitted client sockets, including pre-handshake and 4lw. Zero is unlimited.
+    max_client_connections: usize = 0,
     request_worker_count: usize = 0,
     request_queue_capacity: usize = 256,
     notification_queue_capacity: usize = 256,
@@ -292,6 +294,8 @@ pub const TcpServer = struct {
     watch_manager: watch.Manager,
     notification_queue_capacity: usize,
     connections: std.Io.Group = .init,
+    max_client_connections: usize = 0,
+    admitted_connections: std.atomic.Value(usize) = .init(0),
     four_letter: four_letter.Whitelist = .{},
     trace_mask: std.atomic.Value(i64) = .init(0),
     stats: four_letter.ServerCounters = .{},
@@ -330,6 +334,7 @@ pub const TcpServer = struct {
             ),
             .watch_manager = .init(allocator),
             .notification_queue_capacity = options.notification_queue_capacity,
+            .max_client_connections = options.max_client_connections,
             .four_letter = four_letter.Whitelist.parse(options.four_letter_whitelist),
             .reconfig_enabled = options.reconfig_enabled,
             .data_dir = options.data_dir,
@@ -374,8 +379,18 @@ pub const TcpServer = struct {
     fn acceptConnections(self: *TcpServer, listener: *std.Io.net.Server) !void {
         while (true) {
             const stream = try listener.accept(self.io);
+            // Only this accept loop reserves slots; connection tasks release
+            // them after closing the socket, including error/cancellation paths.
+            if (self.max_client_connections != 0 and
+                self.admitted_connections.load(.acquire) >= self.max_client_connections)
+            {
+                stream.close(self.io);
+                continue;
+            }
+            _ = self.admitted_connections.fetchAdd(1, .acq_rel);
             self.connections.concurrent(self.io, serveTask, .{ self, stream }) catch |err| {
                 stream.close(self.io);
+                _ = self.admitted_connections.fetchSub(1, .acq_rel);
                 return err;
             };
         }
@@ -388,6 +403,7 @@ pub const TcpServer = struct {
     }
 
     fn serveTask(self: *TcpServer, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+        defer _ = self.admitted_connections.fetchSub(1, .acq_rel);
         self.serveConnection(stream) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             std.log.warn("ZooKeeper client connection closed: {s}", .{@errorName(err)});
