@@ -91,6 +91,15 @@ pub fn build(b: *std.Build) void {
         );
         test_storage_failure.dependOn(&storage_failure.step);
 
+        const backup_restore = b.addSystemCommand(&.{"python3"});
+        backup_restore.addFileArg(b.path("tests/faults/backup_restore.py"));
+        backup_restore.addArtifactArg(server);
+        const test_backup_restore = b.step(
+            "test-backup-restore",
+            "Verify offline single-node backup and isolated directory restore",
+        );
+        test_backup_restore.dependOn(&backup_restore.step);
+
         const java_interop = b.addSystemCommand(&.{"bash"});
         java_interop.addFileArg(b.path("tests/interop/java/run.sh"));
         java_interop.addArtifactArg(server);
