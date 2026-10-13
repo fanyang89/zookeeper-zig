@@ -82,6 +82,15 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(server);
 
+        const storage_failure = b.addSystemCommand(&.{"python3"});
+        storage_failure.addFileArg(b.path("tests/faults/storage_failure.py"));
+        storage_failure.addArtifactArg(server);
+        const test_storage_failure = b.step(
+            "test-storage-failure",
+            "Verify fatal storage errors, process exit, and same-directory recovery",
+        );
+        test_storage_failure.dependOn(&storage_failure.step);
+
         const java_interop = b.addSystemCommand(&.{"bash"});
         java_interop.addFileArg(b.path("tests/interop/java/run.sh"));
         java_interop.addArtifactArg(server);

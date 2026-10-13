@@ -397,7 +397,9 @@ upstream. The server is disabled unless `--admin-listen` is set.
 A terminal Raft driver error stops the client listener and propagates out of
 main as an unsuccessful exit. Temporary leader loss does not trigger this
 path. See [health checks and service supervision](docs/fatal-driver-handling.md)
-for readiness limits, restart policy, and the remaining fault-injection gate.
+for readiness limits, restart policy, and storage-failure test coverage.
+Run `mise run test-storage-failure` to verify WAL write failure, nonzero process
+exit, and same-directory recovery with and without AdminServer.
 
 ## Dynamic membership (reconfig)
 
