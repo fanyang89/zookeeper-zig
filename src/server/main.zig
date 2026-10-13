@@ -89,27 +89,26 @@ pub fn main(init: std.process.Init) !void {
         );
         admin.max_connections = config.admin_max_connections;
         defer admin.connections.cancel(init.io);
-        var tasks: std.Io.Group = .init;
-        defer tasks.cancel(init.io);
-        const AdminServe = struct {
-            fn task(admin_server: *zookeeper.server.admin_server.AdminServer) std.Io.Cancelable!void {
-                return admin_server.serve() catch |err| {
-                    if (err == error.Canceled) return error.Canceled;
-                };
-            }
-        };
-        try tasks.concurrent(init.io, AdminServe.task, .{&admin});
+        const Outcome = union(enum) { admin: anyerror!void, client: anyerror!void };
+        var results: [2]Outcome = undefined;
+        var listeners = std.Io.Select(Outcome).init(init.io, &results);
+        defer listeners.cancelDiscard();
+        try listeners.concurrent(.admin, zookeeper.server.admin_server.AdminServer.serve, .{&admin});
+        try listeners.concurrent(.client, zookeeper.server.TcpServer.serve, .{&server});
         raft.log.info(
             @src(),
-            "ZooKeeper quorum node {} listening for clients on {s}:{} and Raft on {s}, admin on {s}:{}",
+            "ZooKeeper quorum node {} starting client listener on {s}:{} and Raft on {s}, admin on {s}:{}",
             .{ config.node_id, config.client_host, config.client_port, config.raft_listen, endpoint.host, endpoint.port },
         );
-        try server.serve();
+        switch (try listeners.await()) {
+            .admin => |result| try result,
+            .client => |result| try result,
+        }
         return;
     }
     raft.log.info(
         @src(),
-        "ZooKeeper quorum node {} listening for clients on {s}:{} and Raft on {s}",
+        "ZooKeeper quorum node {} starting client listener on {s}:{} and Raft on {s}",
         .{ config.node_id, config.client_host, config.client_port, config.raft_listen },
     );
     try server.serve();

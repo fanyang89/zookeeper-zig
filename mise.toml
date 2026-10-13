@@ -27,6 +27,9 @@ run = "zig build test-connection-limits --summary all"
 [tasks.test-backup-restore]
 run = "zig build test-backup-restore --summary all"
 
+[tasks.test-listener-failure]
+run = "zig build test-listener-failure --summary all"
+
 [tasks.test-storage-failure]
 run = "zig build test-storage-failure --summary all"
 

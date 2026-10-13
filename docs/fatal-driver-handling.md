@@ -15,6 +15,28 @@ Election, startup without a leader, and temporary loss of quorum do not set
 this terminal flag and do not trigger a restart. Restarting on those conditions
 can make a recoverable outage worse.
 
+## Configured listener failures
+
+When AdminServer is configured, main supervises its accept loop and the client
+serve loop together. Failure of either task propagates to main, cancels the
+other task, and exits unsuccessfully after cleanup. Admin bind/accept errors
+are no longer swallowed. Startup messages describe listeners as starting, not
+as already bound; an open client port during startup does not establish that
+both listeners have succeeded.
+
+`mise run test-listener-failure` reserves each configured port in turn, requires
+an `AddressInUse` error and positive process exit status within 15 seconds, and
+checks closure of sibling and Raft listeners. It then releases the conflict and
+verifies both ZooKeeper CRUD and AdminServer HTTP after a same-directory restart.
+The port owner is a separate test socket and must remain unaffected. The
+pre-fix revision `5115ddf` fails the admin-port case by remaining alive beyond the
+deadline. CI runs this regression alongside the storage-failure drill.
+
+This test covers bind failures, not every possible runtime accept error. It
+does not make listener startup atomic or implement deployment readiness probes.
+No destructive cleanup is performed; persistent configuration conflicts require
+operator correction rather than an unrestricted restart loop.
+
 ## Health checks and supervision
 
 - Do not use an open TCP port or `ruok` as readiness. `ruok` retains its upstream
