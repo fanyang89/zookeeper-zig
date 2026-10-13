@@ -330,6 +330,9 @@ fn appendZooCfg(
     if (static.get("zookeeper-zig.clientRequestQueueCapacity")) |value| {
         try result.appendPair("--client-request-queue-capacity", value);
     }
+    if (static.get("zookeeper-zig.adminMaxConnections")) |value| {
+        try result.appendPair("--admin-max-connections", value);
+    }
     try appendAdminArguments(result, &static);
 }
 

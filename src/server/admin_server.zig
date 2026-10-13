@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const four_letter = @import("four_letter.zig");
+const TcpTransport = @import("../client/tcp_transport.zig").TcpTransport;
 
 pub const Provider = struct {
     ctx: *anyopaque,
@@ -218,6 +219,9 @@ pub const AdminServer = struct {
     address: std.Io.net.IpAddress,
     connections: std.Io.Group = .init,
     header_timeout_ms: u32 = 10_000,
+    response_timeout_ms: u32 = 10_000,
+    max_connections: usize = 64,
+    admitted_connections: std.atomic.Value(usize) = .init(0),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -239,14 +243,21 @@ pub const AdminServer = struct {
         defer listener.deinit(self.io);
         while (true) {
             const stream = try listener.accept(self.io);
+            if (self.max_connections != 0 and self.admitted_connections.load(.acquire) >= self.max_connections) {
+                stream.close(self.io);
+                continue;
+            }
+            _ = self.admitted_connections.fetchAdd(1, .acq_rel);
             self.connections.concurrent(self.io, serveTask, .{ self, stream }) catch |err| {
                 stream.close(self.io);
+                _ = self.admitted_connections.fetchSub(1, .acq_rel);
                 return err;
             };
         }
     }
 
     fn serveTask(self: *AdminServer, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+        defer _ = self.admitted_connections.fetchSub(1, .acq_rel);
         self.serveConnection(stream) catch |err| {
             if (err == error.Canceled) return error.Canceled;
         };
@@ -299,7 +310,14 @@ pub const AdminServer = struct {
         defer outbound.deinit(self.allocator);
         try outbound.appendSlice(self.allocator, head);
         try outbound.appendSlice(self.allocator, response.body);
-        try writeAll(self.io, stream, outbound.items);
+        // TcpTransport writes the supplied bytes verbatim; HTTP has already
+        // been framed above. Its cancelable write race also handles a peer
+        // that stops reading after a partial response.
+        var transport = TcpTransport.fromStream(stream);
+        try transport.writeFrameTimeout(self.io, outbound.items, .{ .duration = .{
+            .raw = .fromMilliseconds(self.response_timeout_ms),
+            .clock = .awake,
+        } });
     }
 };
 
@@ -327,6 +345,11 @@ const StubProvider = struct {
     fn render(ctx: *anyopaque, allocator: std.mem.Allocator, command: four_letter.Command) anyerror![]u8 {
         _ = ctx;
         return switch (command) {
+            .dump => blk: {
+                const data = try allocator.alloc(u8, 16 * 1024 * 1024);
+                @memset(data, 'x');
+                break :blk data;
+            },
             .ruok => try allocator.dupe(u8, "imok"),
             .mntr => try allocator.dupe(u8, "zk_version\t3.9.5\nzk_server_state\tleader\nzk_znode_count\t7\n"),
             .srvr => try allocator.dupe(u8, "Zookeeper version: 3.9.5\nReceived: 42\nMode: leader\n"),
@@ -401,7 +424,9 @@ test "admin server serves real HTTP requests over loopback" {
     const port = try reserveTestPort(testing.io);
     var admin = try AdminServer.init(testing.allocator, testing.io, stubProvider(), "127.0.0.1", port);
     defer admin.connections.cancel(testing.io);
-    admin.header_timeout_ms = 100;
+    admin.header_timeout_ms = 1_000;
+    admin.response_timeout_ms = 100;
+    admin.max_connections = 1;
 
     var tasks: std.Io.Group = .init;
     defer tasks.cancel(testing.io);
@@ -445,7 +470,40 @@ test "admin server serves real HTTP requests over loopback" {
     try testing.expect(std.mem.indexOf(u8, response, "\"zk_server_state\" : \"leader\"") != null);
 
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
+    try waitForAdmitted(&admin, 0);
+    const idle = try address.connect(testing.io, .{ .mode = .stream });
+    {
+        defer idle.close(testing.io);
+        try waitForAdmitted(&admin, 1);
+        const excess = try address.connect(testing.io, .{ .mode = .stream });
+        defer excess.close(testing.io);
+        var byte: [1]u8 = undefined;
+        const rejected = try excess.socket.receiveTimeout(testing.io, &byte, .{ .duration = .{
+            .raw = .fromSeconds(2),
+            .clock = .awake,
+        } });
+        try testing.expectEqual(@as(usize, 0), rejected.data.len);
+    }
+    try waitForAdmitted(&admin, 0);
+    // Keep the receiver open but do not drain the large response. The write
+    // deadline must release the slot without relying on peer disconnect.
+    const stalled = try address.connect(testing.io, .{ .mode = .stream });
+    defer stalled.close(testing.io);
+    try writeAll(testing.io, stalled, "GET /commands/dump?format=txt HTTP/1.1\r\n\r\n");
+    var prefix: [12]u8 = undefined;
+    var received: usize = 0;
+    while (received < prefix.len) {
+        const first = try stalled.socket.receiveTimeout(testing.io, prefix[received..], .{ .duration = .{
+            .raw = .fromSeconds(2),
+            .clock = .awake,
+        } });
+        try testing.expect(first.data.len > 0);
+        received += first.data.len;
+    }
+    try testing.expect(std.mem.startsWith(u8, &prefix, "HTTP/1.1 200"));
+    try waitForAdmitted(&admin, 0);
     for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", "x" ** max_header_bytes }) |input| {
+        try waitForAdmitted(&admin, 0);
         const invalid = try address.connect(testing.io, .{ .mode = .stream });
         defer invalid.close(testing.io);
         if (input.len > 0) try writeAll(testing.io, invalid, input);
@@ -457,6 +515,29 @@ test "admin server serves real HTTP requests over loopback" {
         } });
         try testing.expectEqual(@as(usize, 0), closed.data.len);
     }
+    try waitForAdmitted(&admin, 0);
+    const recovered = try address.connect(testing.io, .{ .mode = .stream });
+    defer recovered.close(testing.io);
+    try writeAll(testing.io, recovered, "GET /commands/ruok?format=txt HTTP/1.1\r\n\r\n");
+    length = 0;
+    while (length < buffer.len) {
+        const message = try recovered.socket.receiveTimeout(testing.io, buffer[length..], .{ .duration = .{
+            .raw = .fromSeconds(2),
+            .clock = .awake,
+        } });
+        if (message.data.len == 0) break;
+        length += message.data.len;
+    }
+    try testing.expect(std.mem.startsWith(u8, buffer[0..length], "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, buffer[0..length], "\r\n\r\nimok"));
+}
+
+fn waitForAdmitted(admin: *AdminServer, expected: usize) !void {
+    for (0..1_000) |_| {
+        if (admin.admitted_connections.load(.acquire) == expected) return;
+        try admin.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.ConnectionBudgetTimeout;
 }
 
 fn reserveTestPort(io: std.Io) !u16 {

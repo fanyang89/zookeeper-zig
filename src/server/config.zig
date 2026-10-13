@@ -22,6 +22,7 @@ pub const ServerConfig = struct {
     four_letter_whitelist: []u8,
     reconfig_enabled: bool,
     admin_listen: ?Endpoint,
+    admin_max_connections: usize = 64,
 
     pub fn deinit(self: *ServerConfig) void {
         for (self.peers) |peer| self.allocator.free(peer.context.?);
@@ -67,6 +68,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var join = false;
     var reconfig_enabled = false;
     var admin_listen: ?[]const u8 = null;
+    var admin_max_connections: usize = 64;
     var four_letter_whitelist: ?[]const u8 = null;
     var peer_values: std.ArrayList([]const u8) = .empty;
     defer peer_values.deinit(allocator);
@@ -105,6 +107,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             raft_listen = value;
         } else if (std.mem.eql(u8, argument, "--raft-advertise")) {
             raft_advertise = value;
+        } else if (std.mem.eql(u8, argument, "--admin-max-connections")) {
+            admin_max_connections = try std.fmt.parseUnsigned(usize, value, 10);
         } else if (std.mem.eql(u8, argument, "--admin-listen")) {
             admin_listen = value;
         } else if (std.mem.eql(u8, argument, "--data-dir")) {
@@ -192,6 +196,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .cluster_id = cluster_id orelse return error.ClusterIdRequired,
         .client_host = client_host,
         .client_port = client_endpoint.port,
+        .admin_max_connections = admin_max_connections,
         .client_max_connections = client_max_connections,
         .client_handshake_timeout_ms = client_handshake_timeout_ms,
         .client_request_workers = client_request_workers,
@@ -283,6 +288,7 @@ test "parse a durable three-node quorum configuration" {
     try std.testing.expectEqual(@as(usize, 3), parsed.peers.len);
     try std.testing.expectEqualStrings("127.0.0.1", parsed.client_host);
     try std.testing.expectEqual(@as(u16, 2182), parsed.client_port);
+    try std.testing.expectEqual(@as(usize, 64), parsed.admin_max_connections);
     try std.testing.expectEqual(@as(u32, 10_000), parsed.client_handshake_timeout_ms);
     try std.testing.expectEqual(@as(usize, 100), parsed.client_max_connections);
     try std.testing.expectEqual(@as(usize, 3), parsed.client_request_workers);
@@ -321,6 +327,7 @@ test "load a standalone zoo.cfg without myid" {
         \\tickTime=2000
         \\dataDir={s}
         \\clientPort=2181
+        \\zookeeper-zig.adminMaxConnections=5
         \\zookeeper-zig.clientHandshakeTimeoutMs=700
         \\zookeeper-zig.clientMaxConnections=12
         \\
@@ -340,6 +347,7 @@ test "load a standalone zoo.cfg without myid" {
     try testing.expectEqualStrings("127.0.0.1:2888", parsed.raft_advertise);
     try testing.expectEqual(@as(usize, 0), parsed.peers.len);
     try testing.expect(!std.mem.allEqual(u8, &parsed.cluster_id, 0));
+    try testing.expectEqual(@as(usize, 5), parsed.admin_max_connections);
     try testing.expectEqual(@as(u32, 700), parsed.client_handshake_timeout_ms);
     try testing.expectEqual(@as(usize, 12), parsed.client_max_connections);
     var unlimited = try parseWithIo(testing.allocator, testing.io, &.{
@@ -347,6 +355,14 @@ test "load a standalone zoo.cfg without myid" {
         "--client-handshake-timeout-ms", "0",
     });
     defer unlimited.deinit();
+    var admin_unlimited = try parseWithIo(testing.allocator, testing.io, &.{
+        "--config", config_path, "--admin-max-connections", "0",
+    });
+    defer admin_unlimited.deinit();
+    try testing.expectEqual(@as(usize, 0), admin_unlimited.admin_max_connections);
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, &.{
+        "--admin-max-connections", "-1",
+    }));
     try testing.expectEqual(@as(u32, 0), unlimited.client_handshake_timeout_ms);
     try testing.expectEqual(@as(usize, 0), unlimited.client_max_connections);
     try testing.expectError(error.InvalidCharacter, parse(testing.allocator, &.{

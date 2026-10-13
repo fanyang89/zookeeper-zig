@@ -18,7 +18,7 @@ const usage =
     \\  [--import-zookeeper-data-dir PATH] \\
     \\  [--import-zookeeper-log-dir PATH] \\
     \\  [--peer ID=IPV4:PORT ...] [--join] [--4lw-whitelist LIST] [--reconfig-enabled]
-    \\                                              [--admin-listen HOST:PORT]
+    \\                                              [--admin-listen HOST:PORT] [--admin-max-connections COUNT]
     \\
 ;
 
@@ -87,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
             endpoint.host,
             endpoint.port,
         );
+        admin.max_connections = config.admin_max_connections;
         defer admin.connections.cancel(init.io);
         var tasks: std.Io.Group = .init;
         defer tasks.cancel(init.io);

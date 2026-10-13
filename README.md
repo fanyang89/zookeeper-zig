@@ -394,9 +394,17 @@ upstream. The server is disabled unless `--admin-listen` is set. HTTP
 headers must be complete and at most 4096 bytes (including the final CRLF pair),
 and are read under one fixed 10-second deadline. Idle, truncated, oversized,
 and timed-out requests are closed without executing a command or sending an
-HTTP error response. Partial reads do not reset the deadline. This does not
-bound command execution or response writes, limit admin connection count, or
-provide authentication; keep this listener on a protected management network.
+HTTP error response. Partial reads do not reset the deadline.
+
+Admin admission defaults to **64 sockets**, including idle readers and blocked
+writers. Set `--admin-max-connections N` or `zookeeper-zig.adminMaxConnections=N`
+in `zoo.cfg` to override it (`0` disables the cap). Excess sockets are closed
+without an HTTP response. The complete response write has a separate fixed
+**10-second** deadline; a stalled reader is disconnected and its slot released.
+A timeout may truncate a response and does not undo an executed command.
+These limits do not bound command execution, generated response size, or total
+memory and do not provide authentication. Keep this listener on a protected
+management network; saturation alone is not a restart signal.
 
 ## Client connection admission
 
