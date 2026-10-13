@@ -91,6 +91,15 @@ pub fn build(b: *std.Build) void {
         );
         test_storage_failure.dependOn(&storage_failure.step);
 
+        const connection_limits = b.addSystemCommand(&.{"python3"});
+        connection_limits.addFileArg(b.path("tests/faults/connection_limits.py"));
+        connection_limits.addArtifactArg(server);
+        const test_connection_limits = b.step(
+            "test-connection-limits",
+            "Verify pre-handshake client admission and connection slot recovery",
+        );
+        test_connection_limits.dependOn(&connection_limits.step);
+
         const backup_restore = b.addSystemCommand(&.{"python3"});
         backup_restore.addFileArg(b.path("tests/faults/backup_restore.py"));
         backup_restore.addArtifactArg(server);

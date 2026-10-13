@@ -10,6 +10,7 @@ pub const ServerConfig = struct {
     client_port: u16,
     client_request_workers: usize,
     client_request_queue_capacity: usize,
+    client_max_connections: usize = 0,
     raft_listen: []u8,
     raft_advertise: []u8,
     data_dir: []u8,
@@ -53,6 +54,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
     var node_id: ?u64 = null;
     var cluster_id: ?raft.ClusterId = null;
     var client_listen: ?[]const u8 = null;
+    var client_max_connections: usize = 0;
     var client_request_workers: usize = 0;
     var client_request_queue_capacity: usize = 256;
     var raft_listen: ?[]const u8 = null;
@@ -87,6 +89,8 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
             cluster_id = try parseClusterId(value);
         } else if (std.mem.eql(u8, argument, "--client-listen")) {
             client_listen = value;
+        } else if (std.mem.eql(u8, argument, "--client-max-connections")) {
+            client_max_connections = try std.fmt.parseUnsigned(usize, value, 10);
         } else if (std.mem.eql(u8, argument, "--client-request-workers")) {
             client_request_workers = try std.fmt.parseUnsigned(usize, value, 10);
             if (client_request_workers == 0) return error.InvalidClientRequestWorkers;
@@ -184,6 +188,7 @@ pub fn parse(allocator: std.mem.Allocator, arguments: []const []const u8) !Serve
         .cluster_id = cluster_id orelse return error.ClusterIdRequired,
         .client_host = client_host,
         .client_port = client_endpoint.port,
+        .client_max_connections = client_max_connections,
         .client_request_workers = client_request_workers,
         .client_request_queue_capacity = client_request_queue_capacity,
         .raft_listen = owned_raft_listen,
@@ -256,6 +261,7 @@ test "parse a durable three-node quorum configuration" {
         "--node-id",                       "2",
         "--cluster-id",                    "0198f54d-5c2a-7000-8000-000000000001",
         "--client-listen",                 "127.0.0.1:2182",
+        "--client-max-connections",        "100",
         "--client-request-workers",        "3",
         "--client-request-queue-capacity", "32",
         "--raft-listen",                   "127.0.0.1:2882",
@@ -272,6 +278,7 @@ test "parse a durable three-node quorum configuration" {
     try std.testing.expectEqual(@as(usize, 3), parsed.peers.len);
     try std.testing.expectEqualStrings("127.0.0.1", parsed.client_host);
     try std.testing.expectEqual(@as(u16, 2182), parsed.client_port);
+    try std.testing.expectEqual(@as(usize, 100), parsed.client_max_connections);
     try std.testing.expectEqual(@as(usize, 3), parsed.client_request_workers);
     try std.testing.expectEqual(@as(usize, 32), parsed.client_request_queue_capacity);
     try std.testing.expectEqualStrings("/srv/zookeeper/data", parsed.import_zookeeper_data_dir.?);
@@ -308,6 +315,7 @@ test "load a standalone zoo.cfg without myid" {
         \\tickTime=2000
         \\dataDir={s}
         \\clientPort=2181
+        \\zookeeper-zig.clientMaxConnections=12
         \\
     , .{data_dir});
     defer testing.allocator.free(contents);
@@ -325,6 +333,15 @@ test "load a standalone zoo.cfg without myid" {
     try testing.expectEqualStrings("127.0.0.1:2888", parsed.raft_advertise);
     try testing.expectEqual(@as(usize, 0), parsed.peers.len);
     try testing.expect(!std.mem.allEqual(u8, &parsed.cluster_id, 0));
+    try testing.expectEqual(@as(usize, 12), parsed.client_max_connections);
+    var unlimited = try parseWithIo(testing.allocator, testing.io, &.{
+        "--config", config_path, "--client-max-connections", "0",
+    });
+    defer unlimited.deinit();
+    try testing.expectEqual(@as(usize, 0), unlimited.client_max_connections);
+    try testing.expectError(error.InvalidCharacter, parse(testing.allocator, &.{
+        "--client-max-connections", "-1",
+    }));
 
     const mutable_arguments = [_][]const u8{
         "--config",           config_path,

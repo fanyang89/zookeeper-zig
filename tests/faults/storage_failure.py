@@ -89,7 +89,7 @@ def ignore_file_size_signal():
 
 
 @contextlib.contextmanager
-def server(binary, directory, client_port, raft_port, admin_port, *, node_id=1, peers=None):
+def server(binary, directory, client_port, raft_port, admin_port, *, node_id=1, peers=None, extra_args=()):
     command = [binary, "--node-id", str(node_id), "--cluster-id",
                "0198f54d-5c2a-7000-8000-000000000005",
                "--client-listen", f"127.0.0.1:{client_port}",
@@ -99,6 +99,7 @@ def server(binary, directory, client_port, raft_port, admin_port, *, node_id=1, 
         command += ["--peer", f"{peer_id}=127.0.0.1:{port}"]
     if admin_port is not None:
         command += ["--admin-listen", f"127.0.0.1:{admin_port}"]
+    command.extend(extra_args)
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, preexec_fn=ignore_file_size_signal)
     try:
