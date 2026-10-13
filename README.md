@@ -392,6 +392,13 @@ primary names (`monitor` for `mntr`, `server_stats` for `srvr`,
 path, the HTTP endpoints are not gated by the 4lw whitelist, matching
 upstream. The server is disabled unless `--admin-listen` is set.
 
+## Offline backup recovery
+
+Run `mise run test-backup-restore` for the bounded single-node cold-backup drill.
+See [backup and restore](docs/backup-restore.md) for the capture procedure,
+identity restrictions, rollback/fencing risks, and remaining production gates.
+Online and multi-node disaster recovery are not established by this test.
+
 ## Fatal driver failures
 
 A terminal Raft driver error stops the client listener and propagates out of

@@ -18,6 +18,9 @@ run = "zig build check-zig -Doptimize=ReleaseSafe --summary all"
 [tasks.test]
 run = "zig build test --summary all"
 
+[tasks.test-backup-restore]
+run = "zig build test-backup-restore --summary all"
+
 [tasks.test-storage-failure]
 run = "zig build test-storage-failure --summary all"
 

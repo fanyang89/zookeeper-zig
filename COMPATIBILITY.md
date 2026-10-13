@@ -104,6 +104,7 @@ supported; tools that infer ZAB terms from their bit layout are not.
 | Import into a non-empty Zig store | **Unsupported** | Import is an initial migration operation, not merge or replication. |
 | Export upstream snapshot/transaction logs | **Unsupported** | Migration back to Java ZooKeeper is not available. |
 | Direct RocksDB portability to Java ZooKeeper | **Unsupported** | The Zig RocksDB schema is private and not an upstream persistence format. |
+| Offline full-directory backup | **Partial** | A same-version, same-identity single-node drill verifies stopped-directory copying, data/Stat/ACL/config recovery, sequence counters, and new writes. Online backups, multi-node disaster recovery, and rollback fencing guarantees remain open; see [runbook and limits](docs/backup-restore.md). |
 | Crash recovery and snapshots inside a Zig ensemble | **Implemented** | Durable applied indexes, RocksDB state, Raft WAL/snapshots, and restart paths are native to the Zig/Raft deployment. |
 
 Take backups before import and retain the original upstream `dataDir`; the
