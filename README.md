@@ -404,9 +404,21 @@ in `zoo.cfg` to override it (`0` disables the cap). Excess sockets are closed
 without an HTTP response. The complete response write has a separate fixed
 **10-second** deadline; a stalled reader is disconnected and its slot released.
 A timeout may truncate a response and does not undo an executed command.
-These limits do not bound command execution, generated response size, or total
-memory and do not provide authentication. Keep this listener on a protected
-management network; saturation alone is not a restart signal.
+Each complete HTTP request receives a fixed **4 MiB allocation budget** shared
+by provider scratch data, command rendering, and HTTP response construction.
+That storage is released after the response or error, including provider scratch
+allocations that survive rendering. Budget exhaustion returns a fixed small
+`503 Service Unavailable` response under the same write deadline; host allocation
+failure uses the same fallback. Large dump/watch queries can therefore fail
+rather than return truncated success. The limit is a working-memory budget, not
+a 4 MiB payload allowance. Failed response construction does not undo command
+side effects.
+
+These limits do not bound command execution time, third-party internal
+allocations, kernel buffers, or total process RSS and do not provide
+authentication. The HTTP budget does not apply to the separate four-letter
+socket path. Keep this listener on a protected management network; saturation
+alone is not a restart signal.
 
 ## Client connection admission
 
