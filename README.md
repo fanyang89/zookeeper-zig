@@ -396,7 +396,13 @@ listener; `mise run test-listener-failure` covers port conflicts and restart. HT
 headers must be complete and at most 4096 bytes (including the final CRLF pair),
 and are read under one fixed 10-second deadline. Idle, truncated, oversized,
 and timed-out requests are closed without executing a command or sending an
-HTTP error response. Partial reads do not reset the deadline.
+HTTP error response. Partial reads do not reset the deadline. Complete requests require a
+three-field request line with HTTP/1.0 or HTTP/1.1; malformed request lines get
+`400` before dispatch. `HEAD` retains the corresponding GET response headers
+(including Content-Length) but sends no body, including error responses. It
+still performs command rendering and is not a cheap or side-effect-free probe.
+Unknown-command JSON escapes the requested name rather than interpolating it
+as raw JSON.
 
 Admin admission defaults to **64 sockets**, including idle readers and blocked
 writers. Set `--admin-max-connections N` or `zookeeper-zig.adminMaxConnections=N`
