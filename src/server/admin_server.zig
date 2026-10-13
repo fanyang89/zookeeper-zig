@@ -103,9 +103,17 @@ pub fn handleRequest(
     const length = (try headerLength(request)) orelse return error.MalformedRequest;
     var lines = std.mem.splitSequence(u8, request[0..length], "\r\n");
     const request_line = lines.next() orelse return error.MalformedRequest;
-    var parts = std.mem.tokenizeScalar(u8, request_line, ' ');
+    for (request_line) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.MalformedRequest;
+    }
+    if (!std.unicode.utf8ValidateSlice(request_line)) return error.MalformedRequest;
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
     const method = parts.next() orelse return error.MalformedRequest;
     const target = parts.next() orelse return error.MalformedRequest;
+    const version = parts.next() orelse return error.MalformedRequest;
+    if (method.len == 0 or !std.mem.startsWith(u8, target, "/") or parts.next() != null or
+        (!std.mem.eql(u8, version, "HTTP/1.0") and !std.mem.eql(u8, version, "HTTP/1.1")))
+        return error.MalformedRequest;
     if (!std.mem.eql(u8, method, "GET") and !std.mem.eql(u8, method, "HEAD")) {
         return error.MethodNotAllowed;
     }
@@ -128,12 +136,16 @@ pub fn handleRequest(
     }
     const name = path["/commands/".len..];
     const command = commandForName(name) orelse {
-        const body = try std.fmt.allocPrint(
-            allocator,
-            "{{\n  \"command\" : \"{s}\",\n  \"error\" : \"Unknown command: {s}\"\n}}",
-            .{ name, name },
-        );
-        return .{ .status = 404, .content_type = "application/json", .body = body };
+        var body: std.ArrayList(u8) = .empty;
+        errdefer body.deinit(allocator);
+        try body.appendSlice(allocator, "{\n  \"command\" : ");
+        try appendJsonString(allocator, &body, name);
+        try body.appendSlice(allocator, ",\n  \"error\" : ");
+        const message = try std.fmt.allocPrint(allocator, "Unknown command: {s}", .{name});
+        defer allocator.free(message);
+        try appendJsonString(allocator, &body, message);
+        try body.appendSlice(allocator, "\n}");
+        return .{ .status = 404, .content_type = "application/json", .body = try body.toOwnedSlice(allocator) };
     };
 
     const text = try provider.render(provider.ctx, allocator, command);
@@ -286,17 +298,22 @@ pub const AdminServer = struct {
         const request = buffer[0..length];
 
         const storage = self.allocator.alloc(u8, self.response_memory_limit) catch
-            return self.writeResponse(stream, resource_limit_response);
+            return self.writeResponse(stream, responseForMethod(request, resource_limit_response));
         defer self.allocator.free(storage);
         var fixed = std.heap.FixedBufferAllocator.init(storage);
         const output = self.prepareResponse(fixed.allocator(), request) catch
-            return self.writeResponse(stream, resource_limit_response);
+            return self.writeResponse(stream, responseForMethod(request, resource_limit_response));
         try self.writeResponse(stream, output);
     }
 
     fn prepareResponse(self: *AdminServer, allocator: std.mem.Allocator, request: []const u8) ![]u8 {
         var response = handleRequest(allocator, self.provider, request) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.MalformedRequest, error.HeadersTooLarge => Response{
+                .status = 400,
+                .content_type = "text/plain; charset=utf-8",
+                .body = try allocator.dupe(u8, "bad request\n"),
+            },
             error.MethodNotAllowed => Response{
                 .status = 405,
                 .content_type = "text/plain; charset=utf-8",
@@ -324,7 +341,7 @@ pub const AdminServer = struct {
         var outbound: std.ArrayList(u8) = .empty;
         errdefer outbound.deinit(allocator);
         try outbound.appendSlice(allocator, head);
-        try outbound.appendSlice(allocator, response.body);
+        if (!std.mem.startsWith(u8, request, "HEAD ")) try outbound.appendSlice(allocator, response.body);
         return outbound.toOwnedSlice(allocator);
     }
 
@@ -340,9 +357,16 @@ pub const AdminServer = struct {
     }
 };
 
+fn responseForMethod(request: []const u8, response: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, request, "HEAD ")) return response;
+    const end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    return response[0..end];
+}
+
 fn reasonPhrase(status: u16) []const u8 {
     return switch (status) {
         200 => "OK",
+        400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         else => "Internal Server Error",
@@ -523,10 +547,14 @@ test "admin server serves real HTTP requests over loopback" {
     }
     try testing.expect(std.mem.startsWith(u8, &prefix, "HTTP/1.1 200"));
     try waitForAdmitted(&admin, 0);
-    for (0..3) |_| {
+    for (0..3) |attempt| {
         const oversized = try address.connect(testing.io, .{ .mode = .stream });
         defer oversized.close(testing.io);
-        try writeAll(testing.io, oversized, "GET /commands/wchc?format=txt HTTP/1.1\r\n\r\n");
+        const oversized_request = if (attempt == 1)
+            "HEAD /commands/wchc?format=txt HTTP/1.1\r\n\r\n"
+        else
+            "GET /commands/wchc?format=txt HTTP/1.1\r\n\r\n";
+        try writeAll(testing.io, oversized, oversized_request);
         length = 0;
         while (length < buffer.len) {
             const message = try oversized.socket.receiveTimeout(testing.io, buffer[length..], .{ .duration = .{
@@ -536,7 +564,7 @@ test "admin server serves real HTTP requests over loopback" {
             if (message.data.len == 0) break;
             length += message.data.len;
         }
-        try testing.expectEqualStrings(resource_limit_response, buffer[0..length]);
+        try testing.expectEqualStrings(responseForMethod(oversized_request, resource_limit_response), buffer[0..length]);
         try waitForAdmitted(&admin, 0);
     }
     for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", "x" ** max_header_bytes }) |input| {
@@ -604,6 +632,16 @@ test "admin rejects incomplete and oversized headers before invoking commands" {
     const provider = Provider{ .ctx = &calls, .render = CountingProvider.render };
     try std.testing.expectError(error.MalformedRequest, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nHost: localhost\r\n"));
     try std.testing.expectError(error.HeadersTooLarge, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nX: " ++ "a" ** max_header_bytes ++ "\r\n\r\n"));
+    for ([_][]const u8{
+        "GET /commands/srst\r\n\r\n",
+        "GET /commands/srst HTTP/1.1 extra\r\n\r\n",
+        "GET /commands/srst HTTP/2.0\r\n\r\n",
+        "GET  /commands/srst HTTP/1.1\r\n\r\n",
+        "GET /commands/srst\t HTTP/1.1\r\n\r\n",
+        "GET /commands/\xff HTTP/1.1\r\n\r\n",
+    }) |malformed| {
+        try std.testing.expectError(error.MalformedRequest, handleRequest(std.testing.allocator, provider, malformed));
+    }
     try std.testing.expectEqual(@as(usize, 0), calls);
     const prefix = "GET /commands/ruok HTTP/1.1\r\nX: ";
     var response = try handleRequest(std.testing.allocator, provider, prefix ++ "a" ** (max_header_bytes - prefix.len - 4) ++ "\r\n\r\n");
@@ -624,4 +662,36 @@ test "admin response construction honors a shared fixed allocation budget" {
     const response = try admin.prepareResponse(fixed.allocator(), "GET /commands/ruok?format=txt HTTP/1.1\r\n\r\n");
     try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.endsWith(u8, response, "\r\n\r\nimok"));
+}
+
+test "admin HEAD preserves GET headers without transmitting a body" {
+    const allocator = std.testing.allocator;
+    var admin = try AdminServer.init(allocator, std.testing.io, stubProvider(), "127.0.0.1", 0);
+    for ([_][]const u8{ "/commands", "/commands/ruok?format=txt", "/commands/missing", "/missing" }) |target| {
+        const get_request = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\n\r\n", .{target});
+        defer allocator.free(get_request);
+        const head_request = try std.fmt.allocPrint(allocator, "HEAD {s} HTTP/1.0\r\n\r\n", .{target});
+        defer allocator.free(head_request);
+        const get = try admin.prepareResponse(allocator, get_request);
+        defer allocator.free(get);
+        const head = try admin.prepareResponse(allocator, head_request);
+        defer allocator.free(head);
+        const end = std.mem.indexOf(u8, get, "\r\n\r\n").? + 4;
+        try std.testing.expect(get.len > end);
+        try std.testing.expectEqualStrings(get[0..end], head);
+    }
+    const bad = try admin.prepareResponse(allocator, "GET /commands/srst\r\n\r\n");
+    defer allocator.free(bad);
+    try std.testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 400 Bad Request"));
+}
+
+test "admin unknown command is escaped in both JSON fields" {
+    const allocator = std.testing.allocator;
+    var response = try handleRequest(allocator, stubProvider(), "GET /commands/a\"b\\c HTTP/1.1\r\n\r\n");
+    defer response.deinit(allocator);
+    try std.testing.expectEqual(@as(u16, 404), response.status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a\"b\\c", parsed.value.object.get("command").?.string);
+    try std.testing.expectEqualStrings("Unknown command: a\"b\\c", parsed.value.object.get("error").?.string);
 }
