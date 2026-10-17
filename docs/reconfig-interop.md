@@ -54,7 +54,7 @@ are local harness tests, not additional unchanged upstream scenarios.
 
 ## Role and recovery safety limits
 
-Pinned raftz commit `78e6a811b5a965ea92bc5034daf541eb3191a956` exposes
+Pinned raftz 0.2.0 commit `2230f09d9f44238fcaedd056544c3a180a16c256` exposes
 `Raftor.addNode`/`addLearner` and `conf_changer.makeVoter`/`makeLearner`.
 However, this server's `reconfig.LiveMember`/`diffMembership` compare only IDs
 and addresses; `Quorum.driveMembership` does not reconcile same-ID roles or
