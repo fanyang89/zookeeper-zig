@@ -1,8 +1,7 @@
 //! ThreadSanitizer test root for project-owned concurrent paths.
 //!
-//! Keep this dependency closure free of C++ libraries: Zig 0.16's static
-//! libc++ conflicts with the vendored libtsan interceptors. Raft and RocksDB
-//! have their own upstream concurrency testing boundaries.
+//! Keep this dependency closure free of C++ libraries. Raft, grpc-lite, and
+//! RocksDB have their own upstream concurrency testing boundaries.
 
 const builtin = @import("builtin");
 

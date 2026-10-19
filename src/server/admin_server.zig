@@ -567,7 +567,7 @@ test "admin server serves real HTTP requests over loopback" {
         try testing.expectEqualStrings(responseForMethod(oversized_request, resource_limit_response), buffer[0..length]);
         try waitForAdmitted(&admin, 0);
     }
-    for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", "x" ** max_header_bytes }) |input| {
+    for ([_][]const u8{ "", "GET /commands/srst HTTP/1.1\r\n", &@as([max_header_bytes]u8, @splat('x')) }) |input| {
         try waitForAdmitted(&admin, 0);
         const invalid = try address.connect(testing.io, .{ .mode = .stream });
         defer invalid.close(testing.io);
@@ -631,7 +631,7 @@ test "admin rejects incomplete and oversized headers before invoking commands" {
     var calls: usize = 0;
     const provider = Provider{ .ctx = &calls, .render = CountingProvider.render };
     try std.testing.expectError(error.MalformedRequest, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nHost: localhost\r\n"));
-    try std.testing.expectError(error.HeadersTooLarge, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nX: " ++ "a" ** max_header_bytes ++ "\r\n\r\n"));
+    try std.testing.expectError(error.HeadersTooLarge, handleRequest(std.testing.allocator, provider, "GET /commands/srst HTTP/1.1\r\nX: " ++ @as([max_header_bytes]u8, @splat('a')) ++ "\r\n\r\n"));
     for ([_][]const u8{
         "GET /commands/srst\r\n\r\n",
         "GET /commands/srst HTTP/1.1 extra\r\n\r\n",
@@ -644,7 +644,7 @@ test "admin rejects incomplete and oversized headers before invoking commands" {
     }
     try std.testing.expectEqual(@as(usize, 0), calls);
     const prefix = "GET /commands/ruok HTTP/1.1\r\nX: ";
-    var response = try handleRequest(std.testing.allocator, provider, prefix ++ "a" ** (max_header_bytes - prefix.len - 4) ++ "\r\n\r\n");
+    var response = try handleRequest(std.testing.allocator, provider, prefix ++ @as([(max_header_bytes - prefix.len - 4)]u8, @splat('a')) ++ "\r\n\r\n");
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 1), calls);

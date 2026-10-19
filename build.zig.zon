@@ -2,20 +2,19 @@
     .name = .zookeeper_zig,
     .version = "0.1.0",
     .fingerprint = 0x2b6f731e2fe96126, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .raftz = .{
-            .url = "https://github.com/fanyang89/raftz/archive/2230f09d9f44238fcaedd056544c3a180a16c256.tar.gz",
-            .hash = "raftz-0.2.0-dZ8GDkxbywB3UK3Wp8Znb-xfwbaf7avGS-ev8Hjz0CCS",
+            .url = "https://github.com/fanyang89/raftz/archive/d5eba2b338cfd00f2306680cc2dcafb016add3a0.tar.gz",
+            .hash = "raftz-0.2.0-dZ8GDlDo2wDT70LD1RnKeJMgxah_1W6QN-aPjzvdMMKA",
         },
         .rocksdb = .{
             .url = "https://github.com/Syndica/rocksdb-zig/archive/20cc086f2702d9ec4aff144c242962ea3b666ee5.tar.gz",
             .hash = "rocksdb-9.7.4-z_CUTs3JAAArXHjTd4mMpiXG2_mKhw479lWGduaWuNeA",
         },
-        // The next upstream revision requires Zig 0.17; retain the 0.16-compatible runner.
         .zest = .{
-            .url = "https://github.com/cloudboss/zest/archive/2ec1ae4848887223e585e105a92ca57d7612d332.tar.gz",
-            .hash = "zest-0.1.0-2zk2nsZKAAD5f-v2ykUVtvZNmA_Wh2Nwhe49-PbLNdAx",
+            .url = "https://github.com/cloudboss/zest/archive/420846a238e832b42c05bd857773c5a96d8cd586.tar.gz",
+            .hash = "zest-0.1.0-2zk2no5cAAA5jmFf2VGXVTRUS5tAs8av0ztt_iLkMaAe",
         },
     },
     .paths = .{

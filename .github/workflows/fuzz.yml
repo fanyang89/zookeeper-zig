@@ -50,12 +50,19 @@ jobs:
       - name: Install Fedora toolchain
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
-            binutils cmake coreutils git make ninja-build zig \
+            binutils cmake coreutils git make ninja-build curl tar gzip xz \
             pkgconf-pkg-config rocksdb-devel snappy-devel
-          test "$(zig version)" = "0.16.0"
 
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install pinned Zig
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install_args: zig
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "0.17.0"
 
       - name: Cache Zig dependencies
         uses: actions/cache@v4
@@ -63,9 +70,12 @@ jobs:
           path: |
             ~/.cache/zig
             zig-pkg
-          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          key: zig-0.17.0-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
-            zig-fedora-44-${{ runner.arch }}-
+            zig-0.17.0-fedora-44-${{ runner.arch }}-
+
+      - name: Fetch verified dependencies
+        run: bash tools/fetch-deps.sh
 
       - name: Fuzz
         run: |

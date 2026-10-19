@@ -11,13 +11,14 @@ feature gaps, ensemble boundaries, zxid semantics, and migration limits.
 ## Requirements
 
 - mise 2026.7.13 or newer
-- Zig 0.16.0 (installed by mise)
+- Zig 0.17.0 (installed by mise)
 - Linux for the quorum server; client, Jute, protocol, and wire modules remain portable
 
 ## Quick start
 
 ```sh
 mise install
+mise run fetch
 mise run fmt-check
 mise run lint
 mise run build
@@ -25,7 +26,7 @@ mise run test
 ```
 
 The lint task compiles the native test tree in `ReleaseSafe`; formatting is
-checked separately with `zig fmt --check`.
+checked separately with `zig fmt --check build.zig src tools`.
 
 ThreadSanitizer covers the project-owned worker pool, watch manager, async
 client, and TCP transport concurrency paths:
@@ -34,13 +35,15 @@ client, and TCP transport concurrency paths:
 mise run test-tsan
 ```
 
-The task first runs the idempotent `patch-zig-tsan` workaround. Zig 0.16.0's
-vendored libtsan contains an unused `linux/scc.h` include and two unused SCC
-size declarations that fail to compile with its selected libc headers. The
-workaround removes exactly those three lines from the mise-managed Zig
-installation and refuses partially matching source. `src/tsan_test.zig`
-keeps the sanitized dependency closure free of C++ runtimes; Raft, grpc-lite,
-and RocksDB retain their upstream concurrency-testing boundaries.
+Zig 0.17 builds the sanitizer runtime without the previous SCC-header patch.
+`src/tsan_test.zig` keeps the sanitized dependency closure free of C++ runtimes;
+Raft, grpc-lite, and RocksDB retain their upstream concurrency-testing boundaries.
+
+`mise run fetch` normalizes pinned dependency archives before importing them with
+`zig fetch`, and checks every resulting package hash. This avoids Zig 0.17 archive
+root-layout mismatches without weakening verification. CI installs the compiler
+from `mise.toml` rather than relying on Fedora's Zig package. See
+[`docs/zig-0.17.md`](docs/zig-0.17.md) for migration details and validation limits.
 
 ## Native Zig API
 

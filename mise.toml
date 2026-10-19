@@ -1,16 +1,16 @@
 min_version = "2026.7.13"
 
 [tools]
-zig = "0.16.0"
+zig = "0.17.0"
 
 [env]
 ZOOKEEPER_VERSION = "3.9.5"
 
 [tasks.fmt]
-run = "zig fmt build.zig src"
+run = "zig fmt build.zig src tools"
 
 [tasks.fmt-check]
-run = "zig fmt --check build.zig src"
+run = "zig fmt --check build.zig src tools"
 
 [tasks.lint]
 run = "zig build check-zig -Doptimize=ReleaseSafe --summary all"
@@ -60,11 +60,11 @@ run = "bash tools/tla-check.sh"
 [tasks.apalache-check]
 run = "bash tools/apalache-check.sh"
 
-[tasks.patch-zig-tsan]
-run = "bash tools/patch-zig-tsan.sh"
-
 [tasks.test-tsan]
-run = """
-bash tools/patch-zig-tsan.sh
-zig build test-tsan --summary all
-"""
+run = "zig build test-tsan --summary all"
+
+[tasks.fetch]
+run = "bash tools/fetch-deps.sh"
+
+[tasks.build]
+run = "zig build"

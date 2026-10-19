@@ -105,7 +105,7 @@ fn randomValue(comptime T: type, arena: std.mem.Allocator, random: std.Random) a
             null,
         .pointer => |info| {
             if (info.size != .slice) @compileError("unsupported pointer " ++ @typeName(T));
-            if (info.child == u8 and info.is_const) return try randomBytes(arena, random);
+            if (info.child == u8 and info.attrs.@"const") return try randomBytes(arena, random);
             const len = random.intRangeAtMost(usize, 0, 3);
             const slice = try arena.alloc(info.child, len);
             for (slice) |*element| element.* = try randomValue(info.child, arena, random);
@@ -113,8 +113,8 @@ fn randomValue(comptime T: type, arena: std.mem.Allocator, random: std.Random) a
         },
         .@"struct" => |info| {
             var value: T = undefined;
-            inline for (info.fields) |field| {
-                @field(value, field.name) = try randomValue(field.type, arena, random);
+            inline for (info.field_names) |field| {
+                @field(value, field) = try randomValue(@FieldType(T, field), arena, random);
             }
             return value;
         },

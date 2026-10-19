@@ -222,7 +222,7 @@ pub fn encodeRequestWithLimit(
     try writer.writeInt(0);
     try jute.serialize(writer, proto.RequestHeader{
         .xid = xid,
-        .type = @intFromEnum(opcode),
+        .type = @backingInt(opcode),
     });
     if (@TypeOf(body) != void) try jute.serialize(writer, body);
     try finishFrame(writer, frame_start, max_payload);
@@ -241,7 +241,7 @@ pub fn encodeRequestPayloadWithLimit(
     try writer.writeInt(0);
     try jute.serialize(writer, proto.RequestHeader{
         .xid = xid,
-        .type = @intFromEnum(opcode),
+        .type = @backingInt(opcode),
     });
     try writer.writeBytes(body_payload);
     try finishFrame(writer, frame_start, max_payload);
@@ -640,7 +640,7 @@ test "all opcode and special xid values match ZooKeeper 3.9.5" {
         .{ .@"error", -1 },
     };
     for (expected) |item| {
-        try testing.expectEqual(item[1], @intFromEnum(item[0]));
+        try testing.expectEqual(item[1], @backingInt(item[0]));
         try testing.expectEqual(item[0], OpCode.fromInt(item[1]).?);
     }
     try testing.expectEqual(@as(?OpCode, null), OpCode.fromInt(10));

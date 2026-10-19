@@ -98,7 +98,7 @@ pub const RocksStore = struct {
     maintenance_clock_ms: i64,
 
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !RocksStore {
-        const path_z = try allocator.dupeZ(u8, path);
+        const path_z = try allocator.dupeSentinel(u8, path, 0);
         defer allocator.free(path_z);
         var error_data: ?rocksdb.Data = null;
         defer deinitErrorData(&error_data);
@@ -1504,7 +1504,7 @@ pub const RocksStore = struct {
     ) ![]u8 {
         var writer = jute.Writer.init(self.allocator);
         defer writer.deinit();
-        try writer.writeInt(@intFromEnum(ErrorCode.ok));
+        try writer.writeInt(@backingInt(ErrorCode.ok));
         try writer.writeLong(zxid);
         try writer.writeBytes(body);
         return writer.toOwnedSlice();
@@ -1573,9 +1573,9 @@ pub const RocksStore = struct {
                         result.code
                     else
                         .runtime_inconsistency;
-                    try multi.writeHeader(&response, -1, false, @intFromEnum(code));
+                    try multi.writeHeader(&response, -1, false, @backingInt(code));
                     try jute.serialize(&response, protocol.proto.ErrorResponse{
-                        .err = @intFromEnum(code),
+                        .err = @backingInt(code),
                     });
                 }
                 try multi.writeTerminator(&response);
@@ -1636,8 +1636,8 @@ pub const RocksStore = struct {
             }
             const kind: multi.Kind = operation;
             const response_kind: i32 = switch (operation) {
-                .create2, .create_container, .create_ttl => @intFromEnum(multi.Kind.create2),
-                else => @intFromEnum(kind),
+                .create2, .create_container, .create_ttl => @backingInt(multi.Kind.create2),
+                else => @backingInt(kind),
             };
             try multi.writeHeader(&response, response_kind, false, 0);
             switch (operation) {
@@ -2389,7 +2389,7 @@ fn encodeNode(allocator: std.mem.Allocator, node: Node) ![]u8 {
     try writer.writeInt(node.aversion);
     try writer.writeBuffer(node.acl);
     try writer.writeInt(node.sequence_counter);
-    try writer.writeByte(@bitCast(@intFromEnum(node.kind)));
+    try writer.writeByte(@bitCast(@backingInt(node.kind)));
     return allocator.dupe(u8, writer.bytes());
 }
 
@@ -2717,25 +2717,25 @@ test "multi commits atomically and rolls back on failure" {
 
     var success_request = jute.Writer.init(testing.allocator);
     defer success_request.deinit();
-    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.create), false, -1);
+    try multi.writeHeader(&success_request, @backingInt(multi.Kind.create), false, -1);
     try jute.serialize(&success_request, protocol.proto.CreateRequest{
         .path = "/multi",
         .data = "first",
         .acl = &open_acl,
         .flags = 0,
     });
-    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try multi.writeHeader(&success_request, @backingInt(multi.Kind.set_data), false, -1);
     try jute.serialize(&success_request, protocol.proto.SetDataRequest{
         .path = "/multi",
         .data = "second",
         .version = 0,
     });
-    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.check), false, -1);
+    try multi.writeHeader(&success_request, @backingInt(multi.Kind.check), false, -1);
     try jute.serialize(&success_request, protocol.proto.CheckVersionRequest{
         .path = "/multi",
         .version = 1,
     });
-    try multi.writeHeader(&success_request, @intFromEnum(multi.Kind.create_ttl), false, -1);
+    try multi.writeHeader(&success_request, @backingInt(multi.Kind.create_ttl), false, -1);
     try jute.serialize(&success_request, protocol.proto.CreateTTLRequest{
         .path = "/multi-ttl",
         .data = "ttl",
@@ -2771,20 +2771,20 @@ test "multi commits atomically and rolls back on failure" {
 
     var rollback_request = jute.Writer.init(testing.allocator);
     defer rollback_request.deinit();
-    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.create), false, -1);
+    try multi.writeHeader(&rollback_request, @backingInt(multi.Kind.create), false, -1);
     try jute.serialize(&rollback_request, protocol.proto.CreateRequest{
         .path = "/rolled-back",
         .data = "temporary",
         .acl = &open_acl,
         .flags = 0,
     });
-    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try multi.writeHeader(&rollback_request, @backingInt(multi.Kind.set_data), false, -1);
     try jute.serialize(&rollback_request, protocol.proto.SetDataRequest{
         .path = "/missing",
         .data = "failure",
         .version = -1,
     });
-    try multi.writeHeader(&rollback_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try multi.writeHeader(&rollback_request, @backingInt(multi.Kind.delete), false, -1);
     try jute.serialize(&rollback_request, protocol.proto.DeleteRequest{
         .path = "/multi",
         .version = -1,
@@ -2807,16 +2807,16 @@ test "multi commits atomically and rolls back on failure" {
     var response = jute.Reader.init(rollback.response_body.?);
     const create_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
     try testing.expectEqual(@as(i32, -1), create_header.type);
-    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.ok)), create_header.err);
+    try testing.expectEqual(@as(i32, @backingInt(ErrorCode.ok)), create_header.err);
     const create_response = try jute.deserialize(protocol.proto.ErrorResponse, &response, testing.allocator);
-    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.ok)), create_response.err);
+    try testing.expectEqual(@as(i32, @backingInt(ErrorCode.ok)), create_response.err);
     const failure_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
     try testing.expectEqual(@as(i32, -1), failure_header.type);
-    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.no_node)), failure_header.err);
+    try testing.expectEqual(@as(i32, @backingInt(ErrorCode.no_node)), failure_header.err);
     const failure = try jute.deserialize(protocol.proto.ErrorResponse, &response, testing.allocator);
-    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.no_node)), failure.err);
+    try testing.expectEqual(@as(i32, @backingInt(ErrorCode.no_node)), failure.err);
     const skipped_header = try jute.deserialize(protocol.proto.MultiHeader, &response, testing.allocator);
-    try testing.expectEqual(@as(i32, @intFromEnum(ErrorCode.runtime_inconsistency)), skipped_header.err);
+    try testing.expectEqual(@as(i32, @backingInt(ErrorCode.runtime_inconsistency)), skipped_header.err);
 }
 
 test "stale session expiration reports no znode change" {
@@ -2828,7 +2828,7 @@ test "stale session expiration reports no znode change" {
     var store = try RocksStore.open(testing.allocator, path);
     defer store.deinit();
 
-    const password = [_]u8{7} ** 16;
+    const password = @as([16]u8, @splat(7));
     var opened = try store.apply(.{ .open_session = .{
         .session_id = 42,
         .password = &password,
@@ -2887,7 +2887,7 @@ test "multi watch events retain intermediate state and deletion ACLs" {
 
     var delete_request = jute.Writer.init(testing.allocator);
     defer delete_request.deinit();
-    try multi.writeHeader(&delete_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try multi.writeHeader(&delete_request, @backingInt(multi.Kind.delete), false, -1);
     try jute.serialize(&delete_request, protocol.proto.DeleteRequest{
         .path = "/secure",
         .version = -1,
@@ -2911,20 +2911,20 @@ test "multi watch events retain intermediate state and deletion ACLs" {
     }};
     var transient_request = jute.Writer.init(testing.allocator);
     defer transient_request.deinit();
-    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.create), false, -1);
+    try multi.writeHeader(&transient_request, @backingInt(multi.Kind.create), false, -1);
     try jute.serialize(&transient_request, protocol.proto.CreateRequest{
         .path = "/transient",
         .data = "one",
         .acl = &open_acl,
         .flags = 0,
     });
-    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try multi.writeHeader(&transient_request, @backingInt(multi.Kind.set_data), false, -1);
     try jute.serialize(&transient_request, protocol.proto.SetDataRequest{
         .path = "/transient",
         .data = "two",
         .version = 0,
     });
-    try multi.writeHeader(&transient_request, @intFromEnum(multi.Kind.delete), false, -1);
+    try multi.writeHeader(&transient_request, @backingInt(multi.Kind.delete), false, -1);
     try jute.serialize(&transient_request, protocol.proto.DeleteRequest{
         .path = "/transient",
         .version = 1,
@@ -3115,7 +3115,7 @@ test "reconfig ignores ordinary and multi setData poisoning of public config" {
             });
             var request = jute.Writer.init(testing.allocator);
             defer request.deinit();
-            try multi.writeHeader(&request, @intFromEnum(multi.Kind.set_data), false, -1);
+            try multi.writeHeader(&request, @backingInt(multi.Kind.set_data), false, -1);
             try jute.serialize(&request, protocol.proto.SetDataRequest{
                 .path = reconfig.path,
                 .data = poison,

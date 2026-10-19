@@ -139,7 +139,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
     var writer = jute.Writer.init(allocator);
     defer writer.deinit();
     try writer.writeInt(version);
-    try writer.writeInt(@intFromEnum(mutation));
+    try writer.writeInt(@backingInt(mutation));
     switch (mutation) {
         .create => |value| {
             try writer.writeString(value.path);
@@ -155,7 +155,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
                 .ephemeral
             else
                 value.node_kind;
-            try writer.writeByte(@bitCast(@intFromEnum(encoded_kind)));
+            try writer.writeByte(@bitCast(@backingInt(encoded_kind)));
             try writer.writeLong(value.ttl_ms);
         },
         .delete => |value| {
@@ -217,7 +217,7 @@ pub fn encode(allocator: std.mem.Allocator, mutation: Mutation) ![]u8 {
         .delete_extended => |value| {
             try writer.writeString(value.path);
             try writer.writeLong(value.expected_czxid);
-            try writer.writeByte(@bitCast(@intFromEnum(value.expected_kind)));
+            try writer.writeByte(@bitCast(@backingInt(value.expected_kind)));
         },
         .multi => |value| {
             try writer.writeBuffer(value.body);
@@ -243,7 +243,7 @@ pub fn decode(bytes: []const u8) !Mutation {
         return error.UnsupportedCommandVersion;
     }
     const kind = checkedEnum(Kind, try reader.readInt()) orelse return error.UnknownCommand;
-    if ((encoded_version == legacy_version and @intFromEnum(kind) >= 100) or
+    if ((encoded_version == legacy_version and @backingInt(kind) >= 100) or
         (kind == .set_acl and encoded_version < 4))
     {
         return error.UnsupportedCommandVersion;
@@ -379,7 +379,7 @@ pub fn encodeResult(
 ) ![]u8 {
     var writer = jute.Writer.init(allocator);
     defer writer.deinit();
-    try writer.writeInt(@intFromEnum(code));
+    try writer.writeInt(@backingInt(code));
     try writer.writeLong(zxid);
     if (@TypeOf(body) != void) try jute.serialize(&writer, body);
     return allocator.dupe(u8, writer.bytes());
@@ -394,8 +394,8 @@ pub fn decodeResult(bytes: []const u8) !ResultView {
 }
 
 fn checkedEnum(comptime T: type, value: std.meta.Tag(T)) ?T {
-    inline for (std.meta.fields(T)) |field| {
-        if (field.value == value) return @enumFromInt(value);
+    inline for (@typeInfo(T).@"enum".field_values) |field_value| {
+        if (field_value == value) return @fromBackingInt(@intCast(value));
     }
     return null;
 }
@@ -425,7 +425,7 @@ test "mutation commands and results round trip" {
     try testing.expectEqualStrings("value", decoded.set_data.data);
     try testing.expectEqual(@as(i32, 4), decoded.set_data.expected_version);
 
-    const password = [_]u8{0xa5} ** 16;
+    const password = @as([16]u8, @splat(0xa5));
     const session_encoded = try encode(testing.allocator, .{ .open_session = .{
         .session_id = 42,
         .password = &password,
@@ -444,7 +444,7 @@ test "mutation commands and results round trip" {
     var legacy_writer = jute.Writer.init(testing.allocator);
     defer legacy_writer.deinit();
     try legacy_writer.writeInt(legacy_version);
-    try legacy_writer.writeInt(@intFromEnum(Kind.create));
+    try legacy_writer.writeInt(@backingInt(Kind.create));
     try legacy_writer.writeString("/legacy");
     try legacy_writer.writeBuffer("payload");
     try legacy_writer.writeLong(123);
@@ -456,7 +456,7 @@ test "mutation commands and results round trip" {
     var version_two_writer = jute.Writer.init(testing.allocator);
     defer version_two_writer.deinit();
     try version_two_writer.writeInt(2);
-    try version_two_writer.writeInt(@intFromEnum(Kind.create));
+    try version_two_writer.writeInt(@backingInt(Kind.create));
     try version_two_writer.writeString("/v2");
     try version_two_writer.writeBuffer("payload");
     try version_two_writer.writeLong(456);
@@ -472,7 +472,7 @@ test "mutation commands and results round trip" {
     var version_three_writer = jute.Writer.init(testing.allocator);
     defer version_three_writer.deinit();
     try version_three_writer.writeInt(3);
-    try version_three_writer.writeInt(@intFromEnum(Kind.create));
+    try version_three_writer.writeInt(@backingInt(Kind.create));
     try version_three_writer.writeString("/v3-");
     try version_three_writer.writeBuffer("payload");
     try version_three_writer.writeLong(789);
