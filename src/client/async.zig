@@ -310,13 +310,14 @@ pub const AsyncClient = struct {
             .reconnect = options.reconnect,
         };
 
+        const timer_interval_ms = @max(@divTrunc(core.session.readTimeoutMs(), 4), 1);
         self.reader = try io.concurrent(readerMain, .{self});
         self.tasks.concurrent(io, engineMain, .{self}) catch |err| {
             self.stopReader();
             self.tasks_running = false;
             return err;
         };
-        self.tasks.concurrent(io, timerMain, .{self}) catch |err| {
+        self.tasks.concurrent(io, timerMain, .{ self, timer_interval_ms }) catch |err| {
             self.stopBackgroundTasks();
             return err;
         };
@@ -466,6 +467,12 @@ pub const AsyncClient = struct {
         std.debug.assert(self.operation_count != 0);
         self.operation_count -= 1;
         if (self.operation_count == 0) self.operation_condition.signal(self.io);
+    }
+
+    fn isShuttingDown(self: *AsyncClient) bool {
+        self.operation_mutex.lockUncancelable(self.io);
+        defer self.operation_mutex.unlock(self.io);
+        return self.shutting_down;
     }
 
     fn beginShutdown(self: *AsyncClient) void {
@@ -805,7 +812,7 @@ fn reconnectOrTerminal(
     cause: anyerror,
 ) ?anyerror {
     if (!client.reconnect.enabled) return cause;
-    if (client.shutting_down) return cause;
+    if (client.isShuttingDown()) return cause;
     const endpoint = client.endpoint orelse return cause;
     if (client.core.session.session_id == 0) return cause;
     if (client.core.session.state == .closed or client.core.session.state == .auth_failed) {
@@ -848,7 +855,7 @@ fn reconnectOrTerminal(
     var backoff_ms = client.reconnect.first_backoff_ms;
     var attempts: usize = 0;
     reconnect: while (true) {
-        if (client.shutting_down) return cause;
+        if (client.isShuttingDown()) return cause;
         attempts += 1;
         if (client.reconnect.max_attempts != 0 and attempts > client.reconnect.max_attempts) {
             return cause;
@@ -861,7 +868,7 @@ fn reconnectOrTerminal(
             .clock = .awake,
         } };
         sleep.sleep(client.io) catch |err| {
-            if (client.shutting_down) return cause;
+            if (client.isShuttingDown()) return cause;
             return err;
         };
         backoff_ms = @min(backoff_ms * 2, client.reconnect.max_backoff_ms);
@@ -1044,8 +1051,7 @@ fn readerMain(client: *AsyncClient) std.Io.Cancelable!void {
     }
 }
 
-fn timerMain(client: *AsyncClient) std.Io.Cancelable!void {
-    const interval_ms = @max(@divTrunc(client.core.session.readTimeoutMs(), 4), 1);
+fn timerMain(client: *AsyncClient, interval_ms: i64) std.Io.Cancelable!void {
     const interval: std.Io.Timeout = .{ .duration = .{
         .raw = .fromMilliseconds(interval_ms),
         .clock = .awake,
