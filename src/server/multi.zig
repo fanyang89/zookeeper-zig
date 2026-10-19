@@ -71,37 +71,37 @@ pub const RequestIterator = struct {
         }
         if (header.err != -1) return error.InvalidMultiRequest;
         return switch (header.type) {
-            @intFromEnum(Kind.create) => .{ .create = try jute.deserialize(
+            @backingInt(Kind.create) => .{ .create = try jute.deserialize(
                 protocol.proto.CreateRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.delete) => .{ .delete = try jute.deserialize(
+            @backingInt(Kind.delete) => .{ .delete = try jute.deserialize(
                 protocol.proto.DeleteRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.set_data) => .{ .set_data = try jute.deserialize(
+            @backingInt(Kind.set_data) => .{ .set_data = try jute.deserialize(
                 protocol.proto.SetDataRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.check) => .{ .check = try jute.deserialize(
+            @backingInt(Kind.check) => .{ .check = try jute.deserialize(
                 protocol.proto.CheckVersionRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.create2) => .{ .create2 = try jute.deserialize(
+            @backingInt(Kind.create2) => .{ .create2 = try jute.deserialize(
                 protocol.proto.CreateRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.create_container) => .{ .create_container = try jute.deserialize(
+            @backingInt(Kind.create_container) => .{ .create_container = try jute.deserialize(
                 protocol.proto.CreateRequest,
                 &self.reader,
                 allocator,
             ) },
-            @intFromEnum(Kind.create_ttl) => .{ .create_ttl = try jute.deserialize(
+            @backingInt(Kind.create_ttl) => .{ .create_ttl = try jute.deserialize(
                 protocol.proto.CreateTTLRequest,
                 &self.reader,
                 allocator,
@@ -133,11 +133,11 @@ pub const ReadRequestIterator = struct {
         }
         if (header_error != -1) return error.InvalidMultiRequest;
         return switch (header_type) {
-            @intFromEnum(ReadKind.get_data) => .{ .get_data = .{
+            @backingInt(ReadKind.get_data) => .{ .get_data = .{
                 .path = try self.reader.readString(),
                 .watch = try self.reader.readBool(),
             } },
-            @intFromEnum(ReadKind.get_children) => .{ .get_children = .{
+            @backingInt(ReadKind.get_children) => .{ .get_children = .{
                 .path = try self.reader.readString(),
                 .watch = try self.reader.readBool(),
             } },
@@ -191,15 +191,15 @@ pub fn responseBodyCapacity(bytes: []const u8) !usize {
         }
         if (header_error != -1) return error.InvalidMultiRequest;
         const success_size: usize = switch (header_type) {
-            @intFromEnum(Kind.create) => try readCreateCapacity(&reader, false, false),
-            @intFromEnum(Kind.create2), @intFromEnum(Kind.create_container) => try readCreateCapacity(&reader, true, false),
-            @intFromEnum(Kind.create_ttl) => try readCreateCapacity(&reader, true, true),
-            @intFromEnum(Kind.delete), @intFromEnum(Kind.check) => blk: {
+            @backingInt(Kind.create) => try readCreateCapacity(&reader, false, false),
+            @backingInt(Kind.create2), @backingInt(Kind.create_container) => try readCreateCapacity(&reader, true, false),
+            @backingInt(Kind.create_ttl) => try readCreateCapacity(&reader, true, true),
+            @backingInt(Kind.delete), @backingInt(Kind.check) => blk: {
                 _ = (try reader.readString()) orelse return error.InvalidMultiRequest;
                 _ = try reader.readInt();
                 break :blk 9;
             },
-            @intFromEnum(Kind.set_data) => blk: {
+            @backingInt(Kind.set_data) => blk: {
                 _ = (try reader.readString()) orelse return error.InvalidMultiRequest;
                 _ = try reader.readBuffer();
                 _ = try reader.readInt();
@@ -257,19 +257,19 @@ test "multi request iterator parses supported operations" {
     const testing = std.testing;
     var writer = jute.Writer.init(testing.allocator);
     defer writer.deinit();
-    try writeHeader(&writer, @intFromEnum(Kind.create), false, -1);
+    try writeHeader(&writer, @backingInt(Kind.create), false, -1);
     try jute.serialize(&writer, protocol.proto.CreateRequest{
         .path = "/node",
         .data = "value",
         .acl = null,
         .flags = 0,
     });
-    try writeHeader(&writer, @intFromEnum(Kind.check), false, -1);
+    try writeHeader(&writer, @backingInt(Kind.check), false, -1);
     try jute.serialize(&writer, protocol.proto.CheckVersionRequest{
         .path = "/node",
         .version = 0,
     });
-    try writeHeader(&writer, @intFromEnum(Kind.create_ttl), false, -1);
+    try writeHeader(&writer, @backingInt(Kind.create_ttl), false, -1);
     try jute.serialize(&writer, protocol.proto.CreateTTLRequest{
         .path = "/ttl",
         .data = "value",
@@ -303,12 +303,12 @@ test "multi read iterator parses getData and getChildren" {
     const testing = std.testing;
     var writer = jute.Writer.init(testing.allocator);
     defer writer.deinit();
-    try writeHeader(&writer, @intFromEnum(ReadKind.get_data), false, -1);
+    try writeHeader(&writer, @backingInt(ReadKind.get_data), false, -1);
     try jute.serialize(&writer, protocol.proto.GetDataRequest{
         .path = "/data",
         .watch = false,
     });
-    try writeHeader(&writer, @intFromEnum(ReadKind.get_children), false, -1);
+    try writeHeader(&writer, @backingInt(ReadKind.get_children), false, -1);
     try jute.serialize(&writer, protocol.proto.GetChildrenRequest{
         .path = "/parent",
         .watch = false,
@@ -328,7 +328,7 @@ test "multi read response size constants match Jute encoding" {
     const testing = std.testing;
     var writer = jute.Writer.init(testing.allocator);
     defer writer.deinit();
-    try writeHeader(&writer, @intFromEnum(ReadKind.get_data), false, 0);
+    try writeHeader(&writer, @backingInt(ReadKind.get_data), false, 0);
     try jute.serialize(&writer, protocol.proto.GetDataResponse{
         .data = "abc",
         .stat = std.mem.zeroes(protocol.data.Stat),
@@ -336,7 +336,7 @@ test "multi read response size constants match Jute encoding" {
     try testing.expectEqual(get_data_result_base_size + 3, writer.dataSize());
 
     writer.truncate(0);
-    try writeHeader(&writer, @intFromEnum(ReadKind.get_children), false, 0);
+    try writeHeader(&writer, @backingInt(ReadKind.get_children), false, 0);
     try jute.serialize(&writer, protocol.proto.GetChildrenResponse{
         .children = &.{ "one", "two" },
     });
@@ -363,7 +363,7 @@ test "multi read iterator rejects write operations and trailing data" {
     const testing = std.testing;
     var write_request = jute.Writer.init(testing.allocator);
     defer write_request.deinit();
-    try writeHeader(&write_request, @intFromEnum(Kind.check), false, -1);
+    try writeHeader(&write_request, @backingInt(Kind.check), false, -1);
     try jute.serialize(&write_request, protocol.proto.CheckVersionRequest{
         .path = "/node",
         .version = 0,

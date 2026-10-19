@@ -8,6 +8,8 @@ on:
       - ".github/workflows/jepsen.yml"
       - "build.zig"
       - "build.zig.zon"
+      - "mise.toml"
+      - "tools/fetch-deps.sh"
       - "src/**"
       - "tests/jepsen/**"
   pull_request:
@@ -15,6 +17,8 @@ on:
       - ".github/workflows/jepsen.yml"
       - "build.zig"
       - "build.zig.zon"
+      - "mise.toml"
+      - "tools/fetch-deps.sh"
       - "src/**"
       - "tests/jepsen/**"
   schedule:
@@ -77,12 +81,19 @@ jobs:
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
             binutils cmake curl git gnuplot-minimal java-25-openjdk-headless make ninja-build \
-            pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel zig
-          test "$(zig version)" = "0.16.0"
+            pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel python3 tar gzip xz
           java -version
 
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install pinned Zig
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install_args: zig
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "0.17.0"
 
       - name: Cache Leiningen dependencies
         uses: actions/cache@v4
@@ -103,6 +114,9 @@ jobs:
             | sha256sum --check --strict
           chmod 0755 /usr/local/bin/lein
           lein version
+
+      - name: Fetch verified dependencies
+        run: bash tools/fetch-deps.sh
 
       - name: Run Jepsen tests
         run: zig build test-jepsen-smoke -Dsystem-rocksdb=true --summary all
@@ -158,13 +172,20 @@ jobs:
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
             binutils cmake curl docker-cli git gnuplot-minimal java-25-openjdk-headless make \
-            ninja-build pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel zig
-          test "$(zig version)" = "0.16.0"
+            ninja-build pkgconf-pkg-config procps-ng rocksdb-devel snappy-devel python3 tar gzip xz
           java -version
           docker version
 
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install pinned Zig
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install_args: zig
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "0.17.0"
 
       - name: Cache Leiningen dependencies
         uses: actions/cache@v4
@@ -185,6 +206,9 @@ jobs:
             | sha256sum --check --strict
           chmod 0755 /usr/local/bin/lein
           lein version
+
+      - name: Fetch verified dependencies
+        run: bash tools/fetch-deps.sh
 
       - name: Run Jepsen tests
         id: jepsen-tests

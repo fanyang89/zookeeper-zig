@@ -30,7 +30,7 @@ jobs:
       matrix:
         include:
           - name: Format
-            command: zig fmt --check build.zig src
+            command: zig fmt --check build.zig src tools
             cache-zig: false
             system-rocksdb: false
             timeout-minutes: 5
@@ -58,7 +58,6 @@ jobs:
             timeout-minutes: 20
           - name: ThreadSanitizer
             command: |
-              bash tools/patch-zig-tsan.sh
               timeout --foreground --kill-after=10s 8m zig build test-tsan --summary all
             cache-zig: true
             system-rocksdb: false
@@ -82,15 +81,22 @@ jobs:
       - name: Install Fedora toolchain
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
-            binutils cmake git make ninja-build python3 zig java-25-openjdk-headless
+            binutils cmake git make ninja-build python3 curl tar gzip xz java-25-openjdk-headless
           if [[ "${{ matrix.system-rocksdb }}" == true ]]; then
             dnf install --assumeyes --setopt=install_weak_deps=False \
               pkgconf-pkg-config rocksdb-devel snappy-devel
           fi
-          test "$(zig version)" = "0.16.0"
 
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install pinned Zig
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install_args: zig
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "0.17.0"
 
       - name: Cache Zig dependencies
         if: matrix.cache-zig
@@ -99,9 +105,13 @@ jobs:
           path: |
             ~/.cache/zig
             zig-pkg
-          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          key: zig-0.17.0-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
-            zig-fedora-44-${{ runner.arch }}-
+            zig-0.17.0-fedora-44-${{ runner.arch }}-
+
+      - name: Fetch verified dependencies
+        if: matrix.cache-zig
+        run: bash tools/fetch-deps.sh
 
       - name: Cache formal verification toolchains
         if: matrix.name == 'TLA+'
@@ -138,12 +148,19 @@ jobs:
       - name: Install Fedora toolchain
         run: |
           dnf install --assumeyes --setopt=install_weak_deps=False \
-            binutils cmake git hostname make ninja-build zig \
+            binutils cmake git hostname make ninja-build curl tar gzip xz \
             python3 maven pkgconf-pkg-config rocksdb-devel snappy-devel
-          test "$(zig version)" = "0.16.0"
 
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Install pinned Zig
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          install_args: zig
+
+      - name: Verify Zig version
+        run: test "$(zig version)" = "0.17.0"
 
       - name: Set up JDK 11
         uses: actions/setup-java@v4
@@ -157,9 +174,12 @@ jobs:
           path: |
             ~/.cache/zig
             zig-pkg
-          key: zig-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          key: zig-0.17.0-fedora-44-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: |
-            zig-fedora-44-${{ runner.arch }}-
+            zig-0.17.0-fedora-44-${{ runner.arch }}-
+
+      - name: Fetch verified dependencies
+        run: bash tools/fetch-deps.sh
 
       - name: Cache Maven repository
         uses: actions/cache@v4

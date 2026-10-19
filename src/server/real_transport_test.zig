@@ -132,9 +132,9 @@ fn RealCluster(comptime QuorumType: type, comptime OptionsType: type) type {
         configs: *[node_count]config_mod.ServerConfig,
         options: OptionsType,
         controller: *FaultController,
-        raw_transports: [node_count]?*raft.GrpcLiteTransport = .{null} ** node_count,
+        raw_transports: [node_count]?*raft.GrpcLiteTransport = @splat(null),
         fault_transports: [node_count]FaultTransport = undefined,
-        nodes: [node_count]?*QuorumType = .{null} ** node_count,
+        nodes: [node_count]?*QuorumType = @splat(null),
 
         fn create(
             io: std.Io,

@@ -33,13 +33,9 @@ pub const Writer = struct {
     }
 
     pub fn initOwnedBuffer(allocator: std.mem.Allocator, buffer: []u8) Writer {
-        return .{
-            .allocator = allocator,
-            .buffer = .{
-                .items = buffer[0..0],
-                .capacity = buffer.len,
-            },
-        };
+        var list = std.ArrayList(u8).fromOwnedSlice(buffer);
+        list.clearRetainingCapacity();
+        return .{ .allocator = allocator, .buffer = list };
     }
 
     pub fn deinit(self: *Writer) void {
@@ -361,6 +357,21 @@ test "binary archive handles strings buffers and null values" {
     const owned = (try allocating_reader.readStringAlloc(testing.allocator)).?;
     defer testing.allocator.free(owned);
     try testing.expectEqualStrings("zig", owned);
+}
+
+test "owned writer buffer starts empty and supports growth" {
+    const allocator = std.testing.allocator;
+    const buffer = try allocator.alloc(u8, 8);
+    var writer = Writer.initOwnedBuffer(allocator, buffer);
+    defer writer.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), writer.bytes().len);
+    try std.testing.expectEqual(@as(usize, 8), writer.buffer.capacity);
+    try writer.writeLong(42);
+    try writer.writeByte(7);
+    var reader = Reader.init(writer.bytes());
+    try std.testing.expectEqual(@as(i64, 42), try reader.readLong());
+    try std.testing.expectEqual(@as(i8, 7), try reader.readByte());
 }
 
 test "owned writer slice supports spare capacity" {

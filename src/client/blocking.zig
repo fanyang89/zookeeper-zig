@@ -360,7 +360,7 @@ fn clientServerFixture(server: *std.Io.net.Server, io: std.Io) !void {
     const close_payload = try transport.readFrameAlloc(std.testing.allocator, io, wire.default_max_payload);
     defer std.testing.allocator.free(close_payload);
     const close_request = try wire.decodeRequest(void, close_payload, std.testing.allocator);
-    try std.testing.expectEqual(@intFromEnum(wire.OpCode.close_session), close_request.header.type);
+    try std.testing.expectEqual(@backingInt(wire.OpCode.close_session), close_request.header.type);
     writer.truncate(0);
     try wire.encodeReply(
         &writer,

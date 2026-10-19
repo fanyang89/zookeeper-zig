@@ -294,7 +294,7 @@ pub const DataTree = struct {
             try writer.writeInt(@intCast(node.child_count));
             try writer.writeLong(node.ephemeral_owner);
             try writer.writeInt(node.sequence_counter);
-            try writer.writeByte(@bitCast(@intFromEnum(node.kind)));
+            try writer.writeByte(@bitCast(@backingInt(node.kind)));
         }
     }
 

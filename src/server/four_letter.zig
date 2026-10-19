@@ -39,11 +39,11 @@ pub const Command = enum {
     }
 };
 
-pub const command_count = @typeInfo(Command).@"enum".fields.len;
+pub const command_count = @typeInfo(Command).@"enum".field_names.len;
 
 pub fn commandFromName(text: []const u8) ?Command {
-    inline for (@typeInfo(Command).@"enum".fields) |field| {
-        if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Command).@"enum".field_names) |field| {
+        if (std.mem.eql(u8, text, field)) return @field(Command, field);
     }
     return null;
 }
@@ -54,13 +54,13 @@ pub const Whitelist = struct {
     allowed: std.EnumSet(Command) = std.EnumSet(Command).initOne(.srvr),
 
     pub fn parse(text: []const u8) Whitelist {
-        var whitelist = Whitelist{ .allowed = std.EnumSet(Command).initEmpty() };
+        var whitelist = Whitelist{ .allowed = .empty };
         var iterator = std.mem.splitScalar(u8, text, ',');
         while (iterator.next()) |token| {
             const trimmed = std.mem.trim(u8, token, " ");
             if (trimmed.len == 0) continue;
             if (std.mem.eql(u8, trimmed, "*")) {
-                whitelist.allowed = std.EnumSet(Command).initFull();
+                whitelist.allowed = .full;
                 continue;
             }
             if (commandFromName(trimmed)) |command| {
@@ -86,7 +86,7 @@ pub fn LatencyTracker(comptime history: usize) type {
         const Self = @This();
 
         mutex: std.atomic.Mutex = .unlocked,
-        samples: [history]u32 = [_]u32{0} ** history,
+        samples: [history]u32 = @as([history]u32, @splat(0)),
         count: usize = 0,
 
         pub fn record(self: *Self, latency_ms: u32) void {

@@ -4,7 +4,7 @@ const proto = @import("../protocol/proto.zig");
 const wire = @import("../wire.zig");
 
 pub const session_password_length = 16;
-pub const zero_password = [_]u8{0} ** session_password_length;
+pub const zero_password = @as([session_password_length]u8, @splat(0));
 
 pub const State = enum {
     disconnected,

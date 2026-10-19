@@ -48,8 +48,8 @@ fn serializeValue(comptime T: type, writer: *binary.Writer, value: T) SerializeE
             if (info.size != .slice) @compileError("Jute pointers must be slices: " ++ @typeName(T));
             try serializeSlice(T, info.child, writer, value);
         },
-        .@"struct" => |info| inline for (info.fields) |field| {
-            try serializeValue(field.type, writer, @field(value, field.name));
+        .@"struct" => |info| inline for (info.field_names) |field| {
+            try serializeValue(@FieldType(T, field), writer, @field(value, field));
         },
         else => @compileError("unsupported Jute type: " ++ @typeName(T)),
     }
@@ -127,12 +127,12 @@ fn deserializeStructFields(
     reader: *binary.Reader,
     allocator: std.mem.Allocator,
 ) DeserializeError!void {
-    const fields = @typeInfo(Record).@"struct".fields;
+    const fields = @typeInfo(Record).@"struct".field_names;
     if (field_index == fields.len) return;
 
     const field = fields[field_index];
-    @field(result.*, field.name) = try deserializeValue(field.type, reader, allocator);
-    errdefer deinitValue(field.type, @field(result.*, field.name), allocator);
+    @field(result.*, field) = try deserializeValue(@FieldType(Record, field), reader, allocator);
+    errdefer deinitValue(@FieldType(Record, field), @field(result.*, field), allocator);
     try deserializeStructFields(Record, field_index + 1, result, reader, allocator);
 }
 
@@ -191,8 +191,8 @@ fn deinitValue(comptime T: type, value: T, allocator: std.mem.Allocator) void {
             for (value) |element| deinitValue(info.child, element, allocator);
             allocator.free(value);
         },
-        .@"struct" => |info| inline for (info.fields) |field| {
-            deinitValue(field.type, @field(value, field.name), allocator);
+        .@"struct" => |info| inline for (info.field_names) |field| {
+            deinitValue(@FieldType(T, field), @field(value, field), allocator);
         },
         else => {},
     }

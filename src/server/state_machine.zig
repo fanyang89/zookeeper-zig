@@ -301,7 +301,7 @@ pub const ZooKeeperStateMachine = struct {
                     multi.error_result_size,
                     response_body_limit,
                 );
-                try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.bad_arguments));
+                try multi.writeErrorResult(&response, @backingInt(data_tree.ErrorCode.bad_arguments));
                 continue;
             };
             const authorization = try self.store.authorize(path, acl.read, identities);
@@ -311,7 +311,7 @@ pub const ZooKeeperStateMachine = struct {
                     multi.error_result_size,
                     response_body_limit,
                 );
-                try multi.writeErrorResult(&response, @intFromEnum(authorization));
+                try multi.writeErrorResult(&response, @backingInt(authorization));
                 continue;
             }
             switch (operation) {
@@ -322,7 +322,7 @@ pub const ZooKeeperStateMachine = struct {
                             multi.error_result_size,
                             response_body_limit,
                         );
-                        try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.no_node));
+                        try multi.writeErrorResult(&response, @backingInt(data_tree.ErrorCode.no_node));
                         continue;
                     };
                     defer if (result.data) |data| allocator.free(data);
@@ -338,7 +338,7 @@ pub const ZooKeeperStateMachine = struct {
                     );
                     try multi.writeHeader(
                         &response,
-                        @intFromEnum(multi.ReadKind.get_data),
+                        @backingInt(multi.ReadKind.get_data),
                         false,
                         0,
                     );
@@ -355,7 +355,7 @@ pub const ZooKeeperStateMachine = struct {
                             multi.error_result_size,
                             response_body_limit,
                         );
-                        try multi.writeErrorResult(&response, @intFromEnum(data_tree.ErrorCode.no_node));
+                        try multi.writeErrorResult(&response, @backingInt(data_tree.ErrorCode.no_node));
                         continue;
                     }
                     const names = maybe_names.?;
@@ -380,7 +380,7 @@ pub const ZooKeeperStateMachine = struct {
                     for (names, 0..) |name, index| children[index] = name;
                     try multi.writeHeader(
                         &response,
-                        @intFromEnum(multi.ReadKind.get_children),
+                        @backingInt(multi.ReadKind.get_children),
                         false,
                         0,
                     );
@@ -707,7 +707,7 @@ pub const ZooKeeperStateMachine = struct {
         };
         var writer = jute.Writer.initOwnedBuffer(self.allocator, response);
         defer writer.deinit();
-        writer.writeInt(@intFromEnum(result.code)) catch unreachable;
+        writer.writeInt(@backingInt(result.code)) catch unreachable;
         writer.writeLong(zxid) catch unreachable;
         if (result.code == .ok) switch (mutation) {
             .create => |value| jute.serialize(&writer, protocol.proto.Create2Response{
@@ -1076,7 +1076,7 @@ test "RocksDB state machine atomically persists commands and restores snapshots"
         .time_ms = 300,
     } });
     try testing.expectEqual(data_tree.ErrorCode.no_node, rejected.code);
-    const password = [_]u8{0x5a} ** 16;
+    const password = @as([16]u8, @splat(0x5a));
     const opened = try applyMutation(&machine, testing.allocator, 5, .{ .open_session = .{
         .session_id = 99,
         .password = &password,
@@ -1205,7 +1205,7 @@ test "session-rejected multi returns an error after advancing applied state" {
     var machine = try ZooKeeperStateMachine.init(testing.allocator, path);
     defer machine.deinit();
 
-    const password = [_]u8{0x3c} ** 16;
+    const password = @as([16]u8, @splat(0x3c));
     const opened = try applyMutation(&machine, testing.allocator, 1, .{ .open_session = .{
         .session_id = 77,
         .password = &password,

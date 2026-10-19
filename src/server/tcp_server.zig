@@ -139,7 +139,7 @@ const ConnectionState = struct {
             .zxid = event.zxid,
             .err = 0,
         }, protocol.proto.WatcherEvent{
-            .type = @intFromEnum(event.type),
+            .type = @backingInt(event.type),
             .state = 3,
             .path = event.path,
         }) catch {
@@ -2416,7 +2416,7 @@ fn sendError(
     return sendReply(transport, allocator, io, .{
         .xid = xid,
         .zxid = zxid,
-        .err = @intFromEnum(code),
+        .err = @backingInt(code),
     }, {});
 }
 
@@ -2700,14 +2700,14 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
 
     var multi_request = jute.Writer.init(testing.allocator);
     defer multi_request.deinit();
-    try multi.writeHeader(&multi_request, @intFromEnum(multi.Kind.create), false, -1);
+    try multi.writeHeader(&multi_request, @backingInt(multi.Kind.create), false, -1);
     try jute.serialize(&multi_request, protocol.proto.CreateRequest{
         .path = "/transaction",
         .data = "before",
         .acl = &.{.{ .perms = acl.all, .id = .{ .scheme = "world", .id = "anyone" } }},
         .flags = 0,
     });
-    try multi.writeHeader(&multi_request, @intFromEnum(multi.Kind.set_data), false, -1);
+    try multi.writeHeader(&multi_request, @backingInt(multi.Kind.set_data), false, -1);
     try jute.serialize(&multi_request, protocol.proto.SetDataRequest{
         .path = "/transaction",
         .data = "after",
@@ -2723,7 +2723,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         &multi_response,
         testing.allocator,
     );
-    try testing.expectEqual(@as(i32, @intFromEnum(multi.Kind.create)), multi_create_header.type);
+    try testing.expectEqual(@as(i32, @backingInt(multi.Kind.create)), multi_create_header.type);
     const multi_create = try jute.deserialize(
         protocol.proto.CreateResponse,
         &multi_response,
@@ -2736,7 +2736,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         &multi_response,
         testing.allocator,
     );
-    try testing.expectEqual(@as(i32, @intFromEnum(multi.Kind.set_data)), multi_set_header.type);
+    try testing.expectEqual(@as(i32, @backingInt(multi.Kind.set_data)), multi_set_header.type);
     const multi_set = try jute.deserialize(
         protocol.proto.SetDataResponse,
         &multi_response,
@@ -2763,7 +2763,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     defer multi_read_request.deinit();
     try multi.writeHeader(
         &multi_read_request,
-        @intFromEnum(multi.ReadKind.get_data),
+        @backingInt(multi.ReadKind.get_data),
         false,
         -1,
     );
@@ -2773,7 +2773,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     });
     try multi.writeHeader(
         &multi_read_request,
-        @intFromEnum(multi.ReadKind.get_children),
+        @backingInt(multi.ReadKind.get_children),
         false,
         -1,
     );
@@ -2783,7 +2783,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     });
     try multi.writeHeader(
         &multi_read_request,
-        @intFromEnum(multi.ReadKind.get_data),
+        @backingInt(multi.ReadKind.get_data),
         false,
         -1,
     );
@@ -2793,7 +2793,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     });
     try multi.writeHeader(
         &multi_read_request,
-        @intFromEnum(multi.ReadKind.get_data),
+        @backingInt(multi.ReadKind.get_data),
         false,
         -1,
     );
@@ -2813,7 +2813,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqual(
-        @as(i32, @intFromEnum(multi.ReadKind.get_data)),
+        @as(i32, @backingInt(multi.ReadKind.get_data)),
         multi_get_data_header.type,
     );
     const multi_get_data = try jute.deserialize(
@@ -2830,7 +2830,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqual(
-        @as(i32, @intFromEnum(multi.ReadKind.get_children)),
+        @as(i32, @backingInt(multi.ReadKind.get_children)),
         multi_get_children_header.type,
     );
     const multi_get_children = try jute.deserialize(
@@ -2848,7 +2848,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     );
     try testing.expectEqual(@as(i32, -1), multi_read_error_header.type);
     try testing.expectEqual(
-        @as(i32, @intFromEnum(data_tree.ErrorCode.no_node)),
+        @as(i32, @backingInt(data_tree.ErrorCode.no_node)),
         multi_read_error_header.err,
     );
     const multi_read_error = try jute.deserialize(
@@ -2857,7 +2857,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqual(
-        @as(i32, @intFromEnum(data_tree.ErrorCode.no_node)),
+        @as(i32, @backingInt(data_tree.ErrorCode.no_node)),
         multi_read_error.err,
     );
 
@@ -2867,7 +2867,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
         testing.allocator,
     );
     try testing.expectEqual(
-        @as(i32, @intFromEnum(multi.ReadKind.get_data)),
+        @as(i32, @backingInt(multi.ReadKind.get_data)),
         multi_read_after_error_header.type,
     );
     const multi_read_after_error = try jute.deserialize(
@@ -3007,7 +3007,7 @@ test "ZooKeeper TCP server serves replicated CRUD requests" {
     var unauthorized_reply = try resumed.receive();
     defer unauthorized_reply.deinit();
     try testing.expectEqual(unauthorized_xid, unauthorized_reply.header.xid);
-    try testing.expectEqual(@as(i32, @intFromEnum(data_tree.ErrorCode.no_auth)), unauthorized_reply.header.err);
+    try testing.expectEqual(@as(i32, @backingInt(data_tree.ErrorCode.no_auth)), unauthorized_reply.header.err);
 
     try resumed.sendAuth("digest", "user:password");
     var resumed_auth_reply = try resumed.receive();

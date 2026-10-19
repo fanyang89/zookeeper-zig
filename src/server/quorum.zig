@@ -580,7 +580,7 @@ test "single-node quorum persists committed state through WAL restart" {
             quorum.deinit();
         }
         try waitForLeader(quorum, testing.io);
-        const password = [_]u8{0x33} ** 16;
+        const password = @as([16]u8, @splat(0x33));
         const now_ms = std.Io.Clock.real.now(testing.io).toMilliseconds();
         var opened_session = try quorum.propose(.{ .open_session = .{
             .session_id = 77,
@@ -617,7 +617,7 @@ test "single-node quorum persists committed state through WAL restart" {
         } });
         defer response.deinit();
         const result = try command.decodeResult(response.bytes);
-        try testing.expectEqual(@as(i32, 0), @intFromEnum(result.code));
+        try testing.expectEqual(@as(i32, 0), @backingInt(result.code));
         try quorum.linearizableRead();
         var stored = (try quorum.machine.getData(testing.allocator, "/durable")).?;
         defer stored.deinit(testing.allocator);
@@ -782,7 +782,7 @@ test "three-node quorum replicates through follower and survives leader restart"
         .time_ms = 1,
     } });
     defer first_response.deinit();
-    try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(first_response.bytes)).code));
+    try testing.expectEqual(@as(i32, 0), @backingInt((try command.decodeResult(first_response.bytes)).code));
     for (nodes) |maybe_node| try waitForReplicatedPath(maybe_node.?, "/cluster", testing.io);
 
     const stopped_index: usize = @intCast(first_leader - 1);
@@ -805,7 +805,7 @@ test "three-node quorum replicates through follower and survives leader restart"
         .time_ms = 2,
     } });
     defer second_response.deinit();
-    try testing.expectEqual(@as(i32, 0), @intFromEnum((try command.decodeResult(second_response.bytes)).code));
+    try testing.expectEqual(@as(i32, 0), @backingInt((try command.decodeResult(second_response.bytes)).code));
 
     nodes[stopped_index] = try Quorum.create(
         std.heap.smp_allocator,

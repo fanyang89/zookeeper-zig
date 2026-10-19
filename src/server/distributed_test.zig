@@ -264,7 +264,7 @@ pub fn testSessionFencing() !void {
 
     try cluster.raftors[0].campaign();
     const old_leader = try cluster.waitForLeader(0);
-    const password = [_]u8{0x42} ** 16;
+    const password = @as([16]u8, @splat(0x42));
     try expectMutationCode(try cluster.proposeAndWait(old_leader, .{ .open_session = .{
         .session_id = 42,
         .password = &password,
@@ -366,7 +366,7 @@ pub fn testSnapshotCatchUp() !void {
         .expected_version = 0,
         .time_ms = 2,
     } }), .ok);
-    const password = [_]u8{0x77} ** 16;
+    const password = @as([16]u8, @splat(0x77));
     try expectMutationCode(try cluster.proposeAndWait(leader, .{ .open_session = .{
         .session_id = 77,
         .password = &password,
