@@ -5,7 +5,8 @@ version. ZooKeeper compatibility remains **3.9.5**.
 
 ## Dependencies and builds
 
-- raftz: `d5eba2b338cfd00f2306680cc2dcafb016add3a0` (0.2.0).
+- raftz: `23e7bb30691cf17fb95d975f1a5e8aac1dd165fc` (0.2.0), including the
+  nonfatal handling of dropped forwarded proposals during elections.
 - zest: `420846a238e832b42c05bd857773c5a96d8cd586`.
 - rocksdb-zig remains at `20cc086f2702d9ec4aff144c242962ea3b666ee5`.
 - grpc-lite and other transitive versions follow the upstream raftz manifest;

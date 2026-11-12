@@ -96,10 +96,10 @@ fetch_package \
     protobuf-7.0.0-0e82aqFhNADVgEgPYPI7ddEg_dzhphBToYgkjQTrMKWv
 
 fetch_package \
-    raftz-d5eba2b3 \
-    https://codeload.github.com/fanyang89/raftz/tar.gz/d5eba2b338cfd00f2306680cc2dcafb016add3a0 \
+    raftz-23e7bb30 \
+    https://codeload.github.com/fanyang89/raftz/tar.gz/23e7bb30691cf17fb95d975f1a5e8aac1dd165fc \
     - \
-    raftz-0.2.0-dZ8GDlDo2wDT70LD1RnKeJMgxah_1W6QN-aPjzvdMMKA
+    raftz-0.2.0-dZ8GDkIn3AC0gcZdSNmHrjNvLD97jTkdpAp3jqJ6EZ31
 
 fetch_package \
     zest-420846a2 \
